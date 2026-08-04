@@ -207,9 +207,7 @@ func (s *EventSource) filters() []protocol.EventFilter {
 		}
 		f.EventType = set
 	}
-	for _, t := range s.query.topics {
-		f.Topics = append(f.Topics, t)
-	}
+	f.Topics = append(f.Topics, s.query.topics...)
 	if len(f.ContractIDs) == 0 && len(f.Topics) == 0 && len(f.EventType) == 0 {
 		return []protocol.EventFilter{}
 	}

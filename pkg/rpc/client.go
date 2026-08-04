@@ -31,7 +31,7 @@ const URLEnvVar = "SOROBAN_RPC_URL"
 
 // Client is the subset of Soroban RPC that prism uses.
 //
-// It is deliberately tiny: three read methods, all taking a context. New
+// It is deliberately tiny: four read methods, all taking a context. New
 // stream sources should prefer composing these over widening the interface,
 // because every method added here must also be faked in tests.
 type Client interface {
@@ -45,6 +45,10 @@ type Client interface {
 
 	// GetTransaction returns a single transaction by hash.
 	GetTransaction(ctx context.Context, req protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error)
+
+	// GetLatestLedger reports the head of the chain, which is how a stream
+	// with no explicit start ledger works out where "now" is.
+	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
 }
 
 // ResolveURL picks the RPC endpoint from, in order of precedence: an explicit
@@ -100,6 +104,15 @@ func (c *SDKClient) GetTransaction(ctx context.Context, req protocol.GetTransact
 	resp, err := c.inner.GetTransaction(ctx, req)
 	if err != nil {
 		return resp, fmt.Errorf("rpc getTransaction: %w", err)
+	}
+	return resp, nil
+}
+
+// GetLatestLedger implements Client.
+func (c *SDKClient) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error) {
+	resp, err := c.inner.GetLatestLedger(ctx)
+	if err != nil {
+		return resp, fmt.Errorf("rpc getLatestLedger: %w", err)
 	}
 	return resp, nil
 }
