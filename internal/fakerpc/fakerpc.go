@@ -341,6 +341,17 @@ func (s *Server) GetTransaction(ctx context.Context, req protocol.GetTransaction
 	return resp, nil
 }
 
+// GetLatestLedger implements rpc.Client.
+func (s *Server) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return protocol.GetLatestLedgerResponse{}, err
+	}
+	return protocol.GetLatestLedgerResponse{Sequence: s.latest}, nil
+}
+
 // MakeEvents builds a contiguous run of events, one per ledger starting at
 // startLedger, for use as a fake's universe.
 func MakeEvents(startLedger uint32, count int) []protocol.EventInfo {
