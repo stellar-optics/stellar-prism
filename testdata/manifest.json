@@ -1,0 +1,13 @@
+{
+  "source": "Stellar Mainnet (Horizon: https://horizon.stellar.org)",
+  "captured": "2026-08-03",
+  "note": "Real captured mainnet XDR, shared with the sibling stellar-xdr-lens repository. Used to exercise the `prism tx` explain path offline.",
+  "fixtures": {
+    "tx_failed": {
+      "tx_hash": "a6e87c3d8e2ca78e026bf165cf8c3c6423f62c6133c54217804940c32b13e1fe",
+      "description": "failed fee-bumped Soroban invoke_host_function transaction",
+      "envelope_file": "tx_failed.env.txt",
+      "result_file": "tx_failed.res.txt"
+    }
+  }
+}
