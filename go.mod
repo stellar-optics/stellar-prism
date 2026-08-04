@@ -2,12 +2,6 @@ module github.com/stellar-optics/stellar-prism
 
 go 1.25
 
-// DEVELOPMENT ONLY — remove before pushing.
-// prism is developed alongside its sibling repository; this directive lets the
-// two evolve together. It must be dropped once stellar-xdr-lens is tagged, or
-// the build will fail for everyone but the author.
-replace github.com/stellar-optics/stellar-xdr-lens => /home/ade/stellar-xdr-lens
-
 require (
 	github.com/spf13/cobra v1.10.2
 	github.com/stellar-optics/stellar-xdr-lens v0.0.0-20260804095708-4447ace53358
