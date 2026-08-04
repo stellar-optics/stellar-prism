@@ -1,0 +1,93 @@
+name: Bug report
+description: A stream lost, repeated or misrendered records, or prism crashed
+title: "fix: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        For a streaming bug, the most valuable thing you can give us is the
+        sequence of RPC responses that triggered it. If you can express it as
+        an `internal/fakerpc` scenario, that is a reproduction we can put
+        straight into the test suite.
+
+        ⚠️ Do not paste an `--rpc-url` containing an API key.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What went wrong?
+      options:
+        - Records were missed (a gap that was not reported)
+        - Records were duplicated
+        - A payload decoded incorrectly or not at all
+        - prism crashed or hung
+        - Reconnection did not recover
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      description: With any API key redacted.
+      render: shell
+      placeholder: prism events --contract CDLZF... --follow --json
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: What prism printed, on stdout and stderr. Paste it as-is.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: network
+    attributes:
+      label: Network
+      description: testnet, mainnet, futurenet or local — and the RPC provider if hosted.
+      placeholder: testnet (soroban-testnet.stellar.org)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: prism version
+      description: Output of `prism version`, or the commit you built from.
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: go version go1.25.0 linux/amd64
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this bug
+          required: true
+        - label: I have redacted any API key from the command and output above
+          required: true

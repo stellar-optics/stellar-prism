@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/stellar-optics/stellar-prism/security/advisories/new
+    about: Report security issues privately, never in a public issue. See SECURITY.md.
+  - name: Question or usage help
+    url: https://github.com/stellar-optics/stellar-prism/discussions
+    about: Ask how to use prism, or discuss an idea before opening an issue.

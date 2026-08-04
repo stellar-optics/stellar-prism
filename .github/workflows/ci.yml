@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref; the latest push is the one that matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  build:
+    name: Build and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum \
+            || { echo "::error::go.mod/go.sum are not tidy; run 'go mod tidy'"; exit 1; }
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # v7+ is required: .golangci.yml uses the golangci-lint v2 config schema,
+      # which older versions of the action cannot parse. The linter version is
+      # pinned so a lint release cannot turn CI red without a commit here.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Test with race detector and coverage
+        run: |
+          go test -race -covermode=atomic \
+            -coverprofile=coverage.out \
+            -coverpkg=./pkg/...,./internal/cli \
+            ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          {
+            echo "### Coverage"
+            echo '```'
+            go tool cover -func=coverage.out | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+
+  cli:
+    name: CLI smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Exercises the built binary the way a user would. Everything here is
+      # offline: no RPC endpoint is contacted, so CI cannot be broken by a
+      # testnet outage.
+      - name: Build binary
+        run: go build -o prism ./cmd/prism
+
+      - name: help and version
+        run: |
+          ./prism --help > /dev/null
+          ./prism version > /dev/null
+
+      - name: every advertised command exists
+        run: |
+          for c in events ledgers tx version; do
+            ./prism "$c" --help > /dev/null || { echo "::error::missing command $c"; exit 1; }
+          done
+
+      - name: shared flags match stellar-xdr-lens conventions
+        run: |
+          ./prism --help | grep -q -- '--color' \
+            || { echo "::error::--color flag missing"; exit 1; }
+          ./prism events --help | grep -q -- '--json' \
+            || { echo "::error::--json flag missing"; exit 1; }
+
+      - name: invalid input is rejected without a network call
+        run: |
+          if ./prism events --from 1 --type nonsense --rpc-url http://127.0.0.1:1 2>/dev/null; then
+            echo "::error::an invalid event type was accepted"
+            exit 1
+          fi
+
+      - name: unreachable RPC fails rather than hanging
+        run: |
+          timeout 60 ./prism events --from 1 --max-retries 1 \
+            --rpc-url http://127.0.0.1:1 > /dev/null 2>&1
+          code=$?
+          if [ "$code" -eq 0 ]; then
+            echo "::error::an unreachable endpoint reported success"
+            exit 1
+          fi
+          if [ "$code" -eq 124 ]; then
+            echo "::error::prism hung against an unreachable endpoint"
+            exit 1
+          fi

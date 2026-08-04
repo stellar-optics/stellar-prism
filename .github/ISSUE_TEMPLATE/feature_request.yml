@@ -1,0 +1,74 @@
+name: Feature request
+description: Suggest a stream source, an output sink, or another capability
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion.
+
+        The most useful requests describe **what you were trying to debug or
+        monitor** and where prism fell short. A concrete case is far more
+        actionable than an abstract feature.
+
+        Before opening: [docs/roadmap.md](../blob/main/docs/roadmap.md) lists
+        what is planned and what is deliberately out of scope — including a
+        few things that belong in the sibling
+        [stellar-xdr-lens](https://github.com/stellar-optics/stellar-xdr-lens)
+        repository instead.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of request is this?
+      options:
+        - A new stream source (something else to tail)
+        - A new output sink (somewhere else to send records)
+        - A new flag or command
+        - Better decoding or rendering
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What were you trying to do?
+      description: >
+        The actual task. What were you watching for, and what did prism not
+        tell you?
+      placeholder: |
+        I was watching a swap contract and needed to alert when a specific
+        topic appeared, but I could not tell from the output which event
+        variant had fired.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >
+        Does `stellar events`, Horizon, or a hosted indexer already cover this?
+        Deferring to an existing tool is sometimes the right answer.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Would you like to implement this?
+      description: >
+        A new source or sink is designed to be a one-file change — see
+        docs/architecture.md.
+      options:
+        - label: I would be willing to open a pull request for this
+          required: false

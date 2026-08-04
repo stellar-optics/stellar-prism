@@ -1,0 +1,67 @@
+# golangci-lint configuration.
+#
+# The selection favours linters that catch real defects and genuine style
+# drift. Noisy or opinion-heavy linters are left off deliberately: a linter
+# that contributors learn to ignore is worse than no linter.
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # suspicious constructs
+    - ineffassign   # assignments never used
+    - staticcheck   # correctness and simplification
+    - unused        # dead code
+    - bodyclose     # unclosed HTTP bodies
+    - errorlint     # correct error wrapping and comparison
+    - misspell      # spelling in comments and strings
+    - revive        # style, replaces the deprecated golint
+    - unconvert     # redundant type conversions
+    - copyloopvar   # loop variable capture issues
+    - nilerr        # returning nil when an error is non-nil
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    revive:
+      rules:
+        # The public library surface must be documented.
+        - name: exported
+        - name: package-comments
+        - name: indent-error-flow
+        - name: errorf
+        - name: error-strings
+        - name: error-return
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Test files may shadow and assert more freely.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/stellar-optics/stellar-prism
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
