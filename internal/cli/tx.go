@@ -30,7 +30,7 @@ The envelope and result are paired, so the output names which operation
 failed and why — the same explanation ` + "`lens explain --result`" + ` produces,
 without the copy-and-paste.`,
 		Example: `  prism tx 3389e9f0a1b2c3...
-  prism tx 3389e9f0a1b2c3... --json | jq -r '.Headline'
+  prism tx 3389e9f0a1b2c3... --json | jq -r '.headline'
   prism tx 3389e9f0a1b2c3... --fail-on-error`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
