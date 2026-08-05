@@ -147,9 +147,11 @@ jobs:
 
       - name: unreachable RPC fails rather than hanging
         run: |
+          # Actions runs bash with `set -e`, so the expected non-zero exit must
+          # be captured with `|| code=$?` rather than read from $? afterwards.
+          code=0
           timeout 60 ./prism events --from 1 --max-retries 1 \
-            --rpc-url http://127.0.0.1:1 > /dev/null 2>&1
-          code=$?
+            --rpc-url http://127.0.0.1:1 > /dev/null 2>&1 || code=$?
           if [ "$code" -eq 0 ]; then
             echo "::error::an unreachable endpoint reported success"
             exit 1
