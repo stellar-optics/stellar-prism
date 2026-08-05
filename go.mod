@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/spf13/cobra v1.10.2
-	github.com/stellar-optics/stellar-xdr-lens v0.1.0
+	github.com/stellar-optics/stellar-xdr-lens v0.2.0
 	github.com/stellar/go-stellar-sdk v0.7.1
 )
 
