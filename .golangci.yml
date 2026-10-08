@@ -4,7 +4,6 @@
 # drift. Noisy or opinion-heavy linters are left off deliberately: a linter
 # that contributors learn to ignore is worse than no linter.
 
-version: "2"
 
 run:
   timeout: 5m
