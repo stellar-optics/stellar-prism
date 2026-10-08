@@ -1,3 +1,5 @@
+version: "2"
+
 # golangci-lint configuration.
 #
 # The selection favours linters that catch real defects and genuine style
