@@ -83,6 +83,23 @@ type ledgerLine struct {
 	HeaderXDR   string          `json:"headerXdr,omitempty"`
 }
 
+// transactionLine is the documented NDJSON shape for a transaction.
+type transactionLine struct {
+	Kind          string          `json:"kind"`
+	ID            string          `json:"id"`
+	Ledger        uint32          `json:"ledger"`
+	Time          string          `json:"time,omitempty"`
+	Hash          string          `json:"hash,omitempty"`
+	Index         uint32          `json:"index"`
+	Successful    bool            `json:"successful"`
+	Envelope      json.RawMessage `json:"envelope,omitempty"`
+	Result        json.RawMessage `json:"result,omitempty"`
+	ResultMeta    json.RawMessage `json:"resultMeta,omitempty"`
+	EnvelopeXDR   string          `json:"envelopeXdr,omitempty"`
+	ResultXDR     string          `json:"resultXdr,omitempty"`
+	ResultMetaXDR string          `json:"resultMetaXdr,omitempty"`
+}
+
 // Emit implements stream.Sink.
 func (n *NDJSON) Emit(r stream.Record) error {
 	var payload any
@@ -142,6 +159,47 @@ func (n *NDJSON) Emit(r stream.Record) error {
 			} else {
 				line.MetadataXDR = r.Close.MetadataXDR
 				line.HeaderXDR = r.Close.HeaderXDR
+			}
+		}
+		payload = line
+
+	case stream.KindTransaction:
+		line := transactionLine{
+			Kind:       string(r.Kind),
+			ID:         r.ID,
+			Ledger:     r.Sequence,
+			Time:       formatTime(r.Time),
+		}
+		if r.Transaction != nil {
+			line.Hash = r.Transaction.Hash
+			line.Index = r.Transaction.Index
+			line.Successful = r.Transaction.Successful
+			if n.decode {
+				if r.Transaction.EnvelopeXDR != "" {
+					raw, err := n.decodeXDR(r.Transaction.EnvelopeXDR)
+					if err != nil {
+						return err
+					}
+					line.Envelope = raw
+				}
+				if r.Transaction.ResultXDR != "" {
+					raw, err := n.decodeXDR(r.Transaction.ResultXDR)
+					if err != nil {
+						return err
+					}
+					line.Result = raw
+				}
+				if r.Transaction.ResultMetaXDR != "" {
+					raw, err := n.decodeXDR(r.Transaction.ResultMetaXDR)
+					if err != nil {
+						return err
+					}
+					line.ResultMeta = raw
+				}
+			} else {
+				line.EnvelopeXDR = r.Transaction.EnvelopeXDR
+				line.ResultXDR = r.Transaction.ResultXDR
+				line.ResultMetaXDR = r.Transaction.ResultMetaXDR
 			}
 		}
 		payload = line

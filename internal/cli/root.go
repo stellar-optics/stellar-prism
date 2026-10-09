@@ -98,6 +98,7 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 	root.AddCommand(
 		newEventsCmd(g, stdout, stderr),
 		newLedgersCmd(g, stdout, stderr),
+		newTransactionsCmd(g, stdout, stderr),
 		newTxCmd(g, stdout),
 		newVersionCmd(stdout),
 	)

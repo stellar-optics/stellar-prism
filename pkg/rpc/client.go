@@ -46,6 +46,9 @@ type Client interface {
 	// GetTransaction returns a single transaction by hash.
 	GetTransaction(ctx context.Context, req protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error)
 
+	// GetTransactions returns transactions matching the request.
+	GetTransactions(ctx context.Context, req protocol.GetTransactionsRequest) (protocol.GetTransactionsResponse, error)
+
 	// GetLatestLedger reports the head of the chain, which is how a stream
 	// with no explicit start ledger works out where "now" is.
 	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
@@ -104,6 +107,15 @@ func (c *SDKClient) GetTransaction(ctx context.Context, req protocol.GetTransact
 	resp, err := c.inner.GetTransaction(ctx, req)
 	if err != nil {
 		return resp, fmt.Errorf("rpc getTransaction: %w", err)
+	}
+	return resp, nil
+}
+
+// GetTransactions implements Client.
+func (c *SDKClient) GetTransactions(ctx context.Context, req protocol.GetTransactionsRequest) (protocol.GetTransactionsResponse, error) {
+	resp, err := c.inner.GetTransactions(ctx, req)
+	if err != nil {
+		return resp, fmt.Errorf("rpc getTransactions: %w", err)
 	}
 	return resp, nil
 }

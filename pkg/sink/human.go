@@ -62,6 +62,10 @@ func (h *Human) Emit(r stream.Record) error {
 		if err := h.emitLedger(r); err != nil {
 			return err
 		}
+	case stream.KindTransaction:
+		if err := h.emitTransaction(r); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("human: unknown record kind %q", r.Kind)
 	}
@@ -138,6 +142,49 @@ func (h *Human) emitLedger(r stream.Record) error {
 		return nil
 	}
 	return h.writePayload("meta", c.MetadataXDR)
+}
+
+func (h *Human) emitTransaction(r stream.Record) error {
+	p := h.palette
+	t := r.Transaction
+	if t == nil {
+		return fmt.Errorf("human: transaction record %s has no payload", r.ID)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s%s%s  %sledger %d%s  %stx %s%s",
+		p.Note, formatTime(r.Time), p.Reset,
+		p.Dim, r.Sequence, p.Reset,
+		p.Key, shorten(t.Hash), p.Reset,
+	)
+	if !t.Successful {
+		fmt.Fprintf(&b, "  %sfailed%s", p.Remove, p.Reset)
+	}
+	b.WriteString("\n")
+
+	if _, err := h.w.WriteString(b.String()); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if h.compact {
+		return nil
+	}
+
+	if t.EnvelopeXDR != "" {
+		if err := h.writePayload("envelope", t.EnvelopeXDR); err != nil {
+			return err
+		}
+	}
+	if t.ResultXDR != "" {
+		if err := h.writePayload("result", t.ResultXDR); err != nil {
+			return err
+		}
+	}
+	if t.ResultMetaXDR != "" {
+		if err := h.writePayload("meta", t.ResultMetaXDR); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writePayload renders one base64 XDR value through lens, indented under its

@@ -70,6 +70,8 @@ type Server struct {
 
 	// tx maps a hash to a canned transaction response.
 	tx map[string]protocol.GetTransactionResponse
+	// txs is the canned response for getTransactions.
+	txs protocol.GetTransactionsResponse
 }
 
 // Option configures a Server.
@@ -135,6 +137,13 @@ func (s *Server) SetTransaction(hash string, resp protocol.GetTransactionRespons
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tx[hash] = resp
+}
+
+// SetTransactions installs a canned response for GetTransactions.
+func (s *Server) SetTransactions(resp protocol.GetTransactionsResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.txs = resp
 }
 
 // Calls reports how many stream calls have been made, so tests can assert on
@@ -339,6 +348,17 @@ func (s *Server) GetTransaction(ctx context.Context, req protocol.GetTransaction
 		}, nil
 	}
 	return resp, nil
+}
+
+// GetTransactions implements rpc.Client.
+func (s *Server) GetTransactions(ctx context.Context, req protocol.GetTransactionsRequest) (protocol.GetTransactionsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return protocol.GetTransactionsResponse{}, err
+	}
+	return s.txs, nil
 }
 
 // GetLatestLedger implements rpc.Client.

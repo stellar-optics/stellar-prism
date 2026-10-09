@@ -19,6 +19,8 @@ const (
 	KindEvent Kind = "event"
 	// KindLedger is ledger close metadata.
 	KindLedger Kind = "ledger"
+	// KindTransaction is a Stellar transaction.
+	KindTransaction Kind = "transaction"
 )
 
 // Record is one item in a stream, whatever its source.
@@ -42,6 +44,8 @@ type Record struct {
 	Event *Event
 	// Close is set when Kind is KindLedger.
 	Close *LedgerClose
+	// Transaction is set when Kind is KindTransaction.
+	Transaction *Transaction
 }
 
 // Event is a Soroban event as delivered by RPC. The XDR fields are kept in
@@ -71,4 +75,20 @@ type LedgerClose struct {
 	HeaderXDR string
 	// MetadataXDR is the base64 LedgerCloseMeta.
 	MetadataXDR string
+}
+
+// Transaction is a transaction as delivered by RPC.
+type Transaction struct {
+	// Hash is the hex transaction hash.
+	Hash string
+	// Index is the zero-based index of the transaction within its ledger.
+	Index uint32
+	// Successful indicates whether the transaction succeeded.
+	Successful bool
+	// EnvelopeXDR is the base64 TransactionEnvelope.
+	EnvelopeXDR string
+	// ResultXDR is the base64 TransactionResult.
+	ResultXDR string
+	// ResultMetaXDR is the base64 TransactionMeta.
+	ResultMetaXDR string
 }
