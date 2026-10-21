@@ -95,6 +95,78 @@ func TestWebhookSinkEndToEnd(t *testing.T) {
 	}
 }
 
+func TestElasticsearchSinkEndToEnd(t *testing.T) {
+	t.Setenv(esAPIKeyEnvVar, "encoded-test-key")
+
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(11500, 3), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	type bulkRequest struct {
+		path          string
+		authorization string
+		contentType   string
+		body          string
+	}
+	var (
+		mu       sync.Mutex
+		requests []bulkRequest
+	)
+	elasticsearch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading bulk request: %v", err)
+		}
+		mu.Lock()
+		requests = append(requests, bulkRequest{
+			path:          r.URL.Path,
+			authorization: r.Header.Get("Authorization"),
+			contentType:   r.Header.Get("Content-Type"),
+			body:          string(body),
+		})
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"errors":false,"items":[]}`)
+	}))
+	defer elasticsearch.Close()
+
+	stdout, _, err := run(t, "events", "--from", "11500", "--json",
+		"--sink-es-url", elasticsearch.URL,
+		"--sink-es-index", "stellar-events",
+		"--sink-es-batch-size", "2",
+		"--sink-es-flush-interval", "0")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 3 {
+		t.Errorf("stdout has %d records, want 3 alongside Elasticsearch indexing", got)
+	}
+	mu.Lock()
+	got := append([]bulkRequest(nil), requests...)
+	mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("received %d bulk requests, want a full batch and final partial batch", len(got))
+	}
+	total := 0
+	for i, request := range got {
+		if request.path != "/_bulk" {
+			t.Errorf("request %d path = %q, want /_bulk", i, request.path)
+		}
+		if request.authorization != "ApiKey encoded-test-key" {
+			t.Errorf("request %d Authorization = %q, want API key auth", i, request.authorization)
+		}
+		if request.contentType != "application/x-ndjson" {
+			t.Errorf("request %d Content-Type = %q, want application/x-ndjson", i, request.contentType)
+		}
+		lines := strings.Split(strings.TrimSuffix(request.body, "\n"), "\n")
+		if len(lines)%2 != 0 {
+			t.Errorf("request %d contains %d NDJSON lines, want metadata/document pairs", i, len(lines))
+		}
+		total += len(lines) / 2
+	}
+	if total != 3 {
+		t.Errorf("indexed %d records, want 3", total)
+	}
+}
+
 func TestCloudSinkEndToEnd(t *testing.T) {
 	t.Setenv(gcsTokenEnvVar, "test-token")
 
@@ -300,6 +372,10 @@ func TestSinkFlagValidation(t *testing.T) {
 			args: []string{"events", "--from", "15000", "--webhook-secret", "s"},
 		},
 		{
+			name: "Elasticsearch URL without index",
+			args: []string{"events", "--from", "15000", "--sink-es-url", "http://localhost:9200"},
+		},
+		{
 			name: "cloud bucket without url",
 			args: []string{"events", "--from", "15000", "--cloud-bucket", "b"},
 		},
@@ -360,6 +436,7 @@ func TestStreamingHelpAdvertisesSinkFlags(t *testing.T) {
 	}
 	for _, flag := range []string{
 		"--webhook-url", "--webhook-secret", "--cloud-provider", "--cloud-bucket",
+		"--sink-es-url", "--sink-es-index", "--sink-es-username", "--sink-es-batch-size",
 		"--metrics-addr", "--syslog-address", "--syslog-format", "--syslog-facility",
 	} {
 		if !strings.Contains(stdout, flag) {

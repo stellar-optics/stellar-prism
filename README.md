@@ -153,6 +153,7 @@ emits:
 | Flag | Destination |
 |---|---|
 | `--webhook-url` | Batched HTTP POSTs, optional HMAC-SHA256 signing and backoff retries |
+| `--sink-es-url` + `--sink-es-index` | Elasticsearch/OpenSearch `_bulk` requests, routed to daily indices |
 | `--cloud-bucket` + `--cloud-provider` | Gzipped NDJSON chunks in S3 or GCS |
 | `--metrics-addr` | Prometheus `/metrics` (throughput, ledger latency, errors) |
 | `--syslog-address` | RFC 5424 syslog or systemd-journald native fields |
@@ -164,6 +165,10 @@ prism events --follow --json \
   --cloud-provider s3 --cloud-url https://s3.us-east-1.amazonaws.com \
   --cloud-bucket my-prism-archive
 
+# Index records in daily Elasticsearch/OpenSearch indices
+prism events --follow --contract CDLZF... \
+  --sink-es-url http://localhost:9200 --sink-es-index stellar-events
+
 # Watch throughput and latency while tailing
 prism events --follow --json --metrics-addr 127.0.0.1:9090
 
@@ -173,7 +178,10 @@ prism events --follow --json \
   --syslog-format journald
 ```
 
-Credentials come from the environment (`PRISM_WEBHOOK_SECRET`,
+Elasticsearch/OpenSearch authentication is optional: set `PRISM_ES_API_KEY`
+for API key auth, or pass `--sink-es-username` and set `PRISM_ES_PASSWORD` for
+basic auth. Credentials come from the environment (`PRISM_WEBHOOK_SECRET`,
+`PRISM_ES_API_KEY`, `PRISM_ES_PASSWORD`,
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `GOOGLE_OAUTH_ACCESS_TOKEN`) so
 they do not appear in `ps` output. Delivery to webhooks and object storage is
 at-least-once: a batch is retried until acknowledged and uses a stable key or

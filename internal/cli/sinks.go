@@ -17,6 +17,8 @@ import (
 // process listing or shell history.
 const (
 	webhookSecretEnvVar = "PRISM_WEBHOOK_SECRET"
+	esPasswordEnvVar    = "PRISM_ES_PASSWORD"
+	esAPIKeyEnvVar      = "PRISM_ES_API_KEY"
 	gcsTokenEnvVar      = "GOOGLE_OAUTH_ACCESS_TOKEN"
 	awsAccessKeyEnvVar  = "AWS_ACCESS_KEY_ID"
 	awsSecretKeyEnvVar  = "AWS_SECRET_ACCESS_KEY"
@@ -32,6 +34,12 @@ type sinkFlags struct {
 	webhookBatch     int
 	webhookTimeout   time.Duration
 	webhookMaxRetry  int
+	esURL            string
+	esIndex          string
+	esUsername       string
+	esBatchSize      int
+	esFlushInterval  time.Duration
+	esTimeout        time.Duration
 	cloudURL         string
 	cloudProvider    string
 	cloudBucket      string
@@ -63,6 +71,19 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 		"POST a partial webhook batch after this long (0 means only the batch size triggers)")
 	flags.IntVar(&s.webhookMaxRetry, "webhook-max-retries", 3,
 		"retry a failed webhook delivery this many times (-1 disables retries)")
+
+	flags.StringVar(&s.esURL, "sink-es-url", "",
+		"Elasticsearch/OpenSearch endpoint for bulk indexing")
+	flags.StringVar(&s.esIndex, "sink-es-index", "",
+		"base Elasticsearch/OpenSearch index name; records are routed to a daily index")
+	flags.StringVar(&s.esUsername, "sink-es-username", "",
+		"Elasticsearch/OpenSearch basic-auth username (password from $"+esPasswordEnvVar+")")
+	flags.IntVar(&s.esBatchSize, "sink-es-batch-size", 100,
+		"records per Elasticsearch/OpenSearch bulk request")
+	flags.DurationVar(&s.esFlushInterval, "sink-es-flush-interval", time.Second,
+		"flush a partial Elasticsearch/OpenSearch batch after this long (0 disables the timer)")
+	flags.DurationVar(&s.esTimeout, "sink-es-timeout", 10*time.Second,
+		"timeout for an Elasticsearch/OpenSearch bulk request")
 
 	flags.StringVar(&s.cloudURL, "cloud-url", "",
 		"object store endpoint for archival uploads (default GCS: "+defaultGCSEndpoint+")")
@@ -118,6 +139,32 @@ func (s *sinkFlags) validate() error {
 	}
 	if s.webhookMaxRetry < -1 {
 		return fmt.Errorf("--webhook-max-retries must be -1 or greater")
+	}
+
+	esEnabled := s.esURL != "" || s.esIndex != ""
+	if esEnabled {
+		if s.esURL == "" || s.esIndex == "" {
+			return fmt.Errorf("--sink-es-url and --sink-es-index must be provided together")
+		}
+		if s.esBatchSize <= 0 {
+			return fmt.Errorf("--sink-es-batch-size must be greater than zero")
+		}
+		if s.esFlushInterval < 0 {
+			return fmt.Errorf("--sink-es-flush-interval must not be negative")
+		}
+		if s.esTimeout <= 0 {
+			return fmt.Errorf("--sink-es-timeout must be greater than zero")
+		}
+		password := os.Getenv(esPasswordEnvVar)
+		apiKey := os.Getenv(esAPIKeyEnvVar)
+		if (s.esUsername == "") != (password == "") {
+			return fmt.Errorf("--sink-es-username and %s must be provided together", esPasswordEnvVar)
+		}
+		if apiKey != "" && (s.esUsername != "" || password != "") {
+			return fmt.Errorf("%s cannot be combined with --sink-es-username or %s", esAPIKeyEnvVar, esPasswordEnvVar)
+		}
+	} else if s.esUsername != "" {
+		return fmt.Errorf("--sink-es-username requires --sink-es-url and --sink-es-index")
 	}
 
 	cloudEnabled := s.cloudURL != "" || s.cloudBucket != ""
@@ -221,6 +268,26 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 		}
 		s.constructedSinks = append(s.constructedSinks, hook)
 		sinks = append(sinks, hook)
+	}
+
+	if s.esURL != "" {
+		es, esErr := sink.NewElasticsearch(sink.ElasticsearchOptions{
+			URL:           s.esURL,
+			Index:         s.esIndex,
+			Username:      s.esUsername,
+			Password:      os.Getenv(esPasswordEnvVar),
+			APIKey:        os.Getenv(esAPIKeyEnvVar),
+			BatchSize:     s.esBatchSize,
+			FlushInterval: s.esFlushInterval,
+			Timeout:       s.esTimeout,
+			Decode:        !raw,
+			OnError:       observeError,
+		})
+		if esErr != nil {
+			return nil, esErr
+		}
+		s.constructedSinks = append(s.constructedSinks, es)
+		sinks = append(sinks, es)
 	}
 
 	if s.cloudURL != "" || s.cloudBucket != "" {
