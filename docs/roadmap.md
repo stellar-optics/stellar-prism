@@ -18,8 +18,6 @@ Working and tested:
 - Reconnection with jittered backoff; retry never advances the cursor
 - Gap detection against the server's retention window: exit 2 by default, or
   `--gap-strategy resume` with the skipped range reported
-- Optional cursor journal (`--state-file`) with background pruning, and
-  `--resume` to continue a stream from the last recorded position
 - Streaming core fully tested with no network, and mutation-checked
 
 Known limits, stated plainly:
@@ -28,9 +26,8 @@ Known limits, stated plainly:
   resolve and display the spec, including decoding standalone `--arg` values,
   but the live event stream does not yet apply struct/field names
   automatically. See below.
-- **No exactly-once across restarts.** `--state-file` and `--resume` narrow
-  the restart window to a single record, but a process killed between
-  emitting and recording still re-emits on restart.
+- **No durable cursor.** Exactly-once across restarts is not offered; a
+  process killed between emitting and advancing will re-emit on restart.
 - **Polling, not push.** Soroban RPC has no subscription API, so latency is
   bounded by `--poll` (one ledger close by default).
 - **~24-hour history.** RPC retention bounds how far `--from` can reach.
@@ -40,18 +37,13 @@ Known limits, stated plainly:
 
 ### Durable cursors
 
-Landed as `--state-file` and `--resume`: prism records the position after
-every page it delivered in full, and the next run can start from it. The
-journal is compacted by a background pruner, so it does not grow without
-bound however long the stream runs.
+`--state-file` persisting the cursor after each successful emit, so a restart
+resumes where it left off. This narrows the restart window from "the whole run"
+to "one record" and makes prism usable as a long-lived ingestion process.
 
-What is still missing is true exactly-once. That needs a transaction spanning
-the sink and the cursor store, which a CLI writing to stdout cannot have, so
-the README keeps saying so.
-
-Two smaller things could follow: recording the position per *ledger* rather
-than per page, and letting several streams share one state file without
-keying it by filter set.
+It cannot reach true exactly-once — that needs a transaction spanning the sink
+and the cursor store, which a CLI writing to stdout cannot have — and the
+README should keep saying so.
 
 ### Contract-spec-aware decoding
 

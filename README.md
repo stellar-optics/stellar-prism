@@ -135,35 +135,8 @@ $ prism events --limit 4 --json | jq -r '"\(.ledger)  \(.contract[0:8])…  \(.v
 3966820  CDLZFC3S…  ScValTypeScvI128
 ```
 
-### Resuming a stream from where it stopped
-
-`--state-file` records the position the stream reached after every page, so
-the next run can pick the stream up where the last one stopped:
-
-```sh
-# Record the position as the stream runs
-prism events --contract CDLZF... --follow --state-file ~/.cache/prism/events.jsonl
-
-# Continue from the last recorded position
-prism events --contract CDLZF... --follow \
-  --state-file ~/.cache/prism/events.jsonl --resume
-```
-
-The file is a journal: one checkpoint per delivered page. A background pruner
-compacts it while the stream runs, so it stays small however long you follow.
-`--prune-keep` sets how many checkpoints to keep (100 by default),
-`--prune-max-age` drops the ones that are too old, and `--prune-interval` sets
-how often the compaction happens.
-
-A checkpoint is written only after a page has been delivered *in full*, so a
-recorded position never points past records the run did not emit. The same
-holds for a concurrent backfill (`--backfill-workers`): the drain reports the
-position it reached, and a page the `--limit` cut short is not reported at all.
-
-This narrows the restart window from "the whole run" to "one record". It is
-not exactly-once — see [What prism guarantees](#what-prism-guarantees).
-
 ### `prism tx` — why did this transaction fail?
+
 Fetches a transaction and renders it through the lens explain path, pairing the
 envelope with its result so the failure is attributed to the operation that
 caused it:
@@ -219,10 +192,8 @@ This is a streaming tool, so the guarantee matters more than the feature list:
   printed on stderr.
 - **Not exactly-once across restarts.** prism cannot atomically emit a record
   and commit its cursor, so a process killed between the two re-emits on
-  restart. `--state-file` records the position after every delivered page and
-  `--resume` starts the next run from it, which narrows that window to a
-  single record — but it is still not exactly-once. Key off `id` if that
-  matters to you.
+  restart. Key off `id` if that matters to you. Durable cursors are on the
+  [roadmap](docs/roadmap.md).
 
 These are enforced by tests, not just claimed — see
 [docs/architecture.md](docs/architecture.md#testing-the-guarantee).
@@ -281,8 +252,7 @@ before v1.0.
   skipped range reported.
 - Payloads render as the XDR wire shape — prism has no contract-spec decoding,
   and `stellar events` is better for that today.
-- Optional cursor journal (`--state-file`) with background pruning, and
-  `--resume` to continue from it. Still not exactly-once across restarts.
+- No durable cursor yet, so exactly-once across restarts is not offered.
 
 See [docs/roadmap.md](docs/roadmap.md).
 

@@ -30,24 +30,6 @@ type Stats struct {
 	Recovered int
 }
 
-// Page describes the progress of one page that was emitted in full.
-//
-// It carries the position a later run could resume from, which is what makes
-// a durable cursor possible without the tailer knowing anything about
-// storage.
-type Page struct {
-	// Source names the stream that produced the page.
-	Source string
-	// Cursor is the position to resume from after this page. It is empty
-	// when the source offers no further position.
-	Cursor string
-	// Ledger is the ledger the cursor refers to, or zero when the source
-	// cannot say.
-	Ledger uint32
-	// Records counts the records emitted in the page.
-	Records int
-}
-
 // Options configures a Tailer.
 type Options struct {
 	// Follow keeps the stream open, polling for new records. When false the
@@ -65,13 +47,6 @@ type Options struct {
 	MaxRetries int
 	// Clock is injectable for tests. Defaults to RealClock.
 	Clock Clock
-	// StartCursor resumes the stream from a position an earlier run
-	// recorded. The empty value means "start where the Source was
-	// configured to start".
-	//
-	// A resumed stream is gap-checked like any other, because the cursor is
-	// a real position and the server may have pruned past it.
-	StartCursor string
 	// OnRetry, when set, is called before each backoff wait so the CLI can
 	// tell the user what is happening rather than appearing to hang.
 	OnRetry func(attempt int, delay time.Duration, err error)
@@ -83,13 +58,6 @@ type Options struct {
 	MaxGapRecoveries int
 	// OnGap, when set, is called for every detected gap.
 	OnGap func(GapEvent)
-	// OnPage, when set, is called after every page that was emitted in
-	// full, with the position to resume from.
-	//
-	// A page that was only partly emitted — because the limit was reached
-	// or the sink failed — does not produce a callback, so a recorded
-	// position always refers to records that were actually delivered.
-	OnPage func(Page)
 }
 
 // Tailer drives a Source, emitting records to a Sink.
@@ -111,9 +79,8 @@ type Options struct {
 //
 //   - Not exactly-once across restarts. The tailer cannot atomically emit a
 //     record and commit its cursor, so a process killed between the two will
-//     re-emit on restart. Options.StartCursor and Options.OnPage narrow that
-//     window to a single record for callers that persist the position
-//     themselves; consumers that care should key off Record.ID.
+//     re-emit on restart. Durable cursors would narrow this and are on the
+//     roadmap; consumers that care should key off Record.ID.
 type Tailer struct {
 	src  Source
 	sink Sink
@@ -147,10 +114,9 @@ func NewTailer(src Source, sink Sink, opts Options) *Tailer {
 		strategy = GapFail
 	}
 	return &Tailer{
-		src:    src,
-		sink:   sink,
-		opts:   opts,
-		cursor: opts.StartCursor,
+		src:  src,
+		sink: sink,
+		opts: opts,
 		recovery: GapRecovery{
 			Strategy:      strategy,
 			MaxRecoveries: opts.MaxGapRecoveries,
@@ -204,20 +170,12 @@ func (t *Tailer) Run(ctx context.Context) error {
 			}
 		}
 
-		done, emitted, err := t.emit(batch)
+		done, err := t.emit(batch)
 		if err != nil {
 			return err
 		}
 		if done {
 			return t.finish(nil)
-		}
-
-		// The page was emitted in full, so this is a position a later run
-		// could resume from. Reporting it here — rather than when the page
-		// was fetched — is what keeps a recorded cursor from pointing past
-		// records that were never delivered.
-		if t.reportsPage(batch) {
-			t.notifyPage(batch, emitted)
 		}
 
 		// Advance only after a fully successful emit. If emitting failed we
@@ -310,35 +268,9 @@ func (t *Tailer) checkGap(b Batch) *GapError {
 	return nil
 }
 
-// reportsPage reports whether a page moved the stream forward.
-//
-// An empty page that leaves the cursor where it was says nothing new, and
-// reporting it would fill a cursor journal with duplicates of the position
-// already recorded.
-func (t *Tailer) reportsPage(b Batch) bool {
-	return len(b.Records) > 0 || (b.NextCursor != "" && b.NextCursor != t.cursor)
-}
-
-// notifyPage reports the progress of a fully emitted page.
-func (t *Tailer) notifyPage(b Batch, emitted int) {
-	if t.opts.OnPage == nil {
-		return
-	}
-	page := Page{
-		Source:  t.src.Name(),
-		Cursor:  b.NextCursor,
-		Records: emitted,
-	}
-	if ledger, ok := t.src.CursorLedger(b.NextCursor); ok {
-		page.Ledger = ledger
-	}
-	t.opts.OnPage(page)
-}
-
 // emit writes a batch's records, suppressing any the server replayed, and
-// reports whether the configured limit has been reached along with how many
-// records were written.
-func (t *Tailer) emit(b Batch) (done bool, emitted int, err error) {
+// reports whether the configured limit has been reached.
+func (t *Tailer) emit(b Batch) (done bool, err error) {
 	for _, r := range b.Records {
 		// IDs are fixed-width and zero-padded, so this comparison is a
 		// chronological one. Anything at or before the high-water mark is a
@@ -349,15 +281,14 @@ func (t *Tailer) emit(b Batch) (done bool, emitted int, err error) {
 		}
 
 		if err := t.sink.Emit(r); err != nil {
-			return false, emitted, fmt.Errorf("writing record %s: %w", r.ID, err)
+			return false, fmt.Errorf("writing record %s: %w", r.ID, err)
 		}
 		t.lastID = r.ID
 		t.stats.Emitted++
-		emitted++
 
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {
-			return true, emitted, nil
+			return true, nil
 		}
 	}
-	return false, emitted, nil
+	return false, nil
 }

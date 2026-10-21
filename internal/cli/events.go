@@ -44,17 +44,6 @@ type streamFlags struct {
 	rotateInterval time.Duration
 	rotateCompress bool
 	rotateKeep     int
-
-	stateFile     string
-	resume        bool
-	pruneInterval time.Duration
-	pruneKeep     int
-	pruneMaxAge   time.Duration
-
-	// stateKey identifies this stream inside the cursor metadata file. Two
-	// runs share a key only when they watch the same thing, so a recorded
-	// cursor is never applied to a different set of filters.
-	stateKey string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -100,23 +89,9 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"gzip rotated output files")
 	cmd.Flags().IntVar(&s.rotateKeep, "rotate-keep", 0,
 		"keep at most this many rotated files (0 keeps all)")
-	cmd.Flags().StringVar(&s.stateFile, "state-file", "",
-		"record cursor metadata in this file, so a later run can resume from it")
-	cmd.Flags().BoolVar(&s.resume, "resume", false,
-		"resume from the last cursor recorded in --state-file")
-	cmd.Flags().DurationVar(&s.pruneInterval, "prune-interval", stream.DefaultPruneInterval,
-		"how often to compact the cursor metadata file in the background (0 compacts once)")
-	cmd.Flags().IntVar(&s.pruneKeep, "prune-keep", stream.DefaultPruneKeep,
-		"keep at most this many cursor metadata entries per stream (0 keeps all)")
-	cmd.Flags().DurationVar(&s.pruneMaxAge, "prune-max-age", 0,
-		"drop cursor metadata entries older than this (0 keeps entries regardless of age)")
 }
 
-// validate checks the stream options before anything is fetched.
-//
-// cmd is required: it is what tells an explicitly-set flag apart from one
-// that is merely carrying its default.
-func (s *streamFlags) validate(cmd *cobra.Command) error {
+func (s *streamFlags) validate() error {
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
 	}
@@ -137,37 +112,6 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.output == "" {
 		if s.rotateSize != 0 || s.rotateInterval != 0 || s.rotateCompress || s.rotateKeep != 0 {
 			return fmt.Errorf("--rotate-* flags require --output-file")
-		}
-	}
-	if err := s.validateState(cmd); err != nil {
-		return err
-	}
-	return nil
-}
-
-// validateState checks the cursor metadata options.
-//
-// The pruning flags only mean something when there is a file to prune, so
-// they are rejected on their own rather than being silently ignored.
-func (s *streamFlags) validateState(cmd *cobra.Command) error {
-	if s.pruneInterval < 0 {
-		return fmt.Errorf("--prune-interval must not be negative")
-	}
-	if s.pruneKeep < 0 {
-		return fmt.Errorf("--prune-keep must not be negative")
-	}
-	if s.pruneMaxAge < 0 {
-		return fmt.Errorf("--prune-max-age must not be negative")
-	}
-	if s.stateFile != "" {
-		return nil
-	}
-	if s.resume {
-		return fmt.Errorf("--resume requires --state-file")
-	}
-	for _, name := range []string{"prune-interval", "prune-keep", "prune-max-age"} {
-		if cmd.Flags().Changed(name) {
-			return fmt.Errorf("--%s requires --state-file", name)
 		}
 	}
 	return nil
@@ -281,11 +225,7 @@ last. The semantics are identical to ` + "`stellar events --topic`" + `.
 
 Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
-reports the missed ledger range and exits 2 rather than skipping silently.
-
-With --state-file the position reached is recorded after every page, and a
-background pruner keeps that file from growing without bound. Add --resume to
-start the next run where the last one stopped.`,
+reports the missed ledger range and exits 2 rather than skipping silently.`,
 		Example: `  # Follow one contract
   prism events --contract CBGSB... --follow
 
@@ -299,7 +239,7 @@ start the next run where the last one stopped.`,
   prism events --from 1234567 --follow`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := sf.validate(cmd); err != nil {
+			if err := sf.validate(); err != nil {
 				return err
 			}
 
@@ -309,7 +249,16 @@ start the next run where the last one stopped.`,
 			}
 			defer closeClient()
 
-			sf.stateKey = eventsStateKey(contractIDs, topics, eventTypes)
+			from := sf.from
+			if from == 0 {
+				// Starting "now" means asking the server where now is; the
+				// RPC requires a concrete start ledger.
+				latest, err := latestLedger(cmd.Context(), client)
+				if err != nil {
+					return err
+				}
+				from = latest
+			}
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewEventSource(client, stream.EventQuery{
@@ -321,7 +270,7 @@ start the next run where the last one stopped.`,
 				})
 			}
 
-			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
+			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
 		},
 	}
 
@@ -350,16 +299,12 @@ func newLedgersCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		Long: `Stream ledger close metadata as ledgers close.
 
 Ledger metadata is large, so --compact is often what you want when watching
-for liveness rather than reading contents.
-
-With --state-file the position reached is recorded after every page, and a
-background pruner keeps that file from growing without bound. Add --resume to
-start the next run where the last one stopped.`,
+for liveness rather than reading contents.`,
 		Example: `  prism ledgers --follow --compact
   prism ledgers --from 1234567 --limit 5 --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := sf.validate(cmd); err != nil {
+			if err := sf.validate(); err != nil {
 				return err
 			}
 
@@ -369,7 +314,14 @@ start the next run where the last one stopped.`,
 			}
 			defer closeClient()
 
-			sf.stateKey = "ledgers"
+			from := sf.from
+			if from == 0 {
+				latest, err := latestLedger(cmd.Context(), client)
+				if err != nil {
+					return err
+				}
+				from = latest
+			}
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewLedgerSource(client, stream.LedgerQuery{
@@ -377,7 +329,7 @@ start the next run where the last one stopped.`,
 					PageLimit:   sf.pageSize,
 				}), nil
 			}
-			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
+			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
 		},
 	}
 
@@ -392,23 +344,17 @@ type sourceFactory = stream.SourceFactory
 // runStream wires a source to a sink and runs the tailer until it finishes or
 // the operator interrupts it. When backfill workers are configured it drains
 // the historical range concurrently before following live records.
-//
-// from is the ledger the operator asked for, or zero when they did not ask
-// for one. A zero means "start at the server's head", unless a recorded
-// cursor says otherwise.
 func runStream(
-	cmd *cobra.Command,
-	client rpc.Client,
+	ctx context.Context,
 	newSource sourceFactory,
 	from uint32,
 	sf *streamFlags,
 	g *globalFlags,
 	stdout, stderr io.Writer,
 ) (err error) {
-	if err := sf.validate(cmd); err != nil {
+	if err := sf.validate(); err != nil {
 		return err
 	}
-	ctx := cmd.Context()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -416,12 +362,6 @@ func runStream(
 	// partially written line never reaches a downstream consumer.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	// Diagnostics come from more than one goroutine: the stream reports
-	// retries and gaps, and the background cursor pruner reports what it
-	// compacted. The writer is serialised so those lines cannot interleave
-	// and so a test's stderr buffer cannot race.
-	stderr = newSyncWriter(stderr)
 
 	out, err := sf.newSink(stdout, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
@@ -431,52 +371,20 @@ func runStream(
 	}
 	if closer, ok := out.(io.Closer); ok {
 		defer func() {
-			// A failure to close the output is joined with whatever else
-			// went wrong rather than replacing it: two causes are more
-			// useful than one, and neither is worth losing.
-			err = errors.Join(err, closer.Close())
+			closeErr := closer.Close()
+			if closeErr == nil {
+				return
+			}
+			if err == nil {
+				err = closeErr
+				return
+			}
 		}()
 	}
-
-	// The cursor metadata file is opened before the stream starts, so a
-	// recorded cursor is known before the first fetch and the pruner is
-	// running for the whole of the run.
-	state, err := openCursorState(ctx, sf, sf.stateKey, stderr)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		// The context may already be cancelled by an interrupt, but the
-		// final compaction is local work that should still happen.
-		err = errors.Join(err, state.close(context.WithoutCancel(ctx)))
-	}()
 
 	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
-	}
-	if state != nil {
-		// An explicit --from wins over a recorded cursor: the operator
-		// asked for a position, so it is the position that counts.
-		if sf.from == 0 {
-			opts.StartCursor = state.cursor
-		}
-		opts.OnPage = func(page stream.Page) {
-			if recordErr := state.record(ctx, page); recordErr != nil {
-				fmt.Fprintf(stderr, "prism: recording cursor metadata: %v\n", recordErr)
-			}
-		}
-	}
-
-	startFrom := from
-	if startFrom == 0 && opts.StartCursor == "" {
-		// Starting "now" means asking the server where now is; the
-		// RPC requires a concrete start ledger.
-		latest, err := latestLedger(ctx, client)
-		if err != nil {
-			return err
-		}
-		startFrom = latest
 	}
 
 	if sf.from > 0 && sf.backfillWorkers > 1 {
@@ -493,7 +401,6 @@ func runStream(
 			Clock:            opts.Clock,
 			OnRetry:          opts.OnRetry,
 			OnGap:            opts.OnGap,
-			OnPage:           opts.OnPage,
 		})
 		if err != nil {
 			return err
@@ -517,11 +424,11 @@ func runStream(
 			if drainer.Until() == ^uint32(0) {
 				return fmt.Errorf("cannot follow beyond the maximum ledger sequence")
 			}
-			startFrom = drainer.Until() + 1
+			from = drainer.Until() + 1
 		}
 	}
 
-	src, err := newSource(startFrom)
+	src, err := newSource(from)
 	if err != nil {
 		return err
 	}

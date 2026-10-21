@@ -33,20 +33,11 @@ RPC ───►│  Source  ├───────────►│ Tailer �
               ▲
               │ (optional)
          stream.Pool  — round-robin + failover over several RPC URLs
-
-        ┌────────┐  OnPage: the position each delivered page reached
-        │ Tailer ├───┐
-        └────────┘   │  ┌──────────┐  append  ┌──────────────────┐
-                      └─►│  Pruner  ├─────────►│ cursor journal   │  --state-file
-                         └──────────┘  prune   └──────────────────┘
-                         pruning.go            cursor_store.go
 ```
 
 One goroutine, no channels. The tailer fetches a page, emits its records
 synchronously, advances the cursor, and repeats. Concurrency would buy nothing
-— the bottleneck is the network — and would cost determinism in tests. The
-pruner is the one addition: it owns a single background goroutine, and the
-command joins it before it exits.
+— the bottleneck is the network — and would cost determinism in tests.
 
 ## Package layout
 
@@ -57,8 +48,6 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   color.go            --color parsing and NO_COLOR handling
   completion.go       bash/zsh/fish/powershell script generation
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
-  state.go            the cursor journal, the pruner, and the resume point
-  syncwriter.go       serialised stderr, for the diagnostics several goroutines write
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
 pkg/stream/
@@ -74,8 +63,6 @@ pkg/stream/
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
   gap_recovery.go     GapStrategy, Rewinder and gap handling
-  pruning.go          CursorMetadata, MetadataStore, Pruner
-  cursor_store.go     file-backed cursor metadata journal
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
 pkg/sink/
@@ -262,114 +249,6 @@ Both sources synthesise fixed-width zero-padded IDs (`%010d-%06d-…`) from
 the ledger sequence, preserving the lexicographic-order contract the tailer
 depends on.
 
-## Cursor metadata and background pruning (`pkg/stream/pruning.go`)
-
-A long-running stream produces one checkpoint per page, and a page per ledger
-close. Left alone that journal grows without bound: a week of following a
-contract is hundreds of thousands of lines of metadata nobody asked for.
-
-`--state-file` makes the cursor durable. After every page that was emitted
-**in full**, prism records the position it reached, and a background pruner
-keeps the file from growing:
-
-| Flag | Meaning |
-|---|---|
-| `--state-file <path>` | the journal: one JSON checkpoint per line |
-| `--resume` | start this run from the last recorded position |
-| `--prune-interval` | how often the background pruner compacts the file |
-| `--prune-keep` | how many checkpoints to keep per stream |
-| `--prune-max-age` | how old a checkpoint may be before it is dropped |
-
-The pieces:
-
-| Type | Role |
-|---|---|
-| `stream.CursorMetadata` | one checkpoint: key, cursor, ledger, timestamp |
-| `stream.MetadataStore` | the seam: append, latest, prune |
-| `stream.FileMetadataStore` | the file-backed journal |
-| `stream.Pruner` | the background compactor |
-| `stream.Options.OnPage` | how the tailer reports a delivered page |
-| `stream.Options.StartCursor` | how a tailer resumes |
-| `stream.DrainerConfig.OnPage` | how a concurrent backfill reports a delivered page |
-
-**The checkpoint is written after the emit, not before.** `Options.OnPage`
-fires once a page has been delivered in full. A page cut short by `--limit`,
-or one the sink rejected, produces no checkpoint, so a recorded position can
-never point past records that were not delivered. The callback also skips a
-page that returned nothing and left the cursor where it was: that says
-nothing new, and reporting it would fill the journal with duplicates.
-
-**A concurrent backfill reports its position too.** `--backfill-workers`
-drains a historical range with several workers before the follow phase
-begins, so it is the phase that produces the most pages. `DrainerConfig.OnPage`
-carries the same `stream.Page` the tailer uses: the workers cover disjoint
-ledger ranges and their pages are merged by record ID, so the pages are
-delivered in ascending order and each reported position is further along than
-the last. A page the `--limit` cut short never reaches the callback.
-
-**The pruner owns one goroutine, and joins it.** `Pruner.Start` begins the
-loop; `Pruner.Close` cancels it and waits for it to return. The CLI closes
-the pruner before the command exits — including on Ctrl-C — so an
-interrupted stream leaves nothing running behind it. A failed pass is
-reported on stderr and the loop continues: a file that cannot be compacted
-right now is no reason to stop streaming records.
-
-**Every `Close` waits, not only the first one.** `Pruner.Close` is safe to
-call more than once, and each caller waits for the goroutine to be joined. A
-second `Close` that returned early would report the pruner as stopped when
-it is not, and a caller that trusted that report could exit with the
-goroutine still alive.
-
-**Diagnostics are serialised.** The pruner reports what it compacted on
-stderr, and so does the stream — from a different goroutine. `runStream`
-wraps stderr in a mutex-guarded writer, so those lines cannot interleave
-mid-sentence and a test's stderr buffer cannot race. `fmt.Fprintf` formats
-into its own buffer and hands the result over in a single `Write`, so one
-lock acquisition covers one whole line.
-
-**The final compaction happens even on Ctrl-C.** When the command returns, the
-pruner is closed and one last pass runs against a context detached from the
-command's, so an interrupted run still leaves a compacted journal behind. A
-failure there is reported as the command's error rather than swallowed.
-
-**Rewrites are atomic.** The pruner writes the compacted journal to a
-temporary file in the same directory and renames it over the old one. A
-reader sees either the whole old file or the whole new one, and a crash
-mid-rewrite leaves the previous file intact. The file's permissions are
-carried over.
-
-**The prune pass streams.** It counts the entries per key in one pass and
-rewrites in a second, keeping only the newest `--prune-keep` per key in
-memory. The journal may be large; the pruner's memory footprint is not a
-function of its size.
-
-**A resumed stream is still gap-checked.** A recorded cursor is a real
-position, and the server may have pruned past it. Resuming from a stale
-checkpoint reports the missed range and exits 2, exactly like any other gap.
-
-**Resume is opt-in, and it is not exactly-once.** It narrows the restart
-window from "the whole run" to "one record"; a process killed between the
-emit and the write still re-emits. The README keeps saying so.
-
-**Migration notes.** Nothing existing changed: no CLI flag was renamed or
-removed, and no exported type lost a field or changed a signature. The
-feature adds to the public surface:
-
-| Added | Where |
-|---|---|
-| `stream.CursorMetadata`, `stream.MetadataStore`, `stream.PrunePolicy`, `stream.PruneStats`, `stream.PruneOptions`, `stream.PrunerStats` | `pkg/stream/pruning.go` |
-| `stream.MetadataStore`, `stream.PrunePolicy`, `stream.PruneStats`, `stream.FileMetadataStore` | `pkg/stream/cursor_store.go` |
-| `stream.Page` | `pkg/stream/tail.go` |
-| `stream.Options.OnPage`, `stream.Options.StartCursor` | `pkg/stream/tail.go` |
-| `stream.DrainerConfig.OnPage` | `pkg/stream/drainer.go` |
-| `--state-file`, `--resume`, `--prune-interval`, `--prune-keep`, `--prune-max-age` | every streaming command |
-
-`stream.Pruner` and `stream.FileMetadataStore` are new types rather than
-changes to existing ones, so a caller that ignores them compiles and behaves
-exactly as before. The one behavioural change visible to an existing caller
-is that a streaming command now reads `--state-file` before its first fetch;
-with no `--state-file` nothing is opened and nothing is written.
-
 ## Rotating file sink (`--output-file` + `--rotate-*`)
 
 Every streaming command accepts `--output-file`. When set, the chosen format
@@ -409,15 +288,6 @@ failure, full-page draining, concurrent backfill, batcher count/time/explicit
 flushes, and task-group cancellation. Gap recovery is also unit-tested
 without a network through the `Rewinder` seam.
 
-The cursor metadata store is tested the same way: appends and rewrites
-against a real file in a temporary directory, a pruner that keeps running
-after a failure, a pruner whose goroutine is joined rather than abandoned,
-and a tailer that resumes from a recorded cursor and is still gap-checked
-when it does. `internal/cli` runs the whole thing end to end against
-`internal/fakerpc`: a run that records checkpoints, a file that stays
-bounded while the stream runs, and a second run that picks up where the
-first stopped.
-
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
 a regression that stops the tailer terminating **fails** rather than hanging
@@ -431,12 +301,6 @@ The invariants were verified by breaking the code on purpose:
 |---|---|
 | De-duplication disabled | `TestTailSuppressesReplayedPages` and `TestTailRejectsOutOfOrderPages` fail with exact diagnostics |
 | Gap detection disabled | `TestTailDetectsRetentionGap` fails in 0.00s |
-| Checkpoint written before the page was emitted | `TestTailDoesNotReportAPartiallyEmittedPage` and `TestTailDoesNotReportAPageTheSinkRejected` fail |
-| Pruner goroutine abandoned instead of joined | `TestPrunerCloseJoinsItsGoroutine` fails: `Close()` returned while the pruner was still running |
-| Second `Close` returning without joining the goroutine | `TestPrunerConcurrentCloseWaitsForTheGoroutine` fails: `Close() returned (<nil>) while the pruner was still running` |
-| Diagnostics written to stderr without serialisation | `TestSyncWriterSerialisesConcurrentWrites` fails with a `DATA RACE` report from the race detector |
-| Prune keeping the oldest entries | `TestFileMetadataStorePruneKeepsTheNewestPerKey` fails |
-| Final compaction at shutdown removed | `TestEventsCommandPrunesTheStateFile` fails: 10 checkpoints left instead of 2 |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
