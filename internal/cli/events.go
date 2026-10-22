@@ -528,6 +528,12 @@ func closeSink(s stream.Sink) {
 	}
 }
 
+// closerFunc adapts a function to io.Closer.
+type closerFunc func() error
+
+// Close implements io.Closer.
+func (f closerFunc) Close() error { return f() }
+
 // options builds the tailer options implied by the flags.
 func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, error) {
 	strategy, err := stream.ParseGapStrategy(s.gapStrategy)

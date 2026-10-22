@@ -252,6 +252,18 @@ func (n *NDJSON) EmitBatch(records []stream.Record) error {
 }
 
 func (n *NDJSON) encode(r stream.Record) error {
+	payload, err := n.document(r)
+	if err != nil {
+		return err
+	}
+	if err := n.enc.Encode(payload); err != nil {
+		return fmt.Errorf("ndjson: encoding record %s: %w", r.ID, err)
+	}
+	return nil
+}
+
+// document builds the JSON shape for one record.
+func (n *NDJSON) document(r stream.Record) (any, error) {
 	var payload any
 
 	switch r.Kind {
@@ -276,14 +288,14 @@ func (n *NDJSON) encode(r stream.Record) error {
 				for _, t := range r.Event.TopicXDR {
 					raw, err := n.decodeXDR(t)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Topics = append(line.Topics, raw)
 				}
 				if r.Event.ValueXDR != "" {
 					raw, err := n.decodeXDR(r.Event.ValueXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Value = raw
 				}
@@ -307,7 +319,7 @@ func (n *NDJSON) encode(r stream.Record) error {
 			if n.decode && r.Close.MetadataXDR != "" {
 				raw, err := n.decodeXDR(r.Close.MetadataXDR)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				line.Metadata = raw
 			} else {
@@ -347,21 +359,21 @@ func (n *NDJSON) encode(r stream.Record) error {
 				if r.Transaction.EnvelopeXDR != "" {
 					raw, err := n.decodeXDR(r.Transaction.EnvelopeXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Envelope = raw
 				}
 				if r.Transaction.ResultXDR != "" {
 					raw, err := n.decodeXDR(r.Transaction.ResultXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.Result = raw
 				}
 				if r.Transaction.ResultMetaXDR != "" {
 					raw, err := n.decodeXDR(r.Transaction.ResultMetaXDR)
 					if err != nil {
-						return err
+						return nil, err
 					}
 					line.ResultMeta = raw
 				}
@@ -514,13 +526,32 @@ func (n *NDJSON) encode(r stream.Record) error {
 		payload = line
 
 	default:
-		return fmt.Errorf("ndjson: unknown record kind %q", r.Kind)
+		return nil, fmt.Errorf("ndjson: unknown record kind %q", r.Kind)
 	}
 
-	if err := n.enc.Encode(payload); err != nil {
-		return fmt.Errorf("ndjson: encoding record %s: %w", r.ID, err)
+	return payload, nil
+}
+
+// EncodeRecord renders one record as the same JSON document NDJSON emits,
+// without the newline framing. Broker sinks use it as the message body, so a
+// Kafka or AMQP consumer sees exactly what `prism --json` would have printed.
+func EncodeRecord(r stream.Record, decode bool) ([]byte, error) {
+	n := &NDJSON{
+		decode:  decode,
+		lensFmt: lensformat.NewJSONFormatter(lensformat.WithIndent("")),
 	}
-	return nil
+	payload, err := n.document(r)
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		return nil, fmt.Errorf("ndjson: encoding record %s: %w", r.ID, err)
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // feeBumpLineOf converts a classification to its wire shape, or returns nil
