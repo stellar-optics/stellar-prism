@@ -1152,6 +1152,64 @@ first frame. PUB delivery is intentionally best-effort: a slow or disconnected
 subscriber can miss messages under ZeroMQ's high-water-mark semantics. Use
 NATS JetStream when publisher acknowledgements are required.
 
+#### Audit trail (`--sink-audit`, `pkg/sink/audit_log.go`)
+
+The audit sink writes a trail that shows whether it was changed after the fact.
+Every record is hashed together with the hash of the record before it:
+
+```
+Hash_n = SHA256(Hash_{n-1} + Record_n)
+```
+
+The chain starts at a genesis hash computed over the header, so the header
+cannot be swapped for another one without breaking every record that follows.
+Each record is written as one JSON line holding the sequence number, the
+ledger, the record id and kind, the previous hash, the new hash and the record
+itself — the same document `--json` writes, so an auditor reads the trail
+without a second decoder.
+
+Editing, deleting or inserting a line changes every hash after it, and the
+verifier names the line of each anomaly. On top of the chain, a checkpoint is
+written every `--sink-audit-checkpoint` records (100 by default, 0 writes one
+after every record) and signed with an Ed25519 key:
+
+```
+Signature = Ed25519(SigningKey, Hash_n)
+```
+
+The signature covers the chain hash at that point, so a trail that was edited
+and re-hashed from the beginning still fails to verify against the checkpoints
+written before the edit. The signing key is the PEM private key at
+`--sink-audit-key`, or `<audit file>.key` when the flag is left out; it is
+created exclusively with mode `0600` the first time it is needed, so two
+processes cannot each write a key and leave the trail signed by one of them.
+
+The trail is append-only across runs: a new sink reads the header, checks it
+against the signing key and continues the chain from the last entry. A log
+signed with a different key is refused rather than appended to. A final line
+left half-written by an interrupted run is truncated before the chain
+continues, so an audit log is never left with a dangling entry.
+
+`prism audit-verify` (`internal/cli/audit.go`) recomputes the chain, checks
+every signed checkpoint against the chain it covers and against the public key
+in the header, and reports each anomaly with its line:
+
+| Anomaly | Meaning |
+|---|---|
+| `modified` | the record hash does not match the record |
+| `deleted` | the sequence numbers skip ahead |
+| `inserted` | the sequence numbers go back, or the log holds a second header |
+| `chain_break` | the record does not link to the entry before it |
+| `checkpoint_mismatch` | the checkpoint does not match the chain it covers |
+| `bad_signature` | the checkpoint signature does not verify |
+| `key_mismatch` | the trail is signed with another key than the one expected |
+| `header_mismatch` | the header was changed or is not supported |
+
+The command exits 0 when the trail is intact and 1 when it was tampered with.
+`--public-key` pins the key the trail must be signed with, and
+`--print-public-key` prints the key the trail carries, so it can be pinned
+somewhere the trail cannot reach.
+
 #### Configuration rules
 
 Secrets are read from the environment wherever possible, because command-line

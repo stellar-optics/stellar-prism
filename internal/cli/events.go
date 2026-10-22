@@ -211,7 +211,7 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 // cmd is required: it is what tells an explicitly-set flag apart from one
 // that is merely carrying its default.
 func (s *streamFlags) validate(cmd *cobra.Command) error {
-	if err := s.sinks.validate(); err != nil {
+	if err := s.sinks.validate(cmd); err != nil {
 		return err
 	}
 	format := strings.ToLower(s.format)
@@ -259,6 +259,14 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
 		return fmt.Errorf("--dlq-file must differ from --output-file")
+	}
+	if s.sinks.auditFile != "" {
+		if s.output != "" && samePath(s.sinks.auditFile, s.output) {
+			return fmt.Errorf("--sink-audit must differ from --output-file")
+		}
+		if s.dlqFile != "" && samePath(s.sinks.auditFile, s.dlqFile) {
+			return fmt.Errorf("--sink-audit must differ from --dlq-file")
+		}
 	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")

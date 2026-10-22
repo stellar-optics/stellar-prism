@@ -59,6 +59,9 @@ type sinkFlags struct {
 	natsJetStream    bool
 	zmqEndpoint      string
 	zmqTopic         string
+	auditFile        string
+	auditKeyFile     string
+	auditCheckpoint  int
 	metrics          *sink.Prometheus
 	constructedSinks []io.Closer
 }
@@ -119,6 +122,12 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.BoolVar(&s.natsJetStream, "nats-jetstream", false, "wait for JetStream publish acknowledgements")
 	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "ZeroMQ PUB endpoint")
 	flags.StringVar(&s.zmqTopic, "zmq-topic", "stellar.events.{{.ContractID}}", "ZeroMQ topic template using .ContractID, .Topic0, .ID or .Ledger")
+	flags.StringVar(&s.auditFile, "sink-audit", "",
+		"write a tamper-evident audit trail, chained with SHA-256 and signed at checkpoints, to this file")
+	flags.StringVar(&s.auditKeyFile, "sink-audit-key", "",
+		"Ed25519 private key signing the audit checkpoints (default <audit file>.key, created if absent)")
+	flags.IntVar(&s.auditCheckpoint, "sink-audit-checkpoint", sink.DefaultAuditCheckpointRecords,
+		"write a signed audit checkpoint every this many records (0 writes one after every record)")
 
 	registerFlagCompletion(cmd, "cloud-provider", "s3", "gcs")
 	registerFlagCompletion(cmd, "syslog-format", string(sink.SyslogRFC5424), string(sink.SyslogJournald))
@@ -131,7 +140,7 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 // only for help text.
 const defaultGCSEndpoint = "https://storage.googleapis.com"
 
-func (s *sinkFlags) validate() error {
+func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	if s.webhookSecret != "" && s.webhookURL == "" {
 		return fmt.Errorf("--webhook-secret requires --webhook-url")
 	}
@@ -191,6 +200,26 @@ func (s *sinkFlags) validate() error {
 	if s.natsURL == "" && s.natsJetStream {
 		return fmt.Errorf("--nats-jetstream requires --sink-nats")
 	}
+	return s.validateAudit(cmd)
+}
+
+// validateAudit checks the audit trail options.
+//
+// The flags only mean something when there is a trail to write, so they are
+// rejected on their own rather than being silently ignored.
+func (s *sinkFlags) validateAudit(cmd *cobra.Command) error {
+	if s.auditFile == "" {
+		if s.auditKeyFile != "" {
+			return fmt.Errorf("--sink-audit-key requires --sink-audit")
+		}
+		if cmd != nil && cmd.Flags().Changed("sink-audit-checkpoint") {
+			return fmt.Errorf("--sink-audit-checkpoint requires --sink-audit")
+		}
+		return nil
+	}
+	if s.auditCheckpoint < 0 {
+		return fmt.Errorf("--sink-audit-checkpoint must not be negative")
+	}
 	return nil
 }
 
@@ -200,7 +229,7 @@ func (s *sinkFlags) validate() error {
 // stays exactly the sink it was before these flags existed. On a construction
 // failure every sink already opened is closed, so a bad flag cannot leak a
 // metrics listener or a socket.
-func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) (out stream.Sink, err error) {
+func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error)) (out stream.Sink, err error) {
 	sinks := []stream.Sink{base}
 	s.constructedSinks = nil
 
@@ -238,6 +267,23 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 		sinks = append(sinks, metrics)
 	}
 
+	if s.auditFile != "" {
+		audit, auditErr := sink.NewAuditSink(sink.AuditOptions{
+			Path:              s.auditFile,
+			KeyPath:           s.auditKeyFile,
+			CheckpointRecords: s.auditCheckpoint,
+			Decode:            decode,
+		})
+		if auditErr != nil {
+			return nil, auditErr
+		}
+		s.constructedSinks = append(s.constructedSinks, audit)
+		// The trail is written before anything that can fail on the
+		// network, so a record that was delivered is always a record the
+		// audit trail saw.
+		sinks = append(sinks, audit)
+	}
+
 	if s.webhookURL != "" {
 		secret := s.webhookSecret
 		if secret == "" {
@@ -250,7 +296,7 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 			MaxDelay:   s.webhookTimeout,
 			MaxRetries: s.webhookMaxRetry,
 			Jitter:     0.2,
-			Decode:     !raw,
+			Decode:     decode,
 			OnError:    observeError,
 		})
 		if hookErr != nil {
@@ -272,7 +318,7 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 			BatchBytes:   s.cloudBytes,
 			MaxDelay:     s.cloudTimeout,
 			Compress:     s.cloudCompress,
-			Decode:       !raw,
+			Decode:       decode,
 			Jitter:       0.2,
 			OnError:      observeError,
 		})
@@ -293,7 +339,7 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 			Format:   sink.SyslogFormat(strings.ToLower(s.syslogFormat)),
 			Facility: s.syslogFacility,
 			AppName:  s.syslogAppName,
-			Decode:   !raw,
+			Decode:   decode,
 		})
 		if logErr != nil {
 			_ = conn.Close()
@@ -308,7 +354,7 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 		if apiKey == "" {
 			apiKey = os.Getenv(esAPIKeyEnvVar)
 		}
-		es, esErr := sink.NewElasticsearchSink(sink.ElasticsearchOptions{URL: s.esURL, Index: s.esIndex, Username: s.esUsername, Password: s.esPassword, APIKey: apiKey, BatchSize: s.esBatchSize, MaxDelay: s.esFlushInterval, Decode: !raw})
+		es, esErr := sink.NewElasticsearchSink(sink.ElasticsearchOptions{URL: s.esURL, Index: s.esIndex, Username: s.esUsername, Password: s.esPassword, APIKey: apiKey, BatchSize: s.esBatchSize, MaxDelay: s.esFlushInterval, Decode: decode})
 		if esErr != nil {
 			return nil, esErr
 		}
@@ -316,7 +362,7 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 		sinks = append(sinks, es)
 	}
 	if s.natsURL != "" {
-		natsSink, natsErr := sink.NewNATSSink(sink.NATSOptions{URL: s.natsURL, Subject: s.natsSubject, JetStream: s.natsJetStream, Decode: !raw})
+		natsSink, natsErr := sink.NewNATSSink(sink.NATSOptions{URL: s.natsURL, Subject: s.natsSubject, JetStream: s.natsJetStream, Decode: decode})
 		if natsErr != nil {
 			return nil, natsErr
 		}
@@ -324,7 +370,7 @@ func (s *sinkFlags) addTo(base stream.Sink, raw bool, onAsyncError func(error)) 
 		sinks = append(sinks, natsSink)
 	}
 	if s.zmqEndpoint != "" {
-		zmqSink, zmqErr := sink.NewZeroMQSink(sink.ZeroMQOptions{Endpoint: s.zmqEndpoint, Topic: s.zmqTopic, Decode: !raw})
+		zmqSink, zmqErr := sink.NewZeroMQSink(sink.ZeroMQOptions{Endpoint: s.zmqEndpoint, Topic: s.zmqTopic, Decode: decode})
 		if zmqErr != nil {
 			return nil, zmqErr
 		}

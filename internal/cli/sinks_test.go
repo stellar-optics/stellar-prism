@@ -487,6 +487,7 @@ func TestStreamingHelpAdvertisesSinkFlags(t *testing.T) {
 		"--webhook-url", "--webhook-secret", "--cloud-provider", "--cloud-bucket",
 		"--metrics-addr", "--syslog-address", "--syslog-format", "--syslog-facility",
 		"--sink-es-url", "--sink-es-index", "--sink-nats", "--nats-subject", "--sink-zmq", "--zmq-topic",
+		"--sink-audit", "--sink-audit-key", "--sink-audit-checkpoint",
 	} {
 		if !strings.Contains(stdout, flag) {
 			t.Errorf("help does not mention %s", flag)

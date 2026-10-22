@@ -163,6 +163,7 @@ emits:
 | `--sink-es-url` | Elasticsearch/OpenSearch bulk indexing, partitioned into a daily index |
 | `--sink-nats` | NATS core publish or JetStream acknowledgements (`--nats-jetstream`) |
 | `--sink-zmq` | ZeroMQ PUB messages with templated topic and JSON payload frames |
+| `--sink-audit` | Tamper-evident audit trail: SHA-256 hash chain with signed checkpoints |
 
 ```sh
 # Fan a live stream out to a receiver and to S3-compatible storage
@@ -190,6 +191,9 @@ prism events --follow --sink-nats nats://127.0.0.1:4222 \
 # Broadcast multipart [topic, JSON] messages over ZeroMQ PUB
 prism events --follow --sink-zmq tcp://127.0.0.1:5556 \
   --zmq-topic 'stellar.events.{{.ContractID}}'
+
+# Keep a tamper-evident audit trail of everything the stream saw
+prism events --follow --sink-audit /var/log/prism/audit.log
 ```
 
 Credentials come from the environment (`PRISM_WEBHOOK_SECRET`, `PRISM_ES_API_KEY`,
@@ -199,6 +203,38 @@ at-least-once: a batch is retried until acknowledged and uses a stable key or
 delivery id so a receiver can de-duplicate. See
 [docs/architecture.md](docs/architecture.md#built-in-sinks) for the payload
 shapes and retry rules.
+
+### Auditing a stream
+
+`--sink-audit` writes a trail that shows whether it was changed after the
+fact. Every record is hashed together with the hash of the record before it:
+
+```
+Hash_n = SHA256(Hash_{n-1} + Record_n)
+```
+
+so editing, deleting or inserting a line changes every hash after it. A signed
+checkpoint is written every `--sink-audit-checkpoint` records (100 by default),
+which is what catches a trail that was edited and re-hashed from the beginning.
+The signing key is an Ed25519 private key at `--sink-audit-key`, or
+`<audit file>.key` when the flag is left out; it is created with mode `0600`
+the first time it is needed.
+
+```sh
+# Write a trail and check it later
+prism events --follow --sink-audit /var/log/prism/audit.log
+prism audit-verify /var/log/prism/audit.log
+
+# Pin the key the trail must be signed with, then verify against it
+prism audit-verify --print-public-key /var/log/prism/audit.log > prism.pub
+prism audit-verify --public-key prism.pub /var/log/prism/audit.log
+```
+
+`prism audit-verify` recomputes the chain, checks every signed checkpoint and
+names the line of every anomaly it finds. It exits 0 when the trail is intact
+and 1 when it was tampered with. The trail is append-only across runs: a new
+run continues the chain of the existing log and refuses to continue a log that
+was signed with a different key.
 
 ### NDJSON for pipelines
 
