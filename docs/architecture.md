@@ -64,7 +64,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   heartbeat.go        the --heartbeat liveness line for idle follows
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
-  health.go           periodic getHealth and ledger latency evaluation
+  wire_log.go         debug HTTP wire logger with credential redaction
 pkg/stream/
   record.go           Record: the neutral item every source produces
   source.go           Source and Sink interfaces, GapError   ← the seams
@@ -499,334 +499,60 @@ single `rpc.Client`, so every command gains failover without knowing about it.
 Options: `WithHealthInterval` (0 disables the probe), `WithHealthTimeout`,
 `WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
 
-The pool's probe is a liveness check: it asks an unhealthy endpoint for its
-latest ledger and restores it when the call succeeds. It is not the latency
-checker described below. The two share the word "health" because both answer
-"is this endpoint usable?", but they run for different reasons and on different
-schedules.
+## Debug wire log (`--wire-log`)
 
-## RPC health checking (`pkg/rpc/health.go`)
-
-`prism health` evaluates an endpoint with a single `getHealth` call. It is
-useful as a CI gate, a cron probe, or a manual check when a stream looks stuck:
+When an RPC response does not match what the docs promised, the useful
+artefact is the exact HTTP exchange. `pkg/rpc/wire_log.go` provides
+`rpc.WireLogger`, an `http.RoundTripper` that records each request and response
+as one NDJSON object and then passes the exchange through unchanged.
+`rpc.NewWithTransport` installs it under the SDK client; `New` keeps its
+existing signature and behaviour.
 
 ```console
-$ prism health
-2026-10-21T12:00:00Z  healthy    status=healthy  latest=500  oldest=490  ledger-latency=1.2s  probe-latency=4ms  retention=17280
+$ prism events --from 3966000 --wire-log /tmp/prism-wire.ndjson
+$ jq -c 'select(.direction=="response") | {status, body}' /tmp/prism-wire.ndjson | head
 ```
 
-A check fails for any of four observable reasons:
-
-| Condition | Error | Meaning |
-|---|---|---|
-| `getHealth` returns an error | `rpc.ErrHealthCheckFailed` | the endpoint could not answer |
-| `status` is not `"healthy"` | `rpc.ErrUnhealthyStatus` | the server says it is not serving normally |
-| required fields are missing or inconsistent | `rpc.ErrInvalidHealthResponse` | the response cannot be evaluated |
-| latest ledger close time is too old | `rpc.ErrStaleLedger` | the endpoint has fallen behind the chain |
-
-The report carries the metrics the decision used:
-
-| Metric | Source | Meaning |
-|---|---|---|
-| `LedgerLatency` | `now - latestLedgerCloseTime` | staleness of the newest ledger |
-| `ProbeLatency` | duration of the `getHealth` call | RPC round-trip time |
-| `LatestLedger`, `OldestLedger`, `LedgerRetentionWindow` | `getHealth` | the retention bounds a stream would inherit |
-| `ConsecutiveFailures` | the checker | how many checks in a row have failed |
-
-`getHealth` is exposed as the optional `rpc.HealthClient` interface rather than
-as a method on `rpc.Client`. The streaming core never calls it, and widening
-the streaming interface would force every existing `Client` implementation and
-test double to grow a method it does not use. `SDKClient` and `stream.Pool`
-both implement it, so `--rpc-url` may be repeated and a failed endpoint fails
-over exactly like a streamed call.
-
-### Flags
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--follow` / `-f` | off | keep checking instead of exiting after one probe |
-| `--interval` | `30s` | delay between checks under `--follow` |
-| `--health-timeout` | `5s` | bound on a single `getHealth` request |
-| `--max-ledger-age` | `60s` | staleness limit for the latest ledger |
-| `--fail-after` | `0` | with `--follow`, exit 1 after N consecutive failures (0 keeps watching) |
-| `--json` | off | one JSON object per check, one per line |
-
-One probe exits 0 when healthy and 1 when not. `--follow` resets the failure
-count on a healthy result; `--fail-after` is what turns a watch into a gate.
-Ctrl-C is a clean stop and exits 0, because an operator stopping a watch is not
-an endpoint failure. The command validates every flag before opening a client,
-so a bad interval never reaches the network.
-
-### Goroutine ownership
-
-The checker owns at most one goroutine. `Start` launches it and returns;
-`Stop` cancels it and **waits** for it to return. Every `Stop` waits, not only
-the first, so a second caller cannot report the checker stopped while a probe
-is still in flight. `Run` is the `Start`/`Stop` pair for a blocking command,
-and `defer Stop` handles the early-return paths. A one-shot `Check` starts no
-goroutine at all.
-
-The loop checks immediately, then on a ticker. It checks the context before
-each probe, and suppresses the observer when cancellation races with a probe:
-Ctrl-C must not print a spurious "unhealthy" line. The CLI joins the checker
-before it returns, so an interrupted `prism health --follow` leaves nothing
-running.
-
-### Determinism and offline tests
-
-`NewHealthChecker` takes an injected `HealthClient` and an injectable clock
-(`WithHealthClock`); it never constructs a client or contacts an endpoint by
-itself. Unit tests therefore run with no network and no real sleeps:
-
-- `pkg/rpc/health_test.go` covers every classification branch, the latency
-  arithmetic, failure reset, context cancellation, observer delivery, and both
-  `Stop` invariants (join an in-flight probe, idempotent stop).
-- `internal/cli/health_test.go` exercises the command end to end against
-  `internal/fakerpc`: healthy JSON, human output, stale and unhealthy exits,
-  `--follow --fail-after`, clean cancellation, flag validation before any RPC
-  call, and a client without the optional capability.
-- `fakerpc.WithHealthResponse`, `WithHealthError` and `WithHealthScript` stage
-  real response sequences, including a final entry that repeats so a periodic
-  test terminates without timing guesswork.
-
-Mutation-checked, the same way as the streaming invariants:
-
-| Mutation | Result |
+| Flag | Meaning |
 |---|---|
-| Staleness check disabled | `TestHealthCheckerClassifiesFailures/stale_ledger` fails: `Check() = healthy, want a failure` |
-| `Stop` returns without joining the loop | `TestHealthCheckerStopWaitsForInFlightProbe` fails: `Stop() returned while a probe was still in flight` |
-| Consecutive failures never reset | `TestHealthCheckerResetsFailuresAfterSuccess` fails: `recovery = healthy=true failures=2, want healthy and 0` |
+| `--wire-log <path>` | append the debug NDJSON log to this file; `-` writes to stderr |
+| `--wire-log-max-body <bytes>` | cap each recorded body; `0` uses 1 MiB, `-1` disables bodies |
 
-### Compatibility
+Each line carries `time`, `direction` (`request`, `response`, or `error`),
+`method`, `url`, headers, status, duration and the body where applicable.
+Bodies are recorded as UTF-8 text when possible and base64 otherwise, with a
+`truncated` marker when the cap was reached.
 
-The feature is additive. `rpc.Client`, every existing command and every
-existing flag are unchanged. New exported surface:
+**Credentials are masked before the line is encoded.** The default redaction
+set is `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
+`X-Api-Key`, `X-Auth-Token` and `X-Amz-Security-Token`;
+`WireLogOptions.RedactHeaders` adds provider-specific names. URL userinfo
+(including basic-auth credentials) is replaced with `[REDACTED]`, as are
+values of credential-bearing query parameters such as `token` and `api_key`.
+Transport error text is scrubbed with the same values, because those messages
+often echo the URL that failed.
 
-| Added | Where |
-|---|---|
-| `rpc.HealthClient` | `pkg/rpc/health.go` |
-| `rpc.HealthChecker`, `rpc.NewHealthChecker`, `rpc.HealthReport`, `rpc.HealthOption` | `pkg/rpc/health.go` |
-| `rpc.WithHealthInterval`, `WithHealthTimeout`, `WithMaxLedgerAge`, `WithHealthClock`, `WithHealthObserver` | `pkg/rpc/health.go` |
-| `rpc.DefaultHealthCheckInterval`, `DefaultHealthCheckTimeout`, `DefaultMaxLedgerAge` | `pkg/rpc/health.go` |
-| `rpc.ErrHealthUnsupported`, `ErrHealthCheckFailed`, `ErrUnhealthyStatus`, `ErrStaleLedger`, `ErrInvalidHealthResponse`, `ErrInvalidHealthConfig`, `ErrHealthCheckerStarted` | `pkg/rpc/health.go` |
-| `SDKClient.GetHealth`, `Pool.GetHealth` | `pkg/rpc/client.go`, `pkg/stream/pool.go` |
-| `--follow`, `--interval`, `--health-timeout`, `--max-ledger-age`, `--fail-after`, `--json` | `prism health` |
-| `fakerpc.WithHealthResponse`, `WithHealthError`, `WithHealthScript`, `fakerpc.HealthBehaviour` | `internal/fakerpc` |
+**The exchange is not altered.** Request bodies are read through a bounded
+prefix and rebuilt as a replay reader followed by the untouched remainder;
+response bodies use the same mechanism. The transport and the caller therefore
+see exactly the bytes they would have seen without the logger, and memory use
+is capped by `--wire-log-max-body` rather than by the response size.
 
-## Active-passive high availability (`pkg/stream/ha.go`)
+**There is no background writer.** The logger writes under one mutex and
+starts no goroutine, so there is nothing to join on Ctrl-C and no queue that
+can grow. `WireLogger.Close` is idempotent, flushes a writer that supports
+`Flush`, and returns the first logging failure. The CLI closes the RPC client
+first, so an in-flight failover probe cannot write to a closed file, then syncs
+and closes the log. A logging failure (a full disk, for example) is reported on
+stderr but never replaces the RPC result — debug output must not turn a working
+stream into a failing one.
 
-A single prism instance is a single point of failure, and two instances
-streaming the same contract emit the same records twice and fight over the
-cursor file. `--ha-lease-file` makes a pair **active-passive**: the leader
-streams, the standby waits and takes over.
-
-Two mechanisms cooperate, because each covers a failure the other cannot.
-
-- **An advisory lock on the lease file** (`flock(2)`) is held for the whole of
-  a leader's term. The kernel drops it the moment the process dies, so a
-  crashed leader is replaced at once — no TTL to wait out.
-- **A lease record beside it** (`<path>.lease`) carries the holder, an
-  expiry and an **epoch**. It covers the case the lock cannot: a leader that
-  is alive but partitioned, and so neither renews nor exits. Its lease
-  expires, a standby fences it by claiming a higher epoch, and the old leader
-  notices on its next renewal that it has been replaced and stops.
-
-The epoch is the fencing token. It increases every time the lease changes
-hands, so a leader that was slow, paused or partitioned can tell that its
-term has ended and step down instead of continuing to emit alongside the new
-leader. The tailer compares the epoch on every poll: a change means the
-pages queued so far describe work the previous leader did, so they are
-dropped rather than committed, and the stream rewinds to the cursor the
-previous leader committed.
-
-```
-  leader                              standby
-  ──────                              ───────
-  flock(lease)  ──► held
-  write record {holder, epoch: 7, expires}
-                    renew every --ha-heartbeat
-                                         flock(lease)  ──► busy, lease live
-                                         ...lease expires...
-                                         write record {holder, epoch: 8}
-  renew ──► epoch 8 > 7, fenced
-  release the term                     flock(lease)  ──► held
-                                       write record {holder, epoch: 9}
-```
-
-The lease file must be on a file system that supports advisory locking (a
-shared NFS mount, for instance) so every instance sees the same lock. On a
-platform without `flock`, `lockFile` returns an error rather than pretending
-the lease works — the alternative would produce exactly the duplicate events
-the lease exists to prevent.
-
-A standby is alive but not ready: it is waiting for the lease, not serving.
-The health monitor is told about the change through the election's `OnChange`
-callback, so `/healthz` keeps answering 200 while `/readyz` answers 503.
-
-## Liveness and readiness probes (`pkg/stream/health.go`)
-
-`--health-port` serves the three endpoints a container orchestrator asks
-for. The state behind them is a `HealthMonitor`, fed by the tailer:
-
-| Endpoint | Answers |
-|---|---|
-| `/healthz` | 200 while the process is running and still making progress; 503 when it is stuck |
-| `/readyz` | 200 when the RPC is answering, the stream has not gapped, and the lag is within `--max-lag`; 503 otherwise |
-| `/metrics` | The same state in the Prometheus exposition format |
-
-The tailer reports progress after every successful fetch through
-`Options.OnProgress`, so the lag is the real distance between the stream's
-position and the server's head rather than a guess. A failed fetch marks the
-endpoint unreachable; a detected gap marks the stream gapped. Both make the
-stream not ready, because neither is a state a consumer should be sent into.
-
-Liveness is a staleness check: the monitor records when it was last updated,
-and a process that has not reported for `StaleAfter` (30s by default) is
-considered stuck. A standby is exempt — it is waiting for the lease, not
-wedged.
-
-## Graceful drain (`Tailer.Drain`)
-
-On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives
-the sinks and the state store a bounded window to finish:
-
-```sh
-prism events --follow --drain-timeout 15s
-```
-
-`Tailer.Drain(ctx, timeout)` writes out the records still held in the reorder
-buffer, flushes the sink and reports the pages that were delivered, which is
-what commits the final cursor. The timeout bounds the whole operation, and a
-drain that overruns it is reported rather than waited out: a process that is
-about to be killed cannot be helped by a longer flush.
-
-Two details make the drain safe rather than merely best-effort:
-
-- **Only one flush runs at a time.** `flushOutput` admits one flush through a
-  gate; a flush that overran its deadline is abandoned, and a second one
-  waits for it rather than starting alongside it. A sink that buffers would
-  otherwise write the same batch twice.
-- **The cursor is committed only for delivered pages.** A page that was
-  partly emitted is not reported, so a drain that fails half-way leaves the
-  cursor where it was and the next run re-emits the records that were not
-  delivered.
-
-The CLI runs the drain inside its own deadline and joins any error with the
-run's own, so a drain failure is reported rather than swallowed.
-
-## Run summary (`--stats`)
-
-Every streaming command accepts `--stats`, which prints one line on stderr as
-the command exits:
-
-```console
-$ prism events --from 1234567 --follow --stats
-...
-prism: stats: processed=1042 duplicates=7 retries=1 elapsed=2m3s
-```
-
-| Part | Meaning |
-|---|---|
-| `processed` | records handed to the sinks, summed over the backfill and follow phases |
-| `duplicates` | records dropped as duplicates: the tailer's high-water mark (`Stats.Duplicates`) plus the `--dedup-window` ring (`DedupSink.Dropped`) |
-| `retries` | fetches that failed and were retried |
-| `elapsed` | wall-clock time from the start of the run, rounded to milliseconds |
-
-Details:
-
-- **stderr, never stdout.** The summary is a diagnostic like every other
-  `prism:` line, so a piped `--json` stream is unaffected.
-- **Printed once, at the end.** Each phase contributes its `stream.Stats` as
-  it finishes; one deferred call prints after the drain, the cursor commit
-  and the sink close, so the numbers describe what actually reached the
-  sinks.
-- **Silent when there is nothing to summarise.** Without `--stats`, or when
-  the run fails before it starts fetching — a sink that cannot be built, an
-  unresolvable head — nothing is printed and the error stands alone.
-- **Nothing new to clean up.** `internal/cli/stats.go` is a plain struct the
-  run feeds; the reporter holds no goroutine and no timer. The one hazard is
-  counters owned by the *drain* goroutine: a drain that overruns
-  `--drain-timeout` is abandoned to it, so the summary reports snapshots
-  taken before it started — chosen with `errors.Is(drainErr, errTimedOut)` —
-  or a fresh read after a drain that completed and was joined.
-
-The flag is additive: a stream that does not ask for it prints exactly what
-it printed before.
-
-## Heartbeat (`--heartbeat`)
-
-A follow on a quiet contract is indistinguishable from a hung process unless
-something keeps saying the stream is alive. `--heartbeat` prints one line on
-stderr for every interval the stream waits without delivering a record:
-
-```console
-$ prism events --follow --heartbeat 30s
-prism: heartbeat: idle for 30s with no records
-prism: heartbeat: idle for 60s with no records
-```
-
-Details:
-
-- **Driven by the tailer's own waits.** `internal/cli/heartbeat.go` wraps
-  the injected `Clock` (`Options.Clock`), slicing each wait at the interval
-  so the beat lands *while* the stream waits — a line printed only after a
-  wait ends would say nothing about a process stuck inside one. The waits
-  are sliced rather than raced against a timer, so the beat needs no
-  goroutine of its own and there is nothing new to clean up at termination.
-- **Idle means idle.** The wrapped `OnPage` marks every page emitted in
-  full, restarting the window, so heartbeats never interrupt a busy stream
-  however long its polls take. The chain preserves what `OnPage` already
-  did — recording the cursor in `--state-file`.
-- **Follow only.** The backfill workers keep the plain clock: their waits
-  are fetch retries, not idle follow intervals, and `--heartbeat` without
-  `--follow` is rejected rather than silently ignored.
-- **Cancellation is unaffected.** Ctrl-C interrupts a wait at the next
-  slice boundary, with the wrapped clock's error passed through untouched.
-- **stderr, never stdout**, like every other `prism:` line, and only when
-  the flag is passed: a run that does not ask for it prints exactly what it
-  printed before.
-
-Retry backoffs pass through the wrapped clock too, so a long backoff may
-beat as well — which is honest: the process really is waiting, and the
-retry messages around it explain why.
-
-## Encrypted state files (`pkg/stream/crypto_state.go`)
-
-The cursor journal holds stream metadata, and on a shared file system or in a
-cloud bucket that is worth encrypting. `--state-passphrase-env` (or
-`--state-passphrase-file`, or a key management service) makes prism write an
-encrypted journal instead.
-
-The file is a header line followed by one envelope per entry:
-
-```
-{"version":1,"alg":"aes-256-gcm","key":{"kdf":"pbkdf2-hmac-sha256", ...}}
-{"version":1,"nonce":"...","ciphertext":"..."}
-```
-
-Each entry is sealed with authenticated **AES-256-GCM** under a fresh random
-nonce, with a fixed label as additional authenticated data so a ciphertext
-cannot be moved from one file into another. A file that was tampered with,
-truncated or written with a different key fails the authentication tag and is
-rejected with a clear error rather than being read as if it were intact.
-
-The key comes from exactly one place, decided by the flags and validated
-before anything is fetched. A passphrase is stretched into a key with
-PBKDF2-HMAC-SHA256 over a random salt, and the salt and iteration count are
-recorded in the header so the file stays readable by a future version; a key
-management service generates the data key and keeps the wrapped form, so the
-plaintext key never reaches the disk.
-
-| Source | Flag |
-|---|---|
-| Environment variable | `--state-passphrase-env NAME` |
-| File | `--state-passphrase-file PATH` |
-| AWS KMS | `--state-kms-provider aws --state-kms-key-id ARN` |
-| GCP KMS | `--state-kms-provider gcp --state-kms-key-id NAME` |
-
-Passing more than one source is an error rather than a silently ignored flag:
-an operator who believes the file is encrypted with a passphrase must never
-end up with a file encrypted with something else.
+The logger makes no network calls of its own; it can only observe a request
+the SDK was already going to make. Unit tests cover redaction, truncation,
+body replay, writer and reader failures, and close idempotence. The integration
+test in `internal/cli` drives a real `httptest` RPC server through the CLI and
+asserts that the Authorization header and URL password are absent from the
+written log.
 
 ## Derived transaction streams
 

@@ -64,7 +64,49 @@ func (s *TransactionSource) Rewind(ledger uint32) { s.query.StartLedger = ledger
 // roughly 10^13, so comparing it directly against the server's retention
 // floor is always false and detection silently becomes a no-op.
 func (s *TransactionSource) CursorLedger(cursor string) (uint32, bool) {
-	return transactionCursorLedger(cursor)
+	if cursor == "" {
+		return 0, false
+	}
+	// Try parsing as a full cursor (has the form ledger-tx-op-event). RPC
+	// cursors are TOID-encoded, while the derived sources synthesise a plain
+	// zero-padded ledger in the first segment; both must be understood.
+	if parts := strings.Split(cursor, "-"); len(parts) >= 2 {
+		// First part may be toid-encoded; parse it and extract the ledger
+		// sequence. Legacy transaction cursors carry the ledger directly
+		// ("%010d-%06d"), so fall back to the plain value when the TOID
+		// payload has no ledger in it.
+		idInt, err := strconv.ParseInt(parts[0], 10, 64)
+		if err == nil {
+			if parsed := toid.Parse(idInt); parsed.LedgerSequence > 0 {
+				return uint32(parsed.LedgerSequence), true
+			}
+			if n, err := strconv.ParseUint(parts[0], 10, 32); err == nil {
+				return uint32(n), true
+			}
+		idInt, err := strconv.ParseInt(parts[0], 10, 64)
+		if err == nil {
+			parsed := toid.Parse(idInt)
+			// A valid ledger sequence is never zero, so a zero here means the
+			// first segment is a plain ledger rather than a TOID.
+			if parsed.LedgerSequence != 0 {
+				return uint32(parsed.LedgerSequence), true
+			}
+		}
+		if n, err := strconv.ParseUint(parts[0], 10, 32); err == nil {
+			return uint32(n), true
+		}
+		// Fall back: try the second part as a plain ledger number.
+		if n, err := strconv.ParseUint(parts[1], 10, 32); err == nil {
+			return uint32(n), true
+		}
+		return 0, false
+	}
+	// No dash in cursor; try parsing as a plain decimal ledger.
+	n, err := strconv.ParseUint(cursor, 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(n), true
 }
 
 // Fetch implements Source.

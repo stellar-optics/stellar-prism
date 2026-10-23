@@ -9,8 +9,11 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -31,28 +34,110 @@ var Version = "dev"
 // in-memory fake and exercise the commands end to end without a network.
 // Production code never reassigns it.
 var newClient = func(urls []string, timeout time.Duration) (rpc.Client, error) {
+	return newClientWithTransport(urls, timeout, nil)
+}
+
+// newClientWithTransport builds the client when a transport wrapper must be
+// installed, which is how --wire-log observes every endpoint in a failover
+// pool. It is separate from newClient so the ordinary test seam keeps working
+// unchanged.
+func newClientWithTransport(urls []string, timeout time.Duration, transport http.RoundTripper) (rpc.Client, error) {
 	if len(urls) == 1 {
-		return rpc.New(urls[0], timeout), nil
+		return rpc.NewWithTransport(urls[0], timeout, transport), nil
 	}
 	return stream.NewPool(urls, stream.WithClientFactory(func(url string) rpc.Client {
-		return rpc.New(url, timeout)
+		return rpc.NewWithTransport(url, timeout, transport)
 	}))
 }
 
 // client resolves the configured endpoints and builds the client every
-// command shares.
-func client(g *globalFlags) (rpc.Client, error) {
-	return newClient(rpc.ResolveURLs(g.rpcURLs), g.timeout)
+// command shares. When a wire log is requested the logger is installed as the
+// HTTP transport, so it observes the same requests the SDK sends.
+func client(g *globalFlags, stderr io.Writer) (rpc.Client, func(), error) {
+	wire, closeWire, err := g.openWireLog(stderr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	urls := rpc.ResolveURLs(g.rpcURLs)
+	var c rpc.Client
+	if wire == nil {
+		c, err = newClient(urls, g.timeout)
+	} else {
+		c, err = newClientWithTransport(urls, g.timeout, wire)
+	}
+	if err != nil {
+		closeWire()
+		return nil, nil, err
+	}
+	return c, closeWire, nil
 }
 
 // openClient resolves the configured endpoints, builds the client and returns
 // the deferrable cleanup every command uses.
 func openClient(g *globalFlags, stderr io.Writer) (rpc.Client, func(), error) {
-	c, err := client(g)
+	c, closeWire, err := client(g, stderr)
 	if err != nil {
 		return nil, nil, err
 	}
-	return c, func() { closeClient(c, stderr) }, nil
+	return c, func() {
+		// Stop the failover probe and finish in-flight calls before the log
+		// is closed, so no request can write to a closed file.
+		closeClient(c, stderr)
+		closeWire()
+	}, nil
+}
+
+// openWireLog builds the debug logger implied by --wire-log.
+//
+// The returned cleanup is safe on every command path, including Ctrl-C:
+// closing the logger is idempotent, and the file is synced and closed after
+// the logger has finished writing. A failure is reported on stderr rather
+// than replacing the command's own result.
+func (g *globalFlags) openWireLog(stderr io.Writer) (*rpc.WireLogger, func(), error) {
+	if g.wireLog == "" {
+		return nil, func() {}, nil
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+
+	var (
+		w    io.Writer
+		file *os.File
+		err  error
+	)
+	if g.wireLog == "-" {
+		// Serialise with the stream's other diagnostics, which may be
+		// written from the pruner and the retry path at the same time.
+		w = newSyncWriter(stderr)
+	} else {
+		file, err = os.OpenFile(g.wireLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return nil, nil, fmt.Errorf("opening wire log %q: %w", g.wireLog, err)
+		}
+		w = file
+	}
+
+	logger := rpc.NewWireLogger(w, rpc.WireLogOptions{MaxBodyBytes: g.wireLogMaxBody})
+	closeLog := func() {
+		var errs []error
+		if err := logger.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		if file != nil {
+			if err := file.Sync(); err != nil {
+				errs = append(errs, fmt.Errorf("syncing wire log: %w", err))
+			}
+			if err := file.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("closing wire log: %w", err))
+			}
+		}
+		if err := errors.Join(errs...); err != nil {
+			fmt.Fprintf(stderr, "prism: %v\n", err)
+		}
+	}
+	return logger, closeLog, nil
 }
 
 // closeClient releases a client and reports a failure on stderr. Closing a
@@ -81,6 +166,24 @@ type globalFlags struct {
 	rpcURLs []string
 	// timeout bounds a single RPC call.
 	timeout time.Duration
+	// wireLog is the debug wire-log destination; empty disables it and "-"
+	// writes to stderr.
+	wireLog string
+	// wireLogMaxBody caps each recorded body; zero uses the library default
+	// and a negative value disables body capture.
+	wireLogMaxBody int64
+}
+
+// validateWireLog checks the debug wire-log options before a command opens a
+// client, so a typo fails before any RPC call is attempted.
+func (g *globalFlags) validateWireLog(cmd *cobra.Command) error {
+	if g.wireLogMaxBody < -1 {
+		return fmt.Errorf("--wire-log-max-body must be -1, 0, or a positive number of bytes")
+	}
+	if g.wireLog == "" && cmd.Flags().Changed("wire-log-max-body") {
+		return fmt.Errorf("--wire-log-max-body requires --wire-log")
+	}
+	return nil
 }
 
 // Execute builds and runs the root command, returning an error rather than
@@ -97,6 +200,12 @@ func Execute(args []string, stdout, stderr io.Writer, extra ...*cobra.Command) e
 }
 
 func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
+	// Serialise stderr once at the root. Commands may add their own wrappers
+	// for a narrower scope, but the wire logger and the stream diagnostics
+	// must ultimately share this lock: bytes.Buffer, which tests use, is not
+	// safe for concurrent writes.
+	stderr = newSyncWriter(stderr)
+
 	g := &globalFlags{}
 
 	root := &cobra.Command{
@@ -112,7 +221,11 @@ XDR is decoded and rendered by stellar-xdr-lens, so values look exactly as
 they do under ` + "`lens decode`" + `.
 
 For a one-shot look at events with contract-spec-decoded parameters, the
-official ` + "`stellar events`" + ` command does that better. prism is for watching.`,
+official ` + "`stellar events`" + ` command does that better. prism is for watching.
+
+Pass --wire-log <file> to record the raw RPC exchanges for debugging. The
+Authorization header, cookies and credential-bearing query values are
+redacted before anything is written.`,
 		Example: `  # Follow a contract's events as they happen
   prism events --contract CBGSB... --follow
 
@@ -133,8 +246,10 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			_, err := parseColorMode(g.color)
-			return err
+			if _, err := parseColorMode(g.color); err != nil {
+				return err
+			}
+			return g.validateWireLog(cmd)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
@@ -150,6 +265,10 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
+	root.PersistentFlags().StringVar(&g.wireLog, "wire-log", "",
+		`write a debug NDJSON log of RPC requests and responses to this file, with Authorization and other credential headers redacted ("-" writes to stderr)`)
+	root.PersistentFlags().Int64Var(&g.wireLogMaxBody, "wire-log-max-body", 0,
+		"maximum bytes of each body recorded by --wire-log (0 uses 1 MiB, -1 disables body capture)")
 	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
