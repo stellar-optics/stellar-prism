@@ -76,6 +76,12 @@ func NewWASMSource(client rpc.Client, q WASMQuery) (*WASMSource, error) {
 // Name implements Source.
 func (s *WASMSource) Name() string { return "wasm_deployments" }
 
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *WASMSource) Rewind(ledger uint32) {
+	s.cfg.StartLedger = ledger
+	s.tx.Rewind(ledger)
+}
+
 // CursorLedger implements Source.
 func (s *WASMSource) CursorLedger(cursor string) (uint32, bool) {
 	return s.tx.CursorLedger(cursor)

@@ -31,6 +31,9 @@ type Stats struct {
 	Gaps int
 	// Recovered counts gaps the stream skipped past under GapResume.
 	Recovered int
+	// Rewinds counts rewinds the stream applied. Each one re-emitted the
+	// records between the old and the new position.
+	Rewinds int
 }
 
 // Page describes the progress of one page that was emitted in full.
@@ -111,88 +114,16 @@ type Options struct {
 	MaxGapRecoveries int
 	// OnGap, when set, is called for every detected gap.
 	OnGap func(GapEvent)
-	// Process transforms a complete ledger's records before they are emitted.
-	// It is used by derived streams such as footprint conflict detection.
-	Process func([]Record) ([]Record, error)
-	// OnPage, when set, is called after every page that was emitted in
-	// full, with the position to resume from.
+	// Rewind, when set, lets a caller step the stream back while it runs.
 	//
-	// A page that was only partly emitted — because the limit was reached
-	// or the sink failed — does not produce a callback, so a recorded
-	// position always refers to records that were actually delivered.
-	OnPage func(Page)
-	// OnProgress, when set, is called after every successful fetch with
-	// how far the stream has got and how far the server has got. It is
-	// what the health endpoints report stream lag from.
-	OnProgress func(Progress)
-	// Leader, when set, gates the stream on a distributed lease: the
-	// tailer only fetches while this instance holds the lease, so a
-	// standby never emits records the leader is already emitting.
-	//
-	// A nil Leader leaves the stream ungated, which is what a single
-	// instance wants.
-	Leader *LeaderElection
-	// LeaderResume, when set, is called when this instance takes the
-	// lease and returns the cursor to resume from. It is how a standby
-	// picks up the work the previous leader committed rather than
-	// starting from wherever its own fetch cursor had reached.
-	//
-	// An empty cursor means "keep the current position".
-	LeaderResume func(ctx context.Context) (string, error)
-	// DrainTimeout bounds how long the final flush may take when the run
-	// stops.
-	//
-	// It is the grace period an orchestrator gives the process before it
-	// kills it, so a flush that overruns it is abandoned rather than
-	// waited out. Zero means the flush is waited for as long as it takes.
-	// DrainTimeout bounds how long the final flush may take when the run
-	// stops.
-	//
-	// It is the grace period an orchestrator gives the process before it
-	// kills it, so a flush that overruns it is abandoned rather than
-	// waited out. Zero means the flush is waited for as long as it takes.
-	DrainTimeout time.Duration
-	// State, when set, makes the stream position durable. It is saved after
-	// every successfully emitted record and restored when Run starts, so a
-	// restarted process resumes where the previous one stopped instead of
-	// re-emitting from its original start. Nil (the default) keeps the
-	// position in memory only. *StateFile is the file-backed implementation.
-	State StateStore
-}
-
-// StateStore is the seam durable cursors plug into: it holds the stream's
-// resumable position, and the tailer reads it once at startup and writes it
-// after each successful emit. *StateFile is the file-backed implementation;
-// tests substitute fakes to exercise failure paths.
-//
-// Implementations must treat Save as synchronous and durable when it
-// returns nil: the delivery guarantee across restarts rests on the position
-// being on disk before the tailer advances past it.
-type StateStore interface {
-	// Load returns the persisted position, or the zero State when nothing
-	// has been persisted yet.
-	Load() (State, error)
-	// Save replaces the persisted position.
-	Save(st State) error
-}
-
-// Progress reports how far a stream has got relative to the server's head.
-//
-// The difference between the two is the stream's lag: how many ledgers have
-// closed that the stream has not emitted yet.
-type Progress struct {
-	// CurrentLedger is the newest ledger the stream has emitted.
-	CurrentLedger uint32
-	// LatestLedger is the newest ledger the server has.
-	LatestLedger uint32
-}
-
-// Lag reports how many ledgers the stream is behind the server.
-func (p Progress) Lag() uint32 {
-	if p.LatestLedger <= p.CurrentLedger {
-		return 0
-	}
-	return p.LatestLedger - p.CurrentLedger
+	// The tailer applies a pending request before its next fetch: the source
+	// is repositioned, the cursor is cleared and the de-duplication mark is
+	// reset, so the records in between are emitted again. That is deliberate
+	// reprocessing, and it is the only way a stream re-emits a record within
+	// a single run.
+	Rewind *RewindController
+	// OnRewind, when set, is called after a rewind has been applied.
+	OnRewind func(RewindTarget)
 }
 
 // Tailer drives a Source, emitting records to a Sink.
@@ -214,14 +145,13 @@ func (p Progress) Lag() uint32 {
 //
 //   - Not exactly-once across restarts. The tailer cannot atomically emit a
 //     record and commit its cursor, so a process killed between the two will
-//     re-emit on restart. When Options.Store or Options.State is set, the
-//     window narrows to the interrupted record: the position is persisted
-//     after every emit and the restored high-water mark suppresses replays.
-//     Options.StartCursor and Options.OnPage checkpoint fully delivered
-//     pages; pages still held by the reorder buffer may be replayed. True
-//     exactly-once would need a transaction spanning the sink and the cursor
-//     store, which a CLI writing to stdout cannot have; consumers that care
-//     should still key off Record.ID.
+//     re-emit on restart. Durable cursors would narrow this and are on the
+//     roadmap; consumers that care should key off Record.ID.
+//
+//   - A rewind re-emits on purpose. Stepping the cursor back reprocesses the
+//     records in between, so they are emitted a second time. It is the only
+//     way a record is emitted twice within a run, and it happens only when
+//     the caller asks for one.
 type Tailer struct {
 	src  Source
 	sink Sink
@@ -234,6 +164,12 @@ type Tailer struct {
 	// fixed-width and zero-padded, a plain string comparison orders them
 	// correctly, which is what makes de-duplication a single comparison.
 	lastID string
+	// lastLedger is the ledger of the most recently emitted record. It is
+	// the fallback anchor for a rewind when the cursor cannot be read.
+	lastLedger uint32
+	// rewoundTo is the ledger the last rewind landed on. It is what makes a
+	// rewind that reached past the server's retention window detectable.
+	rewoundTo uint32
 
 	// persisted is the last position successfully written to the Store, and
 	// persistedOK records whether anything has been written or restored yet.
@@ -385,15 +321,11 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 			return t.finish(nil)
 		}
 
-		// A standby must not fetch. It would emit the same records as the
-		// leader and fight it for the cursor, which is the duplication the
-		// lease exists to prevent.
-		leading, err := t.leadership(ctx)
-		if err != nil {
-			return err
-		}
-		if !leading {
-			return t.finish(nil)
+		// A rewind is applied before the fetch, so a request made while the
+		// stream is running takes effect at a page boundary rather than in
+		// the middle of a page.
+		if err := t.applyRewind(); err != nil {
+			return t.finish(err)
 		}
 
 		batch, err := t.fetchWithRetry(ctx)
@@ -404,7 +336,17 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 			return err
 		}
 
-		if gapErr := t.checkGap(batch); gapErr != nil {
+		gapErr := t.checkGap(batch)
+		if gapErr == nil {
+			gapErr = t.checkRewindGap(batch)
+		}
+		// The rewind check applies to the page that follows the rewind.
+		// Once that page has been seen the target has been passed, and
+		// comparing it with a later retention floor would report a gap
+		// that is not one: the server's floor moves forward with time.
+		t.rewoundTo = 0
+
+		if gapErr != nil {
 			t.stats.Gaps++
 			recovered, recoverErr := t.recovery.Handle(t.src, gapErr)
 			if recoverErr != nil {
@@ -716,84 +658,88 @@ func (t *Tailer) checkGap(b Batch) *GapError {
 	return nil
 }
 
-// restore loads a persisted position, if any, before the first fetch.
+// applyRewind consumes a pending rewind request and repositions the stream.
 //
-// A missing row is a first run and leaves the configured start position
-// alone. Any other failure is fatal: carrying on would mean claiming
-// durability the operator asked for and silently not having it.
-func (t *Tailer) restore(ctx context.Context) error {
-	if t.opts.Store == nil {
+// Repositioning clears the cursor and the de-duplication mark, which is what
+// makes the records in between be emitted again: a rewind is deliberate
+// reprocessing, and it is the only way a stream re-emits a record within a
+// single run.
+func (t *Tailer) applyRewind() error {
+	if t.opts.Rewind == nil {
 		return nil
 	}
-	state, err := t.opts.Store.Load(ctx, t.storeKey())
-	switch {
-	case errors.Is(err, ErrNoCursor):
+	req, ok := t.opts.Rewind.Take()
+	if !ok {
 		return nil
-	case err != nil:
-		return fmt.Errorf("restoring cursor: %w", err)
 	}
-	t.cursor = state.Cursor
-	t.lastID = state.LastID
-	// Restoring counts as persisted: it is the same position, already durable.
-	t.persisted, t.persistedOK = state, true
+
+	anchor, ok := t.rewindAnchor(req)
+	if !ok {
+		return fmt.Errorf(
+			"cannot rewind the %s stream: it has not reached a position yet", t.src.Name())
+	}
+	target, err := req.Distance.Target(anchor)
+	if err != nil {
+		return fmt.Errorf("rewinding the %s stream: %w", t.src.Name(), err)
+	}
+
+	rewinder, ok := t.src.(Rewinder)
+	if !ok {
+		return fmt.Errorf(
+			"source %q cannot be rewound because it does not implement Rewinder", t.src.Name())
+	}
+
+	rewinder.Rewind(target.Ledger)
+	t.cursor = ""
+	t.lastID = ""
+	t.rewoundTo = target.Ledger
+	t.stats.Rewinds++
+
+	if t.opts.OnRewind != nil {
+		t.opts.OnRewind(target)
+	}
 	return nil
 }
 
-// persist writes the position reached so far.
+// rewindAnchor reports the position a rewind is measured from.
 //
-// It is called after every emitted record and again when a page boundary is
-// crossed, which is what bounds a crash's replay window to one record: the
-// resume point only ever moves to a page boundary once the whole page is out,
-// and LastID suppresses the replay of what was already emitted from inside
-// the page. A position that has not moved is not written again.
-func (t *Tailer) persist(ctx context.Context) error {
-	if t.opts.Store == nil {
+// An explicit anchor wins, because the caller knows where it wants the step
+// measured from. Otherwise the step is measured from the stream's own
+// position: the cursor it reached, or the last record it emitted.
+func (t *Tailer) rewindAnchor(req RewindRequest) (uint32, bool) {
+	if req.Anchor != 0 {
+		return req.Anchor, true
+	}
+	if t.cursor != "" {
+		if at, ok := t.src.CursorLedger(t.cursor); ok {
+			return at, true
+		}
+	}
+	if t.lastLedger != 0 {
+		return t.lastLedger, true
+	}
+	return 0, false
+}
+
+// checkRewindGap reports whether a rewind reached past the server's
+// retention window.
+//
+// Rewinding is a request to reprocess records, so landing before the oldest
+// retained ledger means the records that were wanted are gone. That is a
+// gap, and it is reported like any other rather than skipped over.
+func (t *Tailer) checkRewindGap(b Batch) *GapError {
+	if t.rewoundTo == 0 || b.Oldest == 0 {
 		return nil
 	}
-	state := CursorState{Cursor: t.cursor, LastID: t.lastID}
-	if t.persistedOK && state == t.persisted {
-		return nil
+	if t.rewoundTo < b.Oldest {
+		return &GapError{Source: t.src.Name(), From: t.rewoundTo, Oldest: b.Oldest}
 	}
-	if err := t.opts.Store.Save(ctx, t.storeKey(), state); err != nil {
-		return fmt.Errorf("persisting cursor: %w", err)
-	}
-	t.persisted, t.persistedOK = state, true
 	return nil
 }
 
-// storeKey is the row the position lives under: an explicit key when the
-// caller named one, the Source's name otherwise.
-func (t *Tailer) storeKey() string {
-	if t.opts.StoreKey != "" {
-		return t.opts.StoreKey
-	}
-	return t.src.Name()
-}
-
-// reportsPage reports whether a page moved the stream forward.
-//
-// An empty page that leaves the cursor where it was says nothing new, and
-// reporting it would fill a cursor journal with duplicates of the position
-// already recorded.
-func (t *Tailer) reportsPage(b Batch) bool {
-	return len(b.Records) > 0 || (b.NextCursor != "" && b.NextCursor != t.cursor)
-}
-
-// queuePage remembers a fetched position without publishing it before the
-// reorder buffer has delivered that page, including earlier pending pages.
-func (t *Tailer) queuePage(b Batch) {
-	if !t.reportsPage(b) {
-		return
-	}
-	p := pendingPage{
-		page:    Page{Source: t.src.Name(), Cursor: b.NextCursor},
-		lastID:  t.lastID,
-		records: make(map[string]struct{}),
-	}
-	if len(t.pages) > 0 {
-		p.lastID = t.pages[len(t.pages)-1].lastID
-	}
-	seen := make(map[string]bool)
+// emit writes a batch's records, suppressing any the server replayed, and
+// reports whether the configured limit has been reached.
+func (t *Tailer) emit(b Batch) (done bool, err error) {
 	for _, r := range b.Records {
 		if r.ID > p.lastID {
 			p.lastID = r.ID
@@ -876,6 +822,7 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 			return false, emitted, fmt.Errorf("writing record %s: %w", r.ID, err)
 		}
 		t.lastID = r.ID
+		t.lastLedger = r.Sequence
 		t.stats.Emitted++
 		emitted++
 		t.reportReadyPages()

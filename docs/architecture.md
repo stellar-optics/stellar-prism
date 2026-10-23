@@ -86,13 +86,7 @@ pkg/stream/
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
   gap_recovery.go     GapStrategy, Rewinder and gap handling
-  pruning.go          CursorMetadata, MetadataStore, Pruner
-  cursor_store.go     file-backed cursor metadata journal
-  ha.go               lease-based leader election (active-passive)
-  ha_lock_unix.go     flock(2) primitives for the lease
-  health.go           the liveness/readiness probe server and its monitor
-  crypto_state.go     AES-256-GCM encrypted cursor journal
-  kms.go              AWS and GCP key management clients
+  rewind.go           rewind distances, targets and the rewind controller
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
   topic_pattern.go    client-side topic matching over decoded text
@@ -469,6 +463,10 @@ cancellation is a clean stop, not an error. `Drainer.Run` waits for every
 worker on every path, including sink failure and limit exhaustion, soa terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
 
+The rewind watcher in `internal/cli/rewind.go` is the only other goroutine the
+CLI starts. It owns a signal channel and nothing else: `Close` stops the
+signal delivery and waits for the goroutine to return, so a command that
+ends leaves nothing behind.
 
 ### What is deliberately *not* handled
 
@@ -1081,67 +1079,74 @@ compressed). Rotation is synchronous; the active file is reopened before
 pruning, so a failed prune cannot stop the stream. `--rotate-*` without
 `--output-file` is rejected.
 
-## Dead letter queue (`--dlq-file`)
+## Rewinding the stream (`--rewind`)
 
-A long-running tail must not die because one record is malformed or one write
-fails. `--dlq-file` wraps the chosen sink in `sink.DLQ`, which records the
-failure and keeps the stream running:
+A stream's cursor is the position it has reached. `--rewind` steps it back so
+the records in between are processed again — the manual escape hatch for "the
+event I need was just before where I was looking".
 
-```
-                      ┌──────────────┐
-   Tailer ── Record ─►│ sink.DLQ     ├──► chosen sink ──► stdout / --output-file
-                      │              │
-                      │   failure    ├──► --dlq-file (NDJSON, append)
-                      └──────────────┘
+```console
+$ prism events --contract CDLZF...CYSC --rewind 500 --follow
+prism: rewinding 500 ledgers back to ledger 3966312
 ```
 
-The wrapper implements both `stream.Sink` and `stream.BatchSink`, so every
-streaming command gains it without knowing it exists.
+The distance is either a count of ledgers (`500`, `500l`) or a duration
+(`45s`, `30m`, `2h`, `1h30m`, `7d`). A duration is converted with
+`NominalLedgerInterval` — five seconds, roughly one ledger close — so it
+lands near the requested point rather than exactly on it.
 
-| Field | Meaning |
+### Where the step is measured from
+
+The step is measured from the start the command resolved: `--from` when it is
+given, and the server's head otherwise. So `--from 3966000 --rewind 500`
+starts at ledger 3965500, and `--rewind 500` on its own starts 500 ledgers
+before the head.
+
+A step that would reach before the first ledger is clamped to it rather than
+rejected: "as far back as the chain goes" is a request, not a mistake. The
+clamp is reported, because a rewind that quietly landed somewhere else would
+be worse than one that did not happen.
+
+### Rewinding a running stream
+
+While following, `SIGUSR2` asks for the same step again. The signal is only
+handled while `--rewind` is in effect; without it, `SIGUSR2` keeps its usual
+meaning and terminates the process. The signal is handled by one goroutine
+that owns nothing but the request (`internal/cli/rewind.go`); the tailer
+applies it at the next page boundary, so a request never lands in the middle
+of a page.
+
+### What a rewind does to the guarantee
+
+A rewind re-emits the records between the old and the new position. That is
+the point of it, and it is the only way a record is emitted twice within a
+single run: the de-duplication mark is reset along with the cursor, because
+the records being reprocessed are exactly the ones the mark would suppress.
+
+A rewind that lands before the server's retention window is a gap, and it is
+reported like any other: the tailer compares the rewind target with the
+server's oldest retained ledger and returns a `*GapError`, so the run exits
+2 rather than continuing with a hole in the stream. Under
+`--gap-strategy resume` the usual recovery applies and the missed range is
+announced.
+
+### The pieces
+
+`pkg/stream/rewind.go` holds the logic:
+
+| Symbol | Role |
 |---|---|
-| `kind` | always `"dlq"`, so a queue file is distinguishable from stream NDJSON |
-| `stage` | `validation`, `delivery` or `flush` |
-| `error` | the failure that prevented delivery |
-| `failedAt` | UTC timestamp, injectable through `DLQOptions.Now` |
-| `record` | the original record, preserved field-for-field; absent for `flush` |
+| `ParseRewind` | parses `500` or `30m` into a `RewindDistance` |
+| `RewindDistance.Ledgers` | converts a distance into ledgers |
+| `RewindDistance.Target` | computes where a step lands, clamping at the first ledger |
+| `RewindController` | hands a request to the tailer, safely |
+| `RewindRequest` | the request itself: a distance and an optional anchor |
 
-Two classes of failure are captured:
-
-- **Validation.** `sink.ValidateRecord` checks the structural contract every
-  sink relies on: a non-empty ID, a known `Kind`, and a payload pointer that
-  matches that kind. It deliberately does *not* reject XDR that lens cannot
-  decode — the built-in sinks already report that inline, and treating a
-  display problem as a delivery failure would be wrong.
-- **Delivery.** If the wrapped sink's `Emit` returns an error, the record is
-  written to the queue and the error is swallowed. Only a failure to write the
-  dead letter itself is returned, because at that point the record would vanish
-  with no trace. A primary `Flush` failure is captured as a `flush` entry for
-  the same reason: the per-record failures are already accounted for, and
-  failing the command at shutdown would defeat the queue's purpose.
-
-A captured record counts as delivered, so the tailer advances its cursor past
-it. The queue is the durable copy: replay its `record` field through a sink if
-the primary output must be complete. This is deliberate — blocking the cursor
-on a record the primary can never write would stall the stream forever — and
-it is why the queue is append-only and flushed per entry.
-
-`EmitBatch` validates and delivers one record at a time. A batch sink can fail
-part-way through a batch, after some records were written, so forwarding the
-whole batch again would duplicate them and forwarding nothing would lose them.
-Per-record isolation is what makes every failure attributable; the trade-off
-is that a DLQ-wrapped run does not amortise the wrapped sink's flushes. The
-batcher still controls when the tailer hands records over.
-
-The DLQ starts no goroutines. `Close` flushes the queue, closes the wrapped
-sink when it implements `io.Closer`, and closes the queue writer (when
-`CloseWriter` is set) — so `Ctrl-C`, a failed run and a normal exit all leave
-nothing open behind. It is idempotent, and each `Close` performs the flush it
-needs rather than returning early.
-
-`--dlq-file` is append-only and must differ from `--output-file`. Without
-`--dlq-file` the sink chain is unchanged: nothing is opened and no wrapper is
-inserted.
+The controller is the seam: whoever asks for the rewind — a flag, a signal
+handler — and the tailer, which is the only goroutine allowed to move a
+cursor, meet there. A request carrying an explicit anchor is measured from
+that anchor; one without is measured from the stream's own position, which
+is the cursor it reached or the last record it emitted.
 
 ## Testing the guarantee
 
@@ -1162,10 +1167,10 @@ Covered: clean streams, drops at every position, consecutive drops, replayed
 pages, out-of-order pages, retention overrun with both gap policies, lagging
 backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
 failure, full-page draining, concurrent backfill, batcher count/time/explicit
-flushes, durable-cursor resume across restarts, replay suppression across
-restarts, corrupt/foreign/uninterpretable state files, persist failures mid-page,
-and task-group cancellation. Gap recovery is also unit-tested
-without a network through the `Rewinder` seam.
+flushes, and task-group cancellation. Gap recovery is also unit-tested
+without a network through the `Rewinder` seam. Rewinding is covered the same
+way: a rewind applied mid-stream, in a follow loop, against a source that
+cannot be repositioned, and across the retention window.
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
@@ -1219,20 +1224,10 @@ The invariants were verified by breaking the code on purpose:
 |---|---|
 | De-duplication disabled | `TestTailSuppressesReplayedPages` and `TestTailRejectsOutOfOrderPages` fail with exact diagnostics |
 | Gap detection disabled | `TestTailDetectsRetentionGap` fails in 0.00s |
-| Checkpoint written before the page was emitted | `TestTailDoesNotReportAPartiallyEmittedPage` and `TestTailDoesNotReportAPageTheSinkRejected` fail |
-| Pruner goroutine abandoned instead of joined | `TestPrunerCloseJoinsItsGoroutine` fails: `Close()` returned while the pruner was still running |
-| Second `Close` returning without joining the goroutine | `TestPrunerConcurrentCloseWaitsForTheGoroutine` fails: `Close() returned (<nil>) while the pruner was still running` |
-| Diagnostics written to stderr without serialisation | `TestSyncWriterSerialisesConcurrentWrites` fails with a `DATA RACE` report from the race detector |
-| Prune keeping the oldest entries | `TestFileMetadataStorePruneKeepsTheNewestPerKey` fails |
-| Final compaction at shutdown removed | `TestEventsCommandPrunesTheStateFile` fails: 10 checkpoints left instead of 2 |
-| DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
-| DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
-| DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
-| Transaction cursor parsed as a ledger sequence | `TestTransactionTailDetectsRetentionGap` fails: the stream passes over the pruned range instead of reporting it |
-| Transaction source treats a short page before the head as terminal | `TestTransactionTailContinuesShortPageBeforeHead` and `TestTransactionsCommandShortPageKeepsDraining` fail with one record instead of two |
-| Per-emit persistence disabled | `TestTailStateRecordsPositionAfterEachEmit`, `TestTailStateResumesAcrossRestart` and the CLI restart test fail |
-| Startup restore disabled | `TestTailStateResumesAcrossRestart`, `TestTailStateRefusesPositionFromAnotherStream`, `TestTailStateRejectsUninterpretableToken` and `TestTailStateGapDetectedOnResume` fail |
-| Restored high-water mark dropped | `TestTailStateSuppressesReplayAfterRestart` fails, naming the re-emitted IDs |
+| De-duplication mark not reset on a rewind | `TestTailAppliesRewind` and `TestTailRewindsWhileFollowing` fail with exact diagnostics |
+| Source not repositioned on a rewind | `TestTailAppliesRewind` fails in 0.00s |
+| Retention check after a rewind disabled | `TestTailRewindReportsRetentionGap` fails in 0.00s |
+| Retention check after a rewind applied to every later page | `TestTailRewindChecksRetentionOnlyOnce` fails in 0.00s |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.

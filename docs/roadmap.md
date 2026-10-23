@@ -68,6 +68,9 @@ Two smaller things could follow: recording the position per *ledger* rather
 than per page, and letting several streams share one state file without
 keying it by filter set.
 
+Until it exists, `--rewind` is the manual escape hatch: it steps a run back
+so recent records are reprocessed, by ledger count or by duration.
+
 ### Contract-spec-aware decoding
 
 The one place `stellar events` is clearly better. Given a contract's

@@ -149,57 +149,27 @@ prism events --from 3966000 --limit 10000 --json --backfill-workers 4
 Workers fetch disjoint ledger ranges, then records are merged by ID before
 they reach stdout, so output order and de-duplication are unchanged.
 
-### Shipping records to other sinks
+### Reprocessing with `--rewind`
 
-Every streaming command can write to more than stdout. The extra sinks are
-opt-in, compose with each other, and reuse the same JSON object `--json`
-emits:
-
-| Flag | Destination |
-|---|---|
-| `--webhook-url` | Batched HTTP POSTs, optional HMAC-SHA256 signing and backoff retries |
-| `--cloud-bucket` + `--cloud-provider` | Gzipped NDJSON chunks in S3 or GCS |
-| `--metrics-addr` | Prometheus `/metrics` (throughput, ledger latency, errors) |
-| `--syslog-address` | RFC 5424 syslog or systemd-journald native fields |
-| `--sink-es-url` | Elasticsearch/OpenSearch bulk indexing, partitioned into a daily index |
-| `--sink-nats` | NATS core publish or JetStream acknowledgements (`--nats-jetstream`) |
-| `--sink-zmq` | ZeroMQ PUB messages with templated topic and JSON payload frames |
+`--rewind` steps the start point back so the records in between are processed
+again — the manual way to reprocess what a stream just missed:
 
 ```sh
-# Fan a live stream out to a receiver and to S3-compatible storage
-prism events --follow --json \
-  --webhook-url https://example.com/prism \
-  --cloud-provider s3 --cloud-url https://s3.us-east-1.amazonaws.com \
-  --cloud-bucket my-prism-archive
+# Reprocess the last 500 ledgers, then keep following
+prism events --contract CDLZF...CYSC --rewind 500 --follow
 
-# Watch throughput and latency while tailing
-prism events --follow --json --metrics-addr 127.0.0.1:9090
-
-# Send events to the local systemd journal
-prism events --follow --json \
-  --syslog-address unixgram:///run/systemd/journal/socket \
-  --syslog-format journald
-
-# Index records by day in Elasticsearch or OpenSearch
-prism events --follow --sink-es-url https://search.example.com \
-  --sink-es-index prism-events
-
-# Publish each event using its contract as a NATS subject token
-prism events --follow --sink-nats nats://127.0.0.1:4222 \
-  --nats-subject 'stellar.events.{{.ContractID}}'
-
-# Broadcast multipart [topic, JSON] messages over ZeroMQ PUB
-prism events --follow --sink-zmq tcp://127.0.0.1:5556 \
-  --zmq-topic 'stellar.events.{{.ContractID}}'
+# Or by time: 30 minutes' worth of ledgers
+prism events --contract CDLZF...CYSC --rewind 30m --follow
 ```
 
-Credentials come from the environment (`PRISM_WEBHOOK_SECRET`, `PRISM_ES_API_KEY`,
-`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `GOOGLE_OAUTH_ACCESS_TOKEN`) so
-they do not appear in `ps` output. Delivery to webhooks and object storage is
-at-least-once: a batch is retried until acknowledged and uses a stable key or
-delivery id so a receiver can de-duplicate. See
-[docs/architecture.md](docs/architecture.md#built-in-sinks) for the payload
-shapes and retry rules.
+The step is measured from `--from` when it is given, and from the server's
+head otherwise. While a stream is following, `SIGUSR2` asks for the same
+step again, which reprocesses the records between the old and the new
+position.
+
+A rewind re-emits the records it steps over, on purpose: that is what
+reprocessing means. A rewind that reaches past the server's ~24-hour
+retention window is reported as a gap and exits 2, like any other gap.
 
 ### NDJSON for pipelines
 
@@ -509,7 +479,8 @@ This is a streaming tool, so the guarantee matters more than the feature list:
 
 - **No duplicates within a run.** Cursor paging is exact, and every record is
   checked against the highest ID already emitted, so a page replayed after a
-  reconnect is suppressed.
+  reconnect is suppressed. A `--rewind` is the one exception: it deliberately
+  re-emits the records it steps over, which is what reprocessing means.
 - **A dropped connection cannot skip records.** A failed fetch is retried with
   the cursor *unchanged*.
 - **No silent gaps by default.** Records can only be genuinely lost by falling
@@ -579,6 +550,8 @@ before v1.0.
 - Event, ledger and transaction streams; `prism tx` via the lens explain path.
 - Count/time batching (`--batch`) and concurrent historical backfill
   (`--backfill-workers`).
+- `--rewind` to step a stream back and reprocess recent ledgers, by count or
+  by duration, while it runs.
 - Explicit gap policy: stop by default, or `--gap-strategy resume` with the
   skipped range reported.
 - Payloads render as the XDR wire shape — prism has no contract-spec decoding,

@@ -124,6 +124,12 @@ func normalizeSet(values []string, allowed ...string) (map[string]bool, error) {
 // Name implements Source.
 func (s *StorageChangeSource) Name() string { return "storage_changes" }
 
+// Rewind implements Rewinder, repositioning a fresh fetch at ledger.
+func (s *StorageChangeSource) Rewind(ledger uint32) {
+	s.query.StartLedger = ledger
+	s.tx.Rewind(ledger)
+}
+
 // CursorLedger implements Source.
 func (s *StorageChangeSource) CursorLedger(cursor string) (uint32, bool) {
 	return s.tx.CursorLedger(cursor)
