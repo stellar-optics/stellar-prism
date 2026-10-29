@@ -1,0 +1,42 @@
+name: Security & Malware Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: Dependency Review (Malware & Supply Chain)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: moderate
+          warn-only: false
+
+  govulncheck:
+    name: Govulncheck (Go Vulnerability & Malware Database)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: "stable"
+          check-latest: true
+          go-package: ./...
