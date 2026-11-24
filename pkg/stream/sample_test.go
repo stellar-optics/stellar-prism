@@ -212,3 +212,20 @@ func formatID3(n uint64) string {
 	}
 	return string(b)
 }
+
+func TestSamplerUniformForTenThousandRecords(t *testing.T) {
+	sampler := NewSampler(0.2)
+	kept := 0
+	for i := 0; i < 10000; i++ {
+		matched, err := sampler.Match(Record{ID: formatID3(uint64(i))})
+		if err != nil {
+			t.Fatalf("Match: %v", err)
+		}
+		if matched {
+			kept++
+		}
+	}
+	if kept < 1700 || kept > 2300 {
+		t.Fatalf("20%% sampler kept %d/10000 records, want 1700-2300", kept)
+	}
+}

@@ -572,3 +572,23 @@ func stringsContains(h, n string) bool {
 	}
 	return false
 }
+
+func TestTailStopsAtUntilLedger(t *testing.T) {
+	t.Parallel()
+
+	srv := fakerpc.NewServer(
+		fakerpc.MakeEvents(100, 25),
+		fakerpc.WithPageLimit(10),
+	)
+	sink, _, err := runTail(t, srv, stream.Options{
+		UntilLedger: 105,
+	}, stream.EventQuery{StartLedger: 100, PageLimit: 10})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, record := range sink.records {
+		if record.Sequence > 105 {
+			t.Fatalf("emitted ledger %d after until-ledger 105", record.Sequence)
+		}
+	}
+}

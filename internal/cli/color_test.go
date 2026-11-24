@@ -101,3 +101,20 @@ func TestNoColorEnvironmentSuppressesAutoOutput(t *testing.T) {
 		t.Error("NO_COLOR did not suppress auto colour")
 	}
 }
+
+func TestHighlightTextAndNever(t *testing.T) {
+	got, err := HighlightText("LIQUIDATION GABCD", "LIQUIDATION|GABCD", true)
+	if err != nil {
+		t.Fatalf("HighlightText: %v", err)
+	}
+	if !bytes.Contains([]byte(got), []byte("\x1b[1;93mLIQUIDATION\x1b[0m")) {
+		t.Fatalf("LIQUIDATION was not highlighted: %q", got)
+	}
+	got, err = HighlightText("LIQUIDATION", "LIQUIDATION", false)
+	if err != nil {
+		t.Fatalf("HighlightText disabled: %v", err)
+	}
+	if got != "LIQUIDATION" {
+		t.Fatalf("disabled highlighting changed text: %q", got)
+	}
+}

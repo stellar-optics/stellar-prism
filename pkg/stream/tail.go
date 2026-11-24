@@ -64,6 +64,10 @@ type Options struct {
 	Follow bool
 	// Limit stops the stream after this many records. Zero means unlimited.
 	Limit int
+	// UntilLedger stops after this ledger is processed. Zero disables.
+	UntilLedger uint32
+	// UntilTime stops after the close-time boundary. Zero disables.
+	UntilTime time.Time
 	// Filter runs before the sink. Rejected records still advance the source
 	// cursor, but do not count toward Limit or Emitted.
 	Filter RecordFilter
@@ -253,6 +257,7 @@ type Tailer struct {
 	// lastLedger is the ledger of the most recently emitted record. It is
 	// the fallback anchor for a rewind when the cursor cannot be read.
 	lastLedger uint32
+	lastTime   time.Time
 	// rewoundTo is the ledger the last rewind landed on. It is what makes a
 	// rewind that reached past the server's retention window detectable.
 	rewoundTo uint32
@@ -970,6 +975,12 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 		}
 	}
 	for _, r := range records {
+		if t.opts.UntilLedger > 0 && r.Sequence > t.opts.UntilLedger {
+			return true, emitted, nil
+		}
+		if !t.opts.UntilTime.IsZero() && !r.Time.IsZero() && r.Time.After(t.opts.UntilTime) {
+			return true, emitted, nil
+		}
 		// IDs are fixed-width and zero-padded, so this comparison is a
 		// chronological one. Anything at or before the high-water mark is a
 		// replay after a reconnect, or an out-of-order server response.
@@ -985,6 +996,7 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 			if !matched {
 				t.lastID = r.ID
 				t.lastLedger = r.Sequence
+				t.lastTime = r.Time
 				t.stats.Filtered++
 				for i := range t.pages {
 					if _, ok := t.pages[i].records[r.ID]; ok {
@@ -1003,6 +1015,7 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 		}
 		t.lastID = r.ID
 		t.lastLedger = r.Sequence
+		t.lastTime = r.Time
 		t.stats.Emitted++
 		emitted++
 		t.reportReadyPages()
@@ -1026,6 +1039,12 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {
 			return true, emitted, nil
 		}
+	}
+	if t.opts.UntilLedger > 0 && t.lastLedger >= t.opts.UntilLedger {
+		return true, emitted, nil
+	}
+	if !t.opts.UntilTime.IsZero() && !t.lastTime.IsZero() && !t.lastTime.Before(t.opts.UntilTime) {
+		return true, emitted, nil
 	}
 	return false, emitted, nil
 }

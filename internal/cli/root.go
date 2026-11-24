@@ -183,7 +183,9 @@ type globalFlags struct {
 	// Repeating the flag builds a failover pool.
 	rpcURLs []string
 	// timeout bounds a single RPC call.
-	timeout time.Duration
+	timeout        time.Duration
+	highlightRegex string
+	rulesFile      string
 	// wireLog is the debug wire-log destination; empty disables it and "-"
 	// writes to stderr.
 	wireLog string
@@ -290,6 +292,11 @@ redacted before anything is written.`,
 			if _, err := parseColorMode(g.color); err != nil {
 				return err
 			}
+			if g.highlightRegex != "" {
+				if _, err := CompileHighlighter(g.highlightRegex); err != nil {
+					return fmt.Errorf("invalid --highlight-regex: %w", err)
+				}
+			}
 			if err := g.validateWireLog(cmd); err != nil {
 				return err
 			}
@@ -305,6 +312,12 @@ redacted before anything is written.`,
 
 	root.PersistentFlags().StringVar(&g.color, "color", "auto",
 		`when to colourise output: "auto", "always" or "never"`)
+	root.PersistentFlags().StringVar(&g.highlightRegex, "highlight-regex", "",
+		"highlight terminal text matching this regular expression")
+	root.PersistentFlags().StringVar(&g.highlightRegex, "highlight", "",
+		"alias for --highlight-regex")
+	root.PersistentFlags().StringVar(&g.rulesFile, "rules", "",
+		"load dynamic event alert rules from a YAML file")
 	root.PersistentFlags().StringArrayVar(&g.rpcURLs, "rpc-url", nil,
 		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
