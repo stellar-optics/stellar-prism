@@ -175,6 +175,9 @@ type globalFlags struct {
 	serveSSE         string
 	serveWS          string
 	serveGRPC        string
+	tlsCert          string
+	tlsKey           string
+	tlsAutoReload    bool
 	network          string
 	skipNetworkCheck bool
 	// color is one of "auto", "always" or "never", matching lens.
@@ -327,6 +330,9 @@ redacted before anything is written.`,
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
 	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load (default: ~/.config/prism/config.yaml then .prism.yaml in cwd)")
 	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
+	root.PersistentFlags().StringVar(&g.tlsCert, "tls-cert", "", "path to TLS certificate file (PEM)")
+	root.PersistentFlags().StringVar(&g.tlsKey, "tls-key", "", "path to TLS private key file (PEM)")
+	root.PersistentFlags().BoolVar(&g.tlsAutoReload, "tls-auto-reload", false, "dynamically reload TLS certificate on file change")
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
