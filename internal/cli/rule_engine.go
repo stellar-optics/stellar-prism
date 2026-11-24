@@ -4,16 +4,13 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/stellar-optics/stellar-prism/pkg/rules"
+	"github.com/stellar-optics/stellar-prism/pkg/sink"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
-// ruleEngine wraps compiled stream.ExpressionFilter predicates behind a small
-// name-based dispatch the CLI can wire from flags or config files without
-// re-parsing the expression language itself.
-//
-// The engine is deliberately stateless: compilation is done once by the caller,
-// and Match is a pure function of the record. That keeps the evaluator
-// offline-first and trivially testable without a network or a process.
+// ruleEngine wraps compiled expression filters behind a small name-based
+// dispatch. CEP filters retain their own sliding-window state.
 type ruleEngine struct {
 	filters []stream.ExpressionFilter
 }
@@ -61,10 +58,15 @@ func (e *ruleEngine) Expressions() []string {
 	return out
 }
 
-// CompileRules is a thin wrapper around stream.CompileExpression for
-// consumer code that prefers an explicit compile step. It parses the
-// expression once and returns a rule engine holding the compiled form.
+// CompileRules parses each expression once and returns an engine holding the
+// compiled filters. CEP expressions are compiled as stateful sliding windows.
 func CompileRules(exprs ...string) (*ruleEngine, error) {
+	return CompileRulesWithOptions(rules.Options{}, exprs...)
+}
+
+// CompileRulesWithOptions compiles expressions and applies options to any CEP
+// rules in the input.
+func CompileRulesWithOptions(options rules.Options, exprs ...string) (*ruleEngine, error) {
 	if len(exprs) == 0 {
 		return NewRuleEngine(), nil
 	}
@@ -74,11 +76,32 @@ func CompileRules(exprs ...string) (*ruleEngine, error) {
 		if expr == "" {
 			continue
 		}
-		f, err := stream.CompileExpression(expr)
+		var (
+			f   stream.ExpressionFilter
+			err error
+		)
+		if rules.IsCEPExpression(expr) {
+			f, err = rules.Compile(expr, options)
+		} else {
+			f, err = stream.CompileExpression(expr)
+		}
 		if err != nil {
 			return nil, err
 		}
 		compiled = append(compiled, f)
 	}
 	return NewRuleEngine(compiled...), nil
+}
+
+// CompileRulesWithWebhook configures the supplied webhook to receive each CEP
+// alert as a JSON payload. Ordinary expression filters do not emit alerts.
+func CompileRulesWithWebhook(webhook *sink.Webhook, exprs ...string) (*ruleEngine, error) {
+	if webhook == nil {
+		return nil, fmt.Errorf("rule engine: webhook is required")
+	}
+	return CompileRulesWithOptions(rules.Options{
+		OnAlert: func(alert rules.Alert) error {
+			return webhook.EmitJSON(alert)
+		},
+	}, exprs...)
 }

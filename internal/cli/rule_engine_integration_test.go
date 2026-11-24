@@ -3,9 +3,11 @@ package cli
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/stellar-optics/stellar-prism/pkg/rules"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
@@ -249,6 +251,44 @@ func TestRuleEngineIntegrationErrorHandling(t *testing.T) {
 	// The error should mention the rule expression
 	if len(err.Error()) == 0 {
 		t.Fatalf("error should contain message")
+	}
+}
+
+func TestRuleEngineIntegrationWithCEP(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 24, 9, 0, 0, 0, time.UTC)
+	alerts := 0
+	engine, err := CompileRulesWithOptions(rules.Options{
+		Now: func() time.Time { return now },
+		OnAlert: func(rules.Alert) error {
+			alerts++
+			return nil
+		},
+	}, `count() > 1 within 1m where contract == "CABC"`)
+	if err != nil {
+		t.Fatalf("CompileRulesWithOptions: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		record := stream.Record{
+			Time: now.Add(time.Duration(i) * time.Second),
+			Kind: stream.KindEvent,
+			Event: &stream.Event{
+				ContractID: "CABC",
+				ValueXDR:   encodeTestMap(t, map[string]any{"amount": int64(1)}),
+			},
+		}
+		matched, err := engine.Match(record)
+		if err != nil {
+			t.Fatalf("Match: %v", err)
+		}
+		if matched != (i == 1) {
+			t.Fatalf("Match on event %d = %v, want %v", i, matched, i == 1)
+		}
+	}
+	if alerts != 1 {
+		t.Fatalf("alert callback invoked %d times, want 1", alerts)
 	}
 }
 

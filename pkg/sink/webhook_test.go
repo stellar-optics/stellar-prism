@@ -28,6 +28,12 @@ type webhookCapture struct {
 	notify   chan struct{}
 }
 
+type webhookRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip webhookRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
 func newWebhookCapture(t *testing.T, respond func(attempt int, w http.ResponseWriter, body []byte)) *webhookCapture {
 	t.Helper()
 	c := &webhookCapture{respond: respond}
@@ -59,6 +65,62 @@ func newWebhookCapture(t *testing.T, respond func(attempt int, w http.ResponseWr
 	t.Cleanup(srv.Close)
 	c.server = srv
 	return c
+}
+
+func TestWebhookEmitsStructuredJSONPayload(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_123, 0).UTC()
+	var body []byte
+	var headers http.Header
+	client := &http.Client{Transport: webhookRoundTripper(func(request *http.Request) (*http.Response, error) {
+		var err error
+		body, err = io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		headers = request.Header.Clone()
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    request,
+		}, nil
+	})}
+	hook, err := sink.NewWebhook(sink.WebhookOptions{
+		URL:    "https://example.com/alerts",
+		Secret: []byte("secret"),
+		Client: client,
+		Now:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewWebhook: %v", err)
+	}
+
+	payload := struct {
+		Expression string `json:"expression"`
+		Count      int    `json:"count"`
+	}{Expression: `count() > 5 within 1m`, Count: 6}
+	if err := hook.EmitJSON(payload); err != nil {
+		t.Fatalf("EmitJSON: %v", err)
+	}
+	if err := hook.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var got struct {
+		Expression string `json:"expression"`
+		Count      int    `json:"count"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode emitted payload: %v", err)
+	}
+	if got != payload {
+		t.Fatalf("payload = %+v, want %+v", got, payload)
+	}
+	if headers.Get("X-Prism-Signature") == "" {
+		t.Fatal("structured payload was not signed")
+	}
 }
 
 func (c *webhookCapture) count() int {
