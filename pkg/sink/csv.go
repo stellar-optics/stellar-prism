@@ -13,8 +13,9 @@ import (
 )
 
 // CSVOptions configures a CSV or TSV stream. Fields uses the stable names
-// documented by the CLI: id, ledger, time, kind, contract, tx, topic0 and
-// value. Values that do not apply to a record are emitted as empty cells.
+// documented by the CLI: timestamp, ledger, tx_hash, contract_id, topics and
+// value. The older id, time, kind, contract, tx and topic0 names remain
+// available for explicitly selected fields.
 type CSVOptions struct {
 	Fields    []string
 	Delimiter rune
@@ -33,12 +34,13 @@ func NewCSVSink(w io.Writer, opts CSVOptions) (*CSVSink, error) {
 	// reuse it to construct another sink.
 	fields := append([]string(nil), opts.Fields...)
 	if len(fields) == 0 {
-		fields = []string{"id", "ledger", "time", "kind", "contract", "tx", "topic0", "value"}
+		fields = []string{"timestamp", "ledger", "tx_hash", "contract_id", "topics", "value"}
 	}
 	for i, field := range fields {
 		fields[i] = strings.ToLower(strings.TrimSpace(field))
 		switch fields[i] {
-		case "id", "ledger", "time", "kind", "contract", "tx", "topic0", "value":
+		case "id", "ledger", "time", "kind", "contract", "tx", "topic0", "value",
+			"timestamp", "tx_hash", "contract_id", "topics":
 		default:
 			return nil, fmt.Errorf("csv: unsupported field %q", field)
 		}
@@ -88,25 +90,35 @@ func csvField(r stream.Record, field string) string {
 		return r.ID
 	case "ledger":
 		return strconv.FormatUint(uint64(r.Sequence), 10)
-	case "time":
+	case "time", "timestamp":
 		return r.Time.UTC().Format("2006-01-02T15:04:05Z07:00")
 	case "kind":
 		return string(r.Kind)
 	}
-	if r.Event == nil {
-		return ""
-	}
 	switch field {
-	case "contract":
-		return r.Event.ContractID
-	case "tx":
-		return r.Event.TxHash
+	case "tx", "tx_hash":
+		if r.Event != nil {
+			return r.Event.TxHash
+		}
+		if r.Transaction != nil {
+			return r.Transaction.Hash
+		}
+	case "contract", "contract_id":
+		if r.Event != nil {
+			return r.Event.ContractID
+		}
 	case "topic0":
-		if len(r.Event.TopicXDR) > 0 {
+		if r.Event != nil && len(r.Event.TopicXDR) > 0 {
 			return r.Event.TopicXDR[0]
 		}
+	case "topics":
+		if r.Event != nil {
+			return strings.Join(r.Event.TopicXDR, ",")
+		}
 	case "value":
-		return r.Event.ValueXDR
+		if r.Event != nil {
+			return r.Event.ValueXDR
+		}
 	}
 	return ""
 }
