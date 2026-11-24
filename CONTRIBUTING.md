@@ -39,6 +39,10 @@ picks it up. Run it when you touch the RPC adapter or the streaming loop:
 make test-e2e    # starts a Quickstart container, streams, then removes it
 ```
 
+For step-by-step instructions on running a standalone Quickstart container,
+deploying a sample contract, and tailing local events, see the
+[local Quickstart testing guide](docs/development/local_quickstart_testing.md).
+
 Install the linter if you need it:
 
 ```sh
