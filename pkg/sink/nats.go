@@ -19,24 +19,34 @@ type NATSPublisher interface {
 	Close() error
 }
 
+// natsDeduplicatingPublisher is implemented by publishers that can attach
+// the JetStream Nats-Msg-Id header. It is optional so existing publishers
+// keep working unchanged.
+type natsDeduplicatingPublisher interface {
+	PublishWithMsgID(subject string, data []byte, msgID string) error
+}
+
 type NATSOptions struct {
 	URL       string
 	Subject   string
 	JetStream bool
 	// Decode controls whether XDR fields use the regular --json representation.
-	Decode    bool
-	Publisher NATSPublisher
+	Decode bool
+	// Publisher is an optional test/broker abstraction. It may implement
+	// Publish(subject, data), PublishWithMsgID(...), PublishMsg(*nats.Msg)
+	// or Publish with a header argument.
+	Publisher any
 }
 
 type NATSSink struct {
-	publisher NATSPublisher
+	publisher any
 	subject   *template.Template
 	decode    bool
 }
 
 func NewNATSSink(opts NATSOptions) (*NATSSink, error) {
 	if strings.TrimSpace(opts.Subject) == "" {
-		return nil, fmt.Errorf("nats: subject is required")
+		opts.Subject = "stellar.events.{{.ContractID}}.{{.Topic0}}"
 	}
 	t, err := template.New("subject").Option("missingkey=error").Parse(opts.Subject)
 	if err != nil {
@@ -78,10 +88,41 @@ func (s *NATSSink) Emit(r stream.Record) error {
 	if err != nil {
 		return fmt.Errorf("nats: marshal record: %w", err)
 	}
-	if err := s.publisher.Publish(subject.String(), payload); err != nil {
+	msgID := r.ID
+	if msgID == "" {
+		msgID = fmt.Sprintf("%d", r.Sequence)
+	}
+	if err := publishNATS(s.publisher, subject.String(), payload, msgID); err != nil {
 		return fmt.Errorf("nats: publish: %w", err)
 	}
 	return nil
+}
+
+func publishNATS(p any, subject string, data []byte, msgID string) error {
+	switch v := p.(type) {
+	case interface {
+		PublishWithMsgID(string, []byte, string) error
+	}:
+		return v.PublishWithMsgID(subject, data, msgID)
+	case interface {
+		Publish(string, []byte, nats.Header) error
+	}:
+		header := nats.Header{}
+		header.Set("Nats-Msg-Id", msgID)
+		return v.Publish(subject, data, header)
+	case interface {
+		Publish(string, []byte, map[string]string) error
+	}:
+		return v.Publish(subject, data, map[string]string{"Nats-Msg-Id": msgID})
+	case interface{ PublishMsg(*nats.Msg) error }:
+		msg := &nats.Msg{Subject: subject, Data: data, Header: nats.Header{}}
+		msg.Header.Set("Nats-Msg-Id", msgID)
+		return v.PublishMsg(msg)
+	case interface{ Publish(string, []byte) error }:
+		return v.Publish(subject, data)
+	default:
+		return fmt.Errorf("nats: publisher %T does not implement Publish", p)
+	}
 }
 
 func subjectTemplateData(r stream.Record) struct {
@@ -105,7 +146,12 @@ func subjectTemplateData(r stream.Record) struct {
 	return data
 }
 func (s *NATSSink) Flush() error { return nil }
-func (s *NATSSink) Close() error { return s.publisher.Close() }
+func (s *NATSSink) Close() error {
+	if c, ok := s.publisher.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}
 
 func validateNATSSubject(subject string) error {
 	if subject == "" || strings.ContainsAny(subject, " \t\r\n") {
@@ -127,6 +173,9 @@ func (p coreNATSPublisher) Publish(subject string, data []byte) error {
 	}
 	return p.nc.Flush()
 }
+func (p coreNATSPublisher) PublishWithMsgID(subject string, data []byte, _ string) error {
+	return p.Publish(subject, data)
+}
 func (p coreNATSPublisher) Close() error { p.nc.Close(); return nil }
 
 type jetStreamPublisher struct {
@@ -138,4 +187,18 @@ func (p jetStreamPublisher) Publish(subject string, data []byte) error {
 	_, err := p.js.Publish(subject, data)
 	return err
 }
+
+// PublishWithMsgID lets JetStream deduplicate redelivered records by their
+// event ID. Nats-Msg-Id is the JetStream header for this.
+func (p jetStreamPublisher) PublishWithMsgID(subject string, data []byte, msgID string) error {
+	_, err := p.js.Publish(subject, data, nats.MsgId(msgID))
+	return err
+}
 func (p jetStreamPublisher) Close() error { p.nc.Close(); return nil }
+
+// NatsSink and NatsOptions are compatibility aliases for callers that spell
+// the acronym in title case.
+type NatsSink = NATSSink
+type NatsOptions = NATSOptions
+
+func NewNatsSink(opts NATSOptions) (*NATSSink, error) { return NewNATSSink(opts) }

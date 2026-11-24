@@ -114,6 +114,8 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 
 	flags.StringVar(&s.syslogAddress, "syslog-address", "",
 		"send records to a syslog socket, e.g. unixgram:///dev/log or udp://host:514")
+	flags.StringVar(&s.syslogAddress, "sink-syslog", "",
+		"alias for --syslog-address")
 	flags.StringVar(&s.syslogFormat, "syslog-format", string(sink.SyslogRFC5424),
 		`syslog message format: "rfc5424" or "journald"`)
 	flags.StringVar(&s.syslogFacility, "syslog-facility", "local0",
@@ -128,7 +130,8 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.IntVar(&s.esBatchSize, "sink-es-batch-size", 100, "records per Elasticsearch bulk request")
 	flags.DurationVar(&s.esFlushInterval, "sink-es-flush-interval", time.Second, "flush a partial Elasticsearch bulk request after this interval")
 	flags.StringVar(&s.natsURL, "sink-nats", "", "NATS server URL")
-	flags.StringVar(&s.natsSubject, "nats-subject", "stellar.events.{{.ContractID}}", "NATS subject template using .ContractID, .Topic0, .ID or .Ledger")
+	flags.StringVar(&s.natsURL, "sink-nats-url", "", "alias for --sink-nats")
+	flags.StringVar(&s.natsSubject, "nats-subject", "stellar.events.{{.ContractID}}.{{.Topic0}}", "NATS subject template using .ContractID, .Topic0, .ID or .Ledger")
 	flags.BoolVar(&s.natsJetStream, "nats-jetstream", false, "wait for JetStream publish acknowledgements")
 	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "ZeroMQ PUB endpoint")
 	flags.StringVar(&s.zmqTopic, "zmq-topic", "stellar.events.{{.ContractID}}", "ZeroMQ topic template using .ContractID, .Topic0, .ID or .Ledger")
