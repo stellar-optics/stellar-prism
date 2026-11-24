@@ -104,41 +104,12 @@ hand.`,
 // resolveContractSpec performs the two ledger-entry lookups and parses the
 // embedded spec. It is the only networked path in this file.
 func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID string) (*contractSpec, error) {
-	entries, ok := client.(prismrpc.LedgerEntriesClient)
-	if !ok {
-		return nil, fmt.Errorf("RPC client does not support getLedgerEntries, which is required to resolve a contract ABI")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	instanceKey, err := contractInstanceKey(contractID)
-	if err != nil {
-		return nil, err
-	}
-	instanceEntry, err := fetchLedgerEntry(ctx, entries, instanceKey, contractID)
+	hash, code, err := contractWASM(ctx, client, contractID)
 	if err != nil {
 		return nil, err
 	}
 
-	hash, err := wasmHashFromInstance(instanceEntry)
-	if err != nil {
-		return nil, err
-	}
-
-	codeKey := xdr.LedgerKey{
-		Type:         xdr.LedgerEntryTypeContractCode,
-		ContractCode: &xdr.LedgerKeyContractCode{Hash: hash},
-	}
-	codeEntry, err := fetchLedgerEntry(ctx, entries, codeKey, contractID)
-	if err != nil {
-		return nil, err
-	}
-	if codeEntry.Data.Type != xdr.LedgerEntryTypeContractCode || codeEntry.Data.ContractCode == nil {
-		return nil, fmt.Errorf("contract %s: WASM code entry has unexpected type %s", contractID, codeEntry.Data.Type)
-	}
-
-	specEntries, err := parseContractSpec(codeEntry.Data.ContractCode.Code)
+	specEntries, err := parseContractSpec(code)
 	if err != nil {
 		return nil, fmt.Errorf("contract %s: %w", contractID, err)
 	}
