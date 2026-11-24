@@ -14,6 +14,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -198,6 +199,14 @@ type globalFlags struct {
 	// pprofPort enables the runtime profiling server on 127.0.0.1 when it is
 	// greater than zero.
 	pprofPort int
+	// otelEndpoint is the OTLP/HTTP collector URL traces are exported to.
+	// Empty disables tracing.
+	otelEndpoint string
+	// otelSampleRate is the fraction of traces to keep, between 0 and 1.
+	otelSampleRate float64
+	// telemetryShutdown flushes and stops the trace provider. It is nil when
+	// tracing is disabled.
+	telemetryShutdown func(context.Context) error
 	// profilerFactory builds the profiler cmd/prism supplies. It is nil in
 	// library tests that do not exercise profiling.
 	profilerFactory ProfilerFactory
@@ -236,6 +245,7 @@ func ExecuteWithProfiler(args []string, stdout, stderr io.Writer, factory Profil
 	root.SetArgs(args)
 	defer func() {
 		err = errors.Join(err, g.closeProfiler())
+		err = errors.Join(err, g.stopTelemetry())
 	}()
 	return root.Execute()
 }
@@ -293,7 +303,10 @@ redacted before anything is written.`,
 			if err := g.validateWireLog(cmd); err != nil {
 				return err
 			}
-			return g.startProfiler(stderr)
+			if err := g.startProfiler(stderr); err != nil {
+				return err
+			}
+			return g.startTelemetry(cmd.Context())
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
@@ -315,6 +328,10 @@ redacted before anything is written.`,
 		"maximum bytes of each body recorded by --wire-log (0 uses 1 MiB, -1 disables body capture)")
 	root.PersistentFlags().IntVar(&g.pprofPort, "pprof-port", 0,
 		"serve Go runtime profiles on http://127.0.0.1:PORT/debug/pprof/ (0 disables)")
+	root.PersistentFlags().StringVar(&g.otelEndpoint, "otel-endpoint", "",
+		"OTLP/HTTP trace collector URL, for example http://localhost:4318/v1/traces (empty disables tracing)")
+	root.PersistentFlags().Float64Var(&g.otelSampleRate, "otel-sample-rate", 1,
+		"fraction of traces to sample, between 0 and 1")
 	root.PersistentFlags().StringVar(&g.network, "network", "testnet",
 		"expected Stellar network: testnet, mainnet, futurenet, or standalone")
 	root.PersistentFlags().BoolVar(&g.skipNetworkCheck, "insecure-skip-network-check", false,

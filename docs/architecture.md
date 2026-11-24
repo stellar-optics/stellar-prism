@@ -693,6 +693,42 @@ nothing listening or running. `internal/cli.ProfilerFactory` is the seam: the
 binary supplies the real implementation, while tests use a fake to assert the
 flag wiring and cleanup without opening a socket.
 
+## Distributed tracing (`--otel-endpoint`)
+
+`--otel-endpoint` exports OpenTelemetry traces over OTLP/HTTP, so a run can be
+followed through the polling loop, the filtering pipeline and each sink:
+
+```sh
+prism events --contract CBGSB... --follow \
+  --otel-endpoint http://localhost:4318/v1/traces \
+  --otel-sample-rate 1
+```
+
+The endpoint may be a full URL — Jaeger, Datadog, Honeycomb and other backends
+accept OTLP directly — or a bare `host:port`, which is treated as plaintext
+HTTP for a local collector. `--otel-sample-rate` keeps a fraction of traces
+between 0 and 1 and defaults to 1. An empty endpoint, the default, disables
+tracing: nothing is collected and no exporter is started.
+
+A trace mirrors the work the stream does:
+
+| Span | Parent | What it measures |
+| --- | --- | --- |
+| `poll_page` | the run | one RPC fetch and its response parsing |
+| `filter_event` | `poll_page` | topic and contract matching for one record |
+| `sink_write` | `poll_page` | one external sink write; a fanout emits one per destination |
+
+Spans carry the ledger sequence, the contract ID, the event type and the
+transaction hash, so a trace can be selected by the contract or transaction an
+operator cares about. A failed fetch or sink write is recorded as an exception
+with `Error` span status, which is what makes an intermittent destination
+diagnosable after the fact rather than only while it is failing.
+
+`pkg/stream/telemetry.go` owns provider setup and the record attributes;
+`internal/cli/telemetry.go` owns the flag lifecycle. The provider is flushed
+and shut down on the way out with a five-second bound, so an unreachable
+collector cannot hold a finished command open.
+
 ## Graceful drain (`Tailer.Drain`)
 
 On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives

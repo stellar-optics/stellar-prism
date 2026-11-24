@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // DefaultPollInterval is roughly one Stellar ledger close. Polling faster
@@ -425,7 +426,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 			return t.finish(err)
 		}
 
-		batch, err := t.fetchWithRetry(ctx)
+		pollCtx, batch, err := t.pollPage(ctx)
 		if err != nil {
 			if IsCancellation(err) {
 				return t.finish(nil)
@@ -457,7 +458,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		}
 
 		t.queuePage(batch)
-		done, _, err := t.emit(ctx, batch)
+		done, _, err := t.emit(pollCtx, batch)
 		if err != nil {
 			if IsCancellation(err) {
 				return t.finish(nil)
@@ -469,7 +470,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		// drained and the buffered suffix satisfies the limit. Do not wait
 		// for another ledger just to finish an explicitly bounded request.
 		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+len(t.reorder.pending) >= t.opts.Limit {
-			done, _, err = t.emitReady(ctx, t.reorder.Flush())
+			done, _, err = t.emitReady(pollCtx, t.reorder.Flush())
 			if err != nil {
 				return err
 			}
@@ -696,6 +697,38 @@ func (t *Tailer) flushOutput(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// pollPage fetches one page inside a poll_page span and returns the span's
+// context as well as the page, so the filter_event and sink_write spans for
+// that page nest beneath it. That hierarchy is what makes a trace show
+// "fetch, parse, filter, write" as one unit of work.
+func (t *Tailer) pollPage(ctx context.Context) (context.Context, Batch, error) {
+	pollCtx, span := Tracer().Start(ctx, "poll_page")
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.String("stream.source", t.src.Name()),
+			attribute.Int64("ledger.sequence", int64(t.lastLedger)),
+		)
+		if t.cursor != "" {
+			span.SetAttributes(attribute.String("stream.cursor", t.cursor))
+		}
+	}
+
+	batch, err := t.fetchWithRetry(pollCtx)
+	if err != nil {
+		RecordSpanError(span, err)
+		span.End()
+		return pollCtx, Batch{}, err
+	}
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int64("ledger.latest", int64(batch.Latest)),
+			attribute.Int("stream.page_records", len(batch.Records)),
+		)
+	}
+	span.End()
+	return pollCtx, batch, nil
 }
 
 // fetchWithRetry calls the Source, retrying transient failures with backoff
@@ -978,7 +1011,18 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 			continue
 		}
 		if t.opts.Filter != nil {
+			_, filterSpan := Tracer().Start(ctx, "filter_event")
+			if filterSpan.IsRecording() {
+				filterSpan.SetAttributes(RecordAttributes(r)...)
+			}
 			matched, err := t.opts.Filter.Match(r)
+			if filterSpan.IsRecording() {
+				filterSpan.SetAttributes(attribute.Bool("filter.matched", matched))
+			}
+			if err != nil {
+				RecordSpanError(filterSpan, err)
+			}
+			filterSpan.End()
 			if err != nil {
 				return false, emitted, fmt.Errorf("filtering record %s: %w", r.ID, err)
 			}
@@ -998,9 +1042,26 @@ func (t *Tailer) emitReady(ctx context.Context, records []Record) (done bool, em
 			}
 		}
 
-		if err := t.sink.Emit(r); err != nil {
-			return false, emitted, fmt.Errorf("writing record %s: %w", r.ID, err)
+		// The sink_write span covers the external write. A sink that accepts
+		// the context can nest its own per-destination spans beneath it; one
+		// that does not is still measured, just as a single span.
+		sinkCtx, sinkSpan := Tracer().Start(ctx, "sink_write")
+		if sinkSpan.IsRecording() {
+			sinkSpan.SetAttributes(RecordAttributes(r)...)
+			sinkSpan.SetAttributes(attribute.String("sink.type", fmt.Sprintf("%T", t.sink)))
 		}
+		var emitErr error
+		if contextSink, ok := t.sink.(ContextSink); ok {
+			emitErr = contextSink.EmitContext(sinkCtx, r)
+		} else {
+			emitErr = t.sink.Emit(r)
+		}
+		if emitErr != nil {
+			RecordSpanError(sinkSpan, emitErr)
+			sinkSpan.End()
+			return false, emitted, fmt.Errorf("writing record %s: %w", r.ID, emitErr)
+		}
+		sinkSpan.End()
 		t.lastID = r.ID
 		t.lastLedger = r.Sequence
 		t.stats.Emitted++

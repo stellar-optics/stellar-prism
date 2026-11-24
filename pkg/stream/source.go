@@ -71,6 +71,20 @@ type Sink interface {
 	Flush() error
 }
 
+// ContextSink is a Sink that accepts the caller's context.
+//
+// The tailer passes the context of the page being processed, so a sink that
+// creates trace spans can nest them under the poll_page span and see where a
+// record's time was actually spent. Sinks that do not implement it are still
+// supported: the tailer falls back to Emit and the sink's work appears in the
+// stream's own sink_write span instead.
+type ContextSink interface {
+	Sink
+	// EmitContext writes a single record. The context carries cancellation,
+	// deadlines and the active trace span.
+	EmitContext(ctx context.Context, r Record) error
+}
+
 // SinkFunc adapts a plain function to the Sink interface, for tests and for
 // trivial sinks with nothing to flush.
 type SinkFunc func(r Record) error
