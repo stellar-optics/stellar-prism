@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -74,6 +75,9 @@ hand.`,
 			if function == "" && len(arguments) > 0 {
 				return fmt.Errorf("--arg requires --function")
 			}
+			if _, err := contractInstanceKey(args[0]); err != nil {
+				return err
+			}
 
 			client, closeClient, err := openClient(g, stderr)
 			if err != nil {
@@ -99,6 +103,143 @@ hand.`,
 	cmd.Flags().StringArrayVar(&arguments, "arg", nil,
 		"base64 ScVal argument to decode; repeatable and requires --function")
 	return cmd
+}
+
+// newABIInspectCmd builds `prism abi inspect <contract-id>`.
+func newABIInspectCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
+	var asJSON bool
+
+	cmd := &cobra.Command{
+		Use:   "inspect <contract-id>",
+		Short: "Inspect a contract ABI as markdown or JSON",
+		Long: `Resolve a contract's on-chain spec and print its complete interface.
+
+The markdown view is deliberately plain text with no colour codes, so it can
+be pasted into an issue or a document as-is. Function and argument docstrings
+are shown next to parameter types and return types.
+
+With --json the same information is emitted as a stable object for editors and
+other tooling.`,
+		Example: `  # Human-readable markdown
+  prism abi inspect CBGSB...
+
+  # Structured output for tooling
+  prism abi inspect CBGSB... --json | jq '.functions[].name'`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			contractID := args[0]
+			if _, err := contractInstanceKey(contractID); err != nil {
+				return err
+			}
+
+			client, closeClient, err := openClient(g, stderr)
+			if err != nil {
+				return err
+			}
+			defer closeClient()
+
+			spec, err := resolveContractSpec(cmd.Context(), client, contractID)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return spec.writeInspectionJSON(stdout)
+			}
+			return spec.writeInspectionMarkdown(stdout)
+		},
+	}
+
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit the ABI inspection as JSON")
+	return cmd
+}
+
+// abiInspectionJSON is the stable schema of `prism abi inspect --json`.
+// Scalar fields are always present so consumers do not need to distinguish a
+// missing field from an empty string or list; optional UDT and event sections
+// are omitted when the spec has none.
+type abiInspectionJSON struct {
+	ContractID string            `json:"contractId"`
+	WasmHash   string            `json:"wasmHash"`
+	Functions  []abiFunctionJSON `json:"functions"`
+	Structs    []abiStructJSON   `json:"structs,omitempty"`
+	Unions     []abiUnionJSON    `json:"unions,omitempty"`
+	Enums      []abiEnumJSON     `json:"enums,omitempty"`
+	Errors     []abiErrorJSON    `json:"errors,omitempty"`
+	Events     []abiEventJSON    `json:"events,omitempty"`
+}
+
+type abiFunctionJSON struct {
+	Name      string            `json:"name"`
+	Doc       string            `json:"doc"`
+	Arguments []abiArgumentJSON `json:"arguments"`
+	Returns   []string          `json:"returns"`
+}
+
+type abiArgumentJSON struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Doc  string `json:"doc"`
+}
+
+type abiStructJSON struct {
+	Name   string               `json:"name"`
+	Doc    string               `json:"doc"`
+	Fields []abiStructFieldJSON `json:"fields"`
+}
+
+type abiStructFieldJSON struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Doc  string `json:"doc"`
+}
+
+type abiUnionJSON struct {
+	Name  string             `json:"name"`
+	Doc   string             `json:"doc"`
+	Cases []abiUnionCaseJSON `json:"cases"`
+}
+
+type abiUnionCaseJSON struct {
+	Name  string   `json:"name"`
+	Types []string `json:"types"`
+	Doc   string   `json:"doc"`
+}
+
+type abiEnumJSON struct {
+	Name  string            `json:"name"`
+	Doc   string            `json:"doc"`
+	Cases []abiEnumCaseJSON `json:"cases"`
+}
+
+type abiEnumCaseJSON struct {
+	Name  string `json:"name"`
+	Value uint32 `json:"value"`
+	Doc   string `json:"doc"`
+}
+
+type abiErrorJSON struct {
+	Name  string             `json:"name"`
+	Doc   string             `json:"doc"`
+	Cases []abiErrorCaseJSON `json:"cases"`
+}
+
+type abiErrorCaseJSON struct {
+	Name  string `json:"name"`
+	Value uint32 `json:"value"`
+	Doc   string `json:"doc"`
+}
+
+type abiEventJSON struct {
+	Name   string              `json:"name"`
+	Doc    string              `json:"doc"`
+	Params []abiEventParamJSON `json:"params"`
+}
+
+type abiEventParamJSON struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Location string `json:"location"`
+	Doc      string `json:"doc"`
 }
 
 // resolveContractSpec performs the two ledger-entry lookups and parses the
@@ -462,6 +603,375 @@ func (s *contractSpec) writeAll(w io.Writer) error {
 	})
 }
 
+// writeInspectionMarkdown renders the spec as plain markdown tables. It never
+// consults the colour palette: ANSI escapes would make the result invalid
+// markdown, including when the caller passes --color always.
+func (s *contractSpec) writeInspectionMarkdown(w io.Writer) error {
+	if _, err := fmt.Fprintln(w, "# Contract ABI"); err != nil {
+		return fmt.Errorf("writing ABI inspection title: %w", err)
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return fmt.Errorf("writing ABI inspection separator: %w", err)
+	}
+
+	if err := writeMarkdownTable(w, "Contract", []string{"Field", "Value"}, [][]string{
+		{"Contract ID", markdownCode(s.ContractID)},
+		{"WASM hash", markdownCode(hex.EncodeToString(s.WasmHash[:]))},
+	}); err != nil {
+		return err
+	}
+
+	functionRows := make([][]string, 0, len(s.Functions))
+	argumentRows := make([][]string, 0)
+	for _, fn := range s.Functions {
+		functionRows = append(functionRows, []string{
+			markdownCode(string(fn.Name)),
+			markdownCode(functionSignature(fn)),
+			markdownCode(functionReturns(fn)),
+			fn.Doc,
+		})
+		for _, input := range fn.Inputs {
+			argumentRows = append(argumentRows, []string{
+				markdownCode(string(fn.Name)),
+				markdownCode(input.Name),
+				markdownCode(formatSpecType(input.Type)),
+				input.Doc,
+			})
+		}
+	}
+	if err := writeMarkdownTable(w, "Functions",
+		[]string{"Name", "Signature", "Returns", "Doc"}, functionRows); err != nil {
+		return err
+	}
+	if err := writeMarkdownTable(w, "Arguments",
+		[]string{"Function", "Name", "Type", "Doc"}, argumentRows); err != nil {
+		return err
+	}
+
+	if err := s.writeInspectionTypesMarkdown(w); err != nil {
+		return err
+	}
+	return s.writeInspectionEventsMarkdown(w)
+}
+
+func (s *contractSpec) writeInspectionTypesMarkdown(w io.Writer) error {
+	if len(s.Structs) > 0 {
+		rows := make([][]string, 0)
+		for _, item := range s.Structs {
+			if len(item.Fields) == 0 {
+				rows = append(rows, []string{markdownCode(item.Name), item.Doc, "", "", ""})
+				continue
+			}
+			for _, field := range item.Fields {
+				rows = append(rows, []string{
+					markdownCode(item.Name),
+					item.Doc,
+					markdownCode(field.Name),
+					markdownCode(formatSpecType(field.Type)),
+					field.Doc,
+				})
+			}
+		}
+		if err := writeMarkdownTable(w, "Structs",
+			[]string{"Struct", "Struct Doc", "Field", "Type", "Field Doc"}, rows); err != nil {
+			return err
+		}
+	}
+
+	if len(s.Unions) > 0 {
+		rows := make([][]string, 0)
+		for _, item := range s.Unions {
+			if len(item.Cases) == 0 {
+				rows = append(rows, []string{markdownCode(item.Name), item.Doc, "", "", ""})
+				continue
+			}
+			for _, unionCase := range item.Cases {
+				detail, err := newSpecUnionCaseDetail(unionCase)
+				if err != nil {
+					return fmt.Errorf("describing union case: %w", err)
+				}
+				typeCell := ""
+				if len(detail.Types) > 0 {
+					typeCell = markdownCode("(" + strings.Join(detail.Types, ", ") + ")")
+				}
+				rows = append(rows, []string{
+					markdownCode(item.Name),
+					item.Doc,
+					markdownCode(detail.Name),
+					typeCell,
+					detail.Doc,
+				})
+			}
+		}
+		if err := writeMarkdownTable(w, "Unions",
+			[]string{"Union", "Union Doc", "Case", "Types", "Case Doc"}, rows); err != nil {
+			return err
+		}
+	}
+
+	if len(s.Enums) > 0 {
+		rows := make([][]string, 0)
+		for _, item := range s.Enums {
+			if len(item.Cases) == 0 {
+				rows = append(rows, []string{markdownCode(item.Name), item.Doc, "", "", ""})
+				continue
+			}
+			for _, enumCase := range item.Cases {
+				rows = append(rows, []string{
+					markdownCode(item.Name),
+					item.Doc,
+					markdownCode(enumCase.Name),
+					fmt.Sprintf("%d", enumCase.Value),
+					enumCase.Doc,
+				})
+			}
+		}
+		if err := writeMarkdownTable(w, "Enums",
+			[]string{"Enum", "Enum Doc", "Case", "Value", "Case Doc"}, rows); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *contractSpec) writeInspectionEventsMarkdown(w io.Writer) error {
+	if len(s.Errors) > 0 {
+		rows := make([][]string, 0)
+		for _, item := range s.Errors {
+			if len(item.Cases) == 0 {
+				rows = append(rows, []string{markdownCode(item.Name), item.Doc, "", "", ""})
+				continue
+			}
+			for _, errorCase := range item.Cases {
+				rows = append(rows, []string{
+					markdownCode(item.Name),
+					item.Doc,
+					markdownCode(errorCase.Name),
+					fmt.Sprintf("%d", errorCase.Value),
+					errorCase.Doc,
+				})
+			}
+		}
+		if err := writeMarkdownTable(w, "Errors",
+			[]string{"Error", "Error Doc", "Case", "Value", "Case Doc"}, rows); err != nil {
+			return err
+		}
+	}
+
+	if len(s.Events) == 0 {
+		return nil
+	}
+	rows := make([][]string, 0)
+	for _, event := range s.Events {
+		if len(event.Params) == 0 {
+			rows = append(rows, []string{markdownCode(string(event.Name)), event.Doc, "", "", "", ""})
+			continue
+		}
+		for _, param := range event.Params {
+			rows = append(rows, []string{
+				markdownCode(string(event.Name)),
+				event.Doc,
+				markdownCode(param.Name),
+				markdownCode(formatSpecType(param.Type)),
+				eventParamLocationName(param),
+				param.Doc,
+			})
+		}
+	}
+	return writeMarkdownTable(w, "Events",
+		[]string{"Event", "Event Doc", "Param", "Type", "Location", "Param Doc"}, rows)
+}
+
+func writeMarkdownTable(w io.Writer, title string, headers []string, rows [][]string) error {
+	if _, err := fmt.Fprintf(w, "## %s\n\n", title); err != nil {
+		return fmt.Errorf("writing %s heading: %w", title, err)
+	}
+	if _, err := fmt.Fprintf(w, "| %s |\n", strings.Join(headers, " | ")); err != nil {
+		return fmt.Errorf("writing %s table header: %w", title, err)
+	}
+	separators := make([]string, len(headers))
+	for i := range separators {
+		separators[i] = "---"
+	}
+	if _, err := fmt.Fprintf(w, "| %s |\n", strings.Join(separators, " | ")); err != nil {
+		return fmt.Errorf("writing %s table separator: %w", title, err)
+	}
+	for _, row := range rows {
+		if len(row) != len(headers) {
+			return fmt.Errorf("writing %s row: got %d cells, want %d", title, len(row), len(headers))
+		}
+		cells := make([]string, len(row))
+		for i, cell := range row {
+			cells[i] = markdownCell(cell)
+		}
+		if _, err := fmt.Fprintf(w, "| %s |\n", strings.Join(cells, " | ")); err != nil {
+			return fmt.Errorf("writing %s row: %w", title, err)
+		}
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return fmt.Errorf("writing %s separator: %w", title, err)
+	}
+	return nil
+}
+
+// markdownCell keeps docstrings from breaking a GFM table. Newlines become
+// line breaks and pipes are escaped, while ordinary text is left untouched.
+func markdownCell(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "<br>")
+	s = strings.ReplaceAll(s, "\n", "<br>")
+	s = strings.ReplaceAll(s, "\r", "<br>")
+	return strings.ReplaceAll(s, "|", `\|`)
+}
+
+func markdownCode(s string) string {
+	return "`" + markdownCell(s) + "`"
+}
+
+// writeInspectionJSON renders the spec as a stable, pretty-printed object in
+// the same style as `prism tx --json`.
+func (s *contractSpec) writeInspectionJSON(w io.Writer) error {
+	doc, err := s.inspectionJSON()
+	if err != nil {
+		return fmt.Errorf("building ABI inspection: %w", err)
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(doc); err != nil {
+		return fmt.Errorf("encoding ABI inspection: %w", err)
+	}
+	return nil
+}
+
+func (s *contractSpec) inspectionJSON() (abiInspectionJSON, error) {
+	out := abiInspectionJSON{
+		ContractID: s.ContractID,
+		WasmHash:   hex.EncodeToString(s.WasmHash[:]),
+		Functions:  make([]abiFunctionJSON, 0, len(s.Functions)),
+	}
+	for _, fn := range s.Functions {
+		item := abiFunctionJSON{
+			Name:      string(fn.Name),
+			Doc:       fn.Doc,
+			Arguments: make([]abiArgumentJSON, 0, len(fn.Inputs)),
+			Returns:   make([]string, 0, len(fn.Outputs)),
+		}
+		for _, input := range fn.Inputs {
+			item.Arguments = append(item.Arguments, abiArgumentJSON{
+				Name: input.Name,
+				Type: formatSpecType(input.Type),
+				Doc:  input.Doc,
+			})
+		}
+		for _, output := range fn.Outputs {
+			item.Returns = append(item.Returns, formatSpecType(output))
+		}
+		out.Functions = append(out.Functions, item)
+	}
+
+	if len(s.Structs) > 0 {
+		out.Structs = make([]abiStructJSON, 0, len(s.Structs))
+		for _, item := range s.Structs {
+			entry := abiStructJSON{
+				Name:   item.Name,
+				Doc:    item.Doc,
+				Fields: make([]abiStructFieldJSON, 0, len(item.Fields)),
+			}
+			for _, field := range item.Fields {
+				entry.Fields = append(entry.Fields, abiStructFieldJSON{
+					Name: field.Name,
+					Type: formatSpecType(field.Type),
+					Doc:  field.Doc,
+				})
+			}
+			out.Structs = append(out.Structs, entry)
+		}
+	}
+
+	if len(s.Unions) > 0 {
+		out.Unions = make([]abiUnionJSON, 0, len(s.Unions))
+		for _, item := range s.Unions {
+			entry := abiUnionJSON{
+				Name:  item.Name,
+				Doc:   item.Doc,
+				Cases: make([]abiUnionCaseJSON, 0, len(item.Cases)),
+			}
+			for _, unionCase := range item.Cases {
+				detail, err := newSpecUnionCaseDetail(unionCase)
+				if err != nil {
+					return abiInspectionJSON{}, fmt.Errorf("describing union case: %w", err)
+				}
+				entry.Cases = append(entry.Cases, abiUnionCaseJSON{
+					Name:  detail.Name,
+					Types: detail.Types,
+					Doc:   detail.Doc,
+				})
+			}
+			out.Unions = append(out.Unions, entry)
+		}
+	}
+
+	if len(s.Enums) > 0 {
+		out.Enums = make([]abiEnumJSON, 0, len(s.Enums))
+		for _, item := range s.Enums {
+			entry := abiEnumJSON{
+				Name:  item.Name,
+				Doc:   item.Doc,
+				Cases: make([]abiEnumCaseJSON, 0, len(item.Cases)),
+			}
+			for _, enumCase := range item.Cases {
+				entry.Cases = append(entry.Cases, abiEnumCaseJSON{
+					Name:  enumCase.Name,
+					Value: uint32(enumCase.Value),
+					Doc:   enumCase.Doc,
+				})
+			}
+			out.Enums = append(out.Enums, entry)
+		}
+	}
+
+	if len(s.Errors) > 0 {
+		out.Errors = make([]abiErrorJSON, 0, len(s.Errors))
+		for _, item := range s.Errors {
+			entry := abiErrorJSON{
+				Name:  item.Name,
+				Doc:   item.Doc,
+				Cases: make([]abiErrorCaseJSON, 0, len(item.Cases)),
+			}
+			for _, errorCase := range item.Cases {
+				entry.Cases = append(entry.Cases, abiErrorCaseJSON{
+					Name:  errorCase.Name,
+					Value: uint32(errorCase.Value),
+					Doc:   errorCase.Doc,
+				})
+			}
+			out.Errors = append(out.Errors, entry)
+		}
+	}
+
+	if len(s.Events) > 0 {
+		out.Events = make([]abiEventJSON, 0, len(s.Events))
+		for _, event := range s.Events {
+			entry := abiEventJSON{
+				Name:   string(event.Name),
+				Doc:    event.Doc,
+				Params: make([]abiEventParamJSON, 0, len(event.Params)),
+			}
+			for _, param := range event.Params {
+				entry.Params = append(entry.Params, abiEventParamJSON{
+					Name:     param.Name,
+					Type:     formatSpecType(param.Type),
+					Location: eventParamLocationName(param),
+					Doc:      param.Doc,
+				})
+			}
+			out.Events = append(out.Events, entry)
+		}
+	}
+	return out, nil
+}
+
 // writeSection prints a heading only when the section has content, so a
 // contract without events does not show an empty list.
 func writeSection(w io.Writer, name string, count int, body func() error) error {
@@ -528,8 +1038,15 @@ func (s *contractSpec) writeFunction(w io.Writer, name string, arguments []strin
 }
 
 func writeFunctionSignature(w io.Writer, fn xdr.ScSpecFunctionV0, indent string) error {
+	if _, err := fmt.Fprintln(w, indent+functionSignature(fn)); err != nil {
+		return fmt.Errorf("writing function %s: %w", fn.Name, err)
+	}
+	return nil
+}
+
+// functionSignature renders a function declaration without any indentation.
+func functionSignature(fn xdr.ScSpecFunctionV0) string {
 	var b strings.Builder
-	b.WriteString(indent)
 	b.WriteString(string(fn.Name))
 	b.WriteString("(")
 	for i, input := range fn.Inputs {
@@ -540,58 +1057,75 @@ func writeFunctionSignature(w io.Writer, fn xdr.ScSpecFunctionV0, indent string)
 		b.WriteString(": ")
 		b.WriteString(formatSpecType(input.Type))
 	}
-	b.WriteString(")")
-
-	switch len(fn.Outputs) {
-	case 0:
-		b.WriteString(" -> ()")
-	case 1:
-		b.WriteString(" -> ")
-		b.WriteString(formatSpecType(fn.Outputs[0]))
-	default:
-		b.WriteString(" -> (")
-		for i, output := range fn.Outputs {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(formatSpecType(output))
-		}
-		b.WriteString(")")
-	}
-
-	if _, err := fmt.Fprintln(w, b.String()); err != nil {
-		return fmt.Errorf("writing function %s: %w", fn.Name, err)
-	}
-	return nil
+	b.WriteString(") -> ")
+	b.WriteString(functionReturns(fn))
+	return b.String()
 }
 
-func writeUnionCase(w io.Writer, unionCase xdr.ScSpecUdtUnionCaseV0, indent string) error {
-	var name string
-	var types []string
+// functionReturns renders the return side of a signature. Void is spelled ()
+// to match the rest of prism's ABI output; JSON uses an empty array instead.
+func functionReturns(fn xdr.ScSpecFunctionV0) string {
+	switch len(fn.Outputs) {
+	case 0:
+		return "()"
+	case 1:
+		return formatSpecType(fn.Outputs[0])
+	default:
+		parts := make([]string, 0, len(fn.Outputs))
+		for _, output := range fn.Outputs {
+			parts = append(parts, formatSpecType(output))
+		}
+		return "(" + strings.Join(parts, ", ") + ")"
+	}
+}
+
+type specUnionCaseDetail struct {
+	Name  string
+	Doc   string
+	Types []string
+}
+
+func newSpecUnionCaseDetail(unionCase xdr.ScSpecUdtUnionCaseV0) (specUnionCaseDetail, error) {
 	switch unionCase.Kind {
 	case xdr.ScSpecUdtUnionCaseV0KindScSpecUdtUnionCaseVoidV0:
 		if unionCase.VoidCase == nil {
-			return fmt.Errorf("union case is missing its void payload")
+			return specUnionCaseDetail{}, fmt.Errorf("union case is missing its void payload")
 		}
-		name = unionCase.VoidCase.Name
+		return specUnionCaseDetail{
+			Name:  unionCase.VoidCase.Name,
+			Doc:   unionCase.VoidCase.Doc,
+			Types: make([]string, 0),
+		}, nil
 	case xdr.ScSpecUdtUnionCaseV0KindScSpecUdtUnionCaseTupleV0:
 		if unionCase.TupleCase == nil {
-			return fmt.Errorf("union case is missing its tuple payload")
+			return specUnionCaseDetail{}, fmt.Errorf("union case is missing its tuple payload")
 		}
-		name = unionCase.TupleCase.Name
+		types := make([]string, 0, len(unionCase.TupleCase.Type))
 		for _, typ := range unionCase.TupleCase.Type {
 			types = append(types, formatSpecType(typ))
 		}
+		return specUnionCaseDetail{
+			Name:  unionCase.TupleCase.Name,
+			Doc:   unionCase.TupleCase.Doc,
+			Types: types,
+		}, nil
 	default:
-		return fmt.Errorf("union case has unknown kind %s", unionCase.Kind)
+		return specUnionCaseDetail{}, fmt.Errorf("union case has unknown kind %s", unionCase.Kind)
+	}
+}
+
+func writeUnionCase(w io.Writer, unionCase xdr.ScSpecUdtUnionCaseV0, indent string) error {
+	detail, err := newSpecUnionCaseDetail(unionCase)
+	if err != nil {
+		return err
 	}
 
-	line := indent + name
-	if len(types) > 0 {
-		line += "(" + strings.Join(types, ", ") + ")"
+	line := indent + detail.Name
+	if len(detail.Types) > 0 {
+		line += "(" + strings.Join(detail.Types, ", ") + ")"
 	}
 	if _, err := fmt.Fprintln(w, line); err != nil {
-		return fmt.Errorf("writing union case %s: %w", name, err)
+		return fmt.Errorf("writing union case %s: %w", detail.Name, err)
 	}
 	return nil
 }
@@ -612,6 +1146,13 @@ func eventParamLocation(param xdr.ScSpecEventParamV0) string {
 		return " [topic]"
 	}
 	return " [data]"
+}
+
+func eventParamLocationName(param xdr.ScSpecEventParamV0) string {
+	if param.Location == xdr.ScSpecEventParamLocationV0ScSpecEventParamLocationTopicList {
+		return "topic"
+	}
+	return "data"
 }
 
 // formatSpecType renders an ScSpecTypeDef in Soroban's familiar type syntax.

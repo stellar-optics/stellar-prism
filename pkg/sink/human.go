@@ -203,6 +203,11 @@ func (h *Human) emitEvent(r stream.Record) error {
 		return fmt.Errorf("human: event record %s has no payload", r.ID)
 	}
 
+	sac := e.SAC
+	if sac == nil {
+		sac = stream.DecodeSAC(e.TopicXDR, e.ValueXDR)
+	}
+
 	var b strings.Builder
 	indent := ""
 	if e.CallDepth > 0 {
@@ -228,6 +233,12 @@ func (h *Human) emitEvent(r stream.Record) error {
 
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
+	}
+	if sac != nil {
+		if _, err := fmt.Fprintf(h.w, "  %s[token]%s %s%s%s\n",
+			p.Type, p.Reset, p.Key, sac.Summary(), p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
 	}
 	if h.compact {
 		return nil

@@ -327,6 +327,10 @@ redacted before anything is written.`,
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
 	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load (default: ~/.config/prism/config.yaml then .prism.yaml in cwd)")
 	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
+
+	abiCmd := newABICmd(g, stdout, stderr)
+	abiCmd.AddCommand(newABIInspectCmd(g, stdout, stderr))
+
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
@@ -334,7 +338,7 @@ redacted before anything is written.`,
 		newTransactionsCmd(g, stdout, stderr),
 		newOperationsCmd(g, stdout, stderr),
 		newSimulateCmd(g, stdout, stderr),
-		newABICmd(g, stdout, stderr),
+		abiCmd,
 		newStorageCmd(g, stdout, stderr),
 		newWASMCmd(g, stdout, stderr),
 		newFeeStatsCmd(g, stdout, stderr),

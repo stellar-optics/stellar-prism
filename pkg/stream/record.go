@@ -71,8 +71,8 @@ type Record struct {
 }
 
 // Event is a Soroban event as delivered by RPC. The XDR fields are kept in
-// their base64 form so that decoding happens in the sink, only for the output
-// formats that need it.
+// their base64 form so sinks can re-decode them; SAC holds a decoded view when
+// the event matches a built-in Stellar Asset Contract token event.
 type Event struct {
 	// Type is "contract", "system" or "diagnostic".
 	Type string
@@ -89,6 +89,9 @@ type Event struct {
 	TopicXDR []string
 	// ValueXDR is the base64 ScVal payload.
 	ValueXDR string
+	// SAC is the decoded built-in Stellar Asset Contract token event, or nil
+	// for events that do not follow a SAC token shape.
+	SAC *SACEvent
 	// CallDepth is the zero-based invocation depth when call trace metadata is
 	// available. RPC getEvents currently omits this trace and leaves it zero.
 	CallDepth int

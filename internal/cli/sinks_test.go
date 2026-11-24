@@ -448,6 +448,22 @@ func TestSinkFlagValidation(t *testing.T) {
 			name: "JetStream without NATS",
 			args: []string{"events", "--from", "15000", "--nats-jetstream"},
 		},
+		{
+			name: "invalid ZeroMQ endpoint scheme",
+			args: []string{"events", "--from", "15000", "--sink-zmq-pub", "http://127.0.0.1:5556"},
+		},
+		{
+			name: "AWS batch too small",
+			args: []string{"events", "--from", "15000", "--sink-aws-batch-size", "0"},
+		},
+		{
+			name: "AWS batch too large",
+			args: []string{"events", "--from", "15000", "--sink-sqs-queue", "https://x/q", "--sink-aws-batch-size", "11"},
+		},
+		{
+			name: "negative AWS flush interval",
+			args: []string{"events", "--from", "15000", "--sink-aws-flush-interval", "-1s"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -486,7 +502,8 @@ func TestStreamingHelpAdvertisesSinkFlags(t *testing.T) {
 	for _, flag := range []string{
 		"--webhook-url", "--webhook-secret", "--cloud-provider", "--cloud-bucket",
 		"--metrics-addr", "--syslog-address", "--syslog-format", "--syslog-facility",
-		"--sink-es-url", "--sink-es-index", "--sink-nats", "--nats-subject", "--sink-zmq", "--zmq-topic",
+		"--sink-es-url", "--sink-es-index", "--sink-nats", "--nats-subject", "--sink-zmq", "--sink-zmq-pub", "--zmq-topic",
+		"--sink-sqs-queue", "--sink-sns-topic", "--sink-region", "--sink-aws-batch-size", "--sink-aws-flush-interval",
 		"--sink-audit", "--sink-audit-key", "--sink-audit-checkpoint",
 	} {
 		if !strings.Contains(stdout, flag) {
