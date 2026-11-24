@@ -528,6 +528,13 @@ ledger throughput and fee analytics (see
 prism aggregate --contract CDLZF... --window 1m --metric count --follow --json
 ```
 
+### Migrating from Horizon SSE
+
+Transitioning an existing Horizon `/ledgers`, `/transactions`, or `/payments`
+indexer to Soroban RPC and `stellar-prism` (including side-by-side examples and
+using the built-in `HorizonSSESource` bridge)? See
+[docs/migration/from_horizon_sse.md](docs/migration/from_horizon_sse.md).
+
 ## What prism guarantees
 
 This is a streaming tool, so the guarantee matters more than the feature list:
