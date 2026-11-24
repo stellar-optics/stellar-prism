@@ -511,7 +511,7 @@ prism transactions --detect-conflicts --follow --json
 
 Re-simulates a base64 transaction envelope as the chain head advances and
 reports changes to return values, instructions, memory bytes, and minimum
-resource fees:
+resource fees (see [docs/guides/offline_simulation.md](docs/guides/offline_simulation.md)):
 
 ```sh
 prism simulate --tx-envelope AAA... --follow --json
