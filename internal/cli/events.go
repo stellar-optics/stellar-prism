@@ -68,7 +68,6 @@ type streamFlags struct {
 	quiet     bool
 	verbosity int
 	stats     bool
-	dryRun    bool
 	statsBar  bool
 	process   func([]stream.Record) ([]stream.Record, error)
 	filter    stream.RecordFilter
@@ -203,8 +202,6 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"suppress diagnostic output on stderr; only emit final exit code")
 	cmd.Flags().BoolVar(&s.stats, "stats", false,
 		"print a run summary on exit: records processed, duplicates dropped, retries and elapsed time")
-	cmd.Flags().BoolVar(&s.dryRun, "dry-run", false,
-		"validate filters and report matches without writing to configured sinks")
 	cmd.Flags().BoolVar(&s.statsBar, "stats-bar", false,
 		"show live ledger timing and ingest statistics on stderr (with --follow and a terminal stdout)")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
@@ -522,9 +519,6 @@ func (s *streamFlags) newSink(
 	onBatchError func(error),
 	onDeadLetter func(sink.DLQEntry),
 ) (stream.Sink, error) {
-	if s.dryRun {
-		return sink.NewDryRunSink(diagnostics), nil
-	}
 	build := func(out io.Writer) stream.Sink {
 		format := strings.ToLower(s.format)
 		if s.tsv {
@@ -648,24 +642,6 @@ type errorSink struct{ err error }
 func (s errorSink) Emit(stream.Record) error { return s.err }
 func (s errorSink) Flush() error             { return s.err }
 
-// dryRunFilter reports records rejected before they reach DryRunSink, making
-// filter validation observable without enabling any configured delivery sink.
-type dryRunFilter struct {
-	next        stream.RecordFilter
-	diagnostics io.Writer
-}
-
-func (f dryRunFilter) Match(record stream.Record) (bool, error) {
-	matched, err := f.next.Match(record)
-	if err != nil {
-		return false, err
-	}
-	if !matched {
-		_, _ = fmt.Fprintf(f.diagnostics, "dry-run: reject id=%s ledger=%d kind=%s\n", record.ID, record.Sequence, record.Kind)
-	}
-	return matched, nil
-}
-
 // closingSink gives a wrapper without its own Close a teardown path. It is how
 // a sink chain tells runStream that there is more to release than the outermost
 // Batcher knows about.
@@ -778,6 +754,7 @@ func newEventsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		filterExpr    string
 		topicRegex    []string
 		contractsFile string
+		specPath      string
 	)
 
 	cmd := &cobra.Command{
@@ -881,6 +858,21 @@ start the next run where the last one stopped.`,
 				}()
 			}
 
+			var localSpec *contractSpec
+			specContract := ""
+			if specPath != "" {
+				if len(contractIDs) == 1 {
+					specContract = contractIDs[0]
+				} else if len(contractIDs) > 1 {
+					return fmt.Errorf("--spec supports at most one --contract; decoding locally needs an unambiguous contract")
+				}
+				var err error
+				localSpec, err = loadContractSpec(specPath, specContract)
+				if err != nil {
+					return err
+				}
+			}
+
 			client, closeClient, err := openClient(g, stderr)
 			if err != nil {
 				return err
@@ -913,6 +905,9 @@ start the next run where the last one stopped.`,
 					if err != nil {
 						return nil, err
 					}
+				}
+				if localSpec != nil {
+					return localSpecDecoder(src, localSpec, specContract)
 				}
 				return src, nil
 			}
@@ -947,6 +942,8 @@ start the next run where the last one stopped.`,
 	cmd.Flags().StringVar(&filterExpr, "filter-expr", "", "client-side boolean expression evaluated against decoded event payloads")
 	cmd.Flags().StringArrayVar(&topicRegex, "topic-regex", nil, "client-side topic rule as segment-index:regexp; repeatable and all rules must match")
 	cmd.Flags().StringVar(&contractsFile, "contracts-file", "", "read and hot-reload contract IDs from this file (one per line)")
+	cmd.Flags().StringVar(&specPath, "spec", "",
+		"decode matching events with a local contract spec (.wasm or .json) instead of an RPC lookup")
 	// StringArray, not StringSlice: a comma separates segment *patterns*
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
@@ -1071,6 +1068,10 @@ func runStream(
 				return err
 			}
 		}
+	}
+
+	if g.dryRun {
+		return runDryRunCheck(ctx, cmd, client, sf, g, stdout, stderr)
 	}
 
 	// Diagnostics come from more than one goroutine: the stream reports
@@ -1244,9 +1245,6 @@ func runStream(
 	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
-	}
-	if sf.dryRun && opts.Filter != nil {
-		opts.Filter = dryRunFilter{next: opts.Filter, diagnostics: stderr}
 	}
 	opts.Process = sf.process
 

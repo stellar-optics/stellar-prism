@@ -389,6 +389,18 @@ func (p *Pool) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerRes
 	})
 }
 
+// GetLedgerEntries implements rpc.LedgerEntriesClient for a failover pool.
+func (p *Pool) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	return poolCall(p, ctx, "getLedgerEntries", func(c rpc.Client) (protocol.GetLedgerEntriesResponse, error) {
+		entries, ok := c.(rpc.LedgerEntriesClient)
+		if !ok {
+			return protocol.GetLedgerEntriesResponse{}, rpc.Permanent(fmt.Errorf(
+				"pooled endpoint does not implement LedgerEntriesClient"))
+		}
+		return entries.GetLedgerEntries(ctx, req)
+	})
+}
+
 // GetNetwork implements rpc.NetworkClient for a failover pool.
 func (p *Pool) GetNetwork(ctx context.Context) (protocol.GetNetworkResponse, error) {
 	return poolCall(p, ctx, "getNetwork", func(c rpc.Client) (protocol.GetNetworkResponse, error) {

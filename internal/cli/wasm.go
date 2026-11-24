@@ -1,13 +1,68 @@
 package cli
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"strconv"
 
 	"github.com/spf13/cobra"
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
+	prismrpc "github.com/stellar-optics/stellar-prism/pkg/rpc"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
+
+func fetchMaxContractSizeBytes(ctx context.Context, client prismrpc.Client) (uint32, error) {
+	entries, ok := client.(prismrpc.LedgerEntriesClient)
+	if !ok {
+		return 0, fmt.Errorf("RPC client does not support getLedgerEntries, which is required for the contract size limit")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	key := xdr.LedgerKey{
+		Type: xdr.LedgerEntryTypeConfigSetting,
+		ConfigSetting: &xdr.LedgerKeyConfigSetting{
+			ConfigSettingId: xdr.ConfigSettingIdConfigSettingContractMaxSizeBytes,
+		},
+	}
+	keyXDR, err := xdr.MarshalBase64(key)
+	if err != nil {
+		return 0, fmt.Errorf("encoding config setting ledger key: %w", err)
+	}
+	resp, err := entries.GetLedgerEntries(ctx, protocol.GetLedgerEntriesRequest{Keys: []string{keyXDR}})
+	if err != nil {
+		return 0, fmt.Errorf("fetching contract size limit: %w", err)
+	}
+	for _, result := range resp.Entries {
+		if result.DataXDR == "" {
+			continue
+		}
+		var entry xdr.LedgerEntry
+		if err := xdr.SafeUnmarshalBase64(result.DataXDR, &entry); err != nil {
+			return 0, fmt.Errorf("decoding config setting entry: %w", err)
+		}
+		if entry.Data.Type != xdr.LedgerEntryTypeConfigSetting || entry.Data.ConfigSetting == nil {
+			continue
+		}
+		setting := entry.Data.ConfigSetting
+		if setting.ConfigSettingId != xdr.ConfigSettingIdConfigSettingContractMaxSizeBytes || setting.ContractMaxSizeBytes == nil {
+			continue
+		}
+		return uint32(*setting.ContractMaxSizeBytes), nil
+	}
+	return 0, fmt.Errorf("RPC did not return the CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES config setting")
+}
+
+func formatWASMSize(size int, limit uint32, percent float64) string {
+	if limit == 0 {
+		return fmt.Sprintf("%d bytes", size)
+	}
+	return fmt.Sprintf("%.1f KB / %.1f KB (%.1f%%)", float64(size)/1024, float64(limit)/1024, percent)
+}
 
 func newWASMCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
@@ -54,14 +109,24 @@ start the next run where the last one stopped.`,
 			}
 			defer closeClient()
 
+			var maxSize uint32
+			if !g.dryRun {
+				var err error
+				maxSize, err = fetchMaxContractSizeBytes(cmd.Context(), client)
+				if err != nil {
+					fmt.Fprintf(stderr, "warning: contract size limit unavailable: %v\n", err)
+				}
+			}
+
 			sf.stateKey = stateKey("wasm", "failed="+strconv.FormatBool(includeFailed))
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewWASMSource(client, stream.WASMQuery{
-					StartLedger:       startLedger,
-					PageLimit:         sf.pageSize,
-					NetworkPassphrase: networkPassphrase,
-					IncludeFailed:     includeFailed,
+					StartLedger:          startLedger,
+					PageLimit:            sf.pageSize,
+					NetworkPassphrase:    networkPassphrase,
+					IncludeFailed:        includeFailed,
+					MaxContractSizeBytes: maxSize,
 				})
 			}
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)

@@ -233,6 +233,19 @@ func (h *Human) emitEvent(r stream.Record) error {
 		return nil
 	}
 
+	if e.SpecName != "" {
+		if _, err := fmt.Fprintf(h.w, "  %sevent %s%s\n", p.Key, e.SpecName, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		for _, param := range e.SpecParams {
+			label := fmt.Sprintf("%s  %s (%s) [%s]", indent, param.Name, param.Type, param.Location)
+			if err := h.writePayload(label, param.XDR); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	for i, t := range e.TopicXDR {
 		if err := h.writePayload(fmt.Sprintf("%stopic[%d]", indent, i), t); err != nil {
 			return err
@@ -506,6 +519,10 @@ func (h *Human) emitStorageChange(r stream.Record) error {
 	return nil
 }
 
+func wasmSizeSummary(size int, limit uint32, percent float64) string {
+	return fmt.Sprintf("%.1f KB / %.1f KB (%.1f%%)", float64(size)/1024, float64(limit)/1024, percent)
+}
+
 func (h *Human) emitWASMDeployment(r stream.Record) error {
 	p := h.palette
 	w := r.WASMDeployment
@@ -538,9 +555,24 @@ func (h *Human) emitWASMDeployment(r stream.Record) error {
 	}
 
 	if w.WASMHash != "" {
-		if _, err := fmt.Fprintf(h.w, "  %swasm %s (%d bytes)%s\n",
-			p.Key, w.WASMHash, w.WASMSize, p.Reset); err != nil {
+		size := fmt.Sprintf("%d bytes", w.WASMSize)
+		if w.WASMSizeLimitBytes > 0 {
+			size = wasmSizeSummary(w.WASMSize, w.WASMSizeLimitBytes, w.WASMSizePercent)
+		}
+		if _, err := fmt.Fprintf(h.w, "  %swasm %s (%s)%s\n",
+			p.Key, w.WASMHash, size, p.Reset); err != nil {
 			return fmt.Errorf("human: write: %w", err)
+		}
+		if w.WASMSizeExceeded {
+			if _, err := fmt.Fprintf(h.w, "  %sWASM SIZE EXCEEDED: %s exceeds the network limit%s\n",
+				p.Remove, wasmSizeSummary(w.WASMSize, w.WASMSizeLimitBytes, w.WASMSizePercent), p.Reset); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		} else if w.WASMSizeWarning {
+			if _, err := fmt.Fprintf(h.w, "  %sWASM SIZE WARNING: %s of the network limit%s\n",
+				p.Note, wasmSizeSummary(w.WASMSize, w.WASMSizeLimitBytes, w.WASMSizePercent), p.Reset); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
 		}
 	}
 	if w.Executable != "" {

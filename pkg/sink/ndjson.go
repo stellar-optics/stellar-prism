@@ -72,6 +72,16 @@ type eventLine struct {
 	Value            json.RawMessage   `json:"value,omitempty"`
 	TopicsXDR        []string          `json:"topicsXdr,omitempty"`
 	ValueXDR         string            `json:"valueXdr,omitempty"`
+	SpecName         string            `json:"specEvent,omitempty"`
+	SpecParams       []specParamLine   `json:"specParams,omitempty"`
+}
+
+type specParamLine struct {
+	Name     string          `json:"name"`
+	Type     string          `json:"type"`
+	Location string          `json:"location"`
+	Value    json.RawMessage `json:"value,omitempty"`
+	XDR      string          `json:"xdr,omitempty"`
 }
 
 // ledgerLine is the documented NDJSON shape for a ledger close.
@@ -218,18 +228,22 @@ type storageChangeLine struct {
 
 // wasmLine is the documented NDJSON shape for a deployment host function.
 type wasmLine struct {
-	Kind       string `json:"kind"`
-	ID         string `json:"id"`
-	Ledger     uint32 `json:"ledger"`
-	Time       string `json:"time,omitempty"`
-	Action     string `json:"action,omitempty"`
-	ContractID string `json:"contract,omitempty"`
-	WASMHash   string `json:"wasmHash,omitempty"`
-	WASMSize   int    `json:"wasmSize,omitempty"`
-	Executable string `json:"executable,omitempty"`
-	TxHash     string `json:"tx,omitempty"`
-	OpIndex    uint32 `json:"opIndex"`
-	Successful bool   `json:"successful"`
+	Kind               string  `json:"kind"`
+	ID                 string  `json:"id"`
+	Ledger             uint32  `json:"ledger"`
+	Time               string  `json:"time,omitempty"`
+	Action             string  `json:"action,omitempty"`
+	ContractID         string  `json:"contract,omitempty"`
+	WASMHash           string  `json:"wasmHash,omitempty"`
+	WASMSize           int     `json:"wasmSize,omitempty"`
+	WASMSizeLimitBytes uint32  `json:"wasmSizeLimitBytes,omitempty"`
+	WASMSizePercent    float64 `json:"wasmSizePercent,omitempty"`
+	WASMSizeWarning    bool    `json:"wasmSizeWarning,omitempty"`
+	WASMSizeExceeded   bool    `json:"wasmSizeExceeded,omitempty"`
+	Executable         string  `json:"executable,omitempty"`
+	TxHash             string  `json:"tx,omitempty"`
+	OpIndex            uint32  `json:"opIndex"`
+	Successful         bool    `json:"successful"`
 }
 
 // Emit implements stream.Sink.
@@ -283,6 +297,19 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 			line.CallDepth = r.Event.CallDepth
 			line.ParentContractID = r.Event.ParentContractID
 			line.InvocationPath = r.Event.InvocationPath
+			line.SpecName = r.Event.SpecName
+			for _, param := range r.Event.SpecParams {
+				entry := specParamLine{Name: param.Name, Type: param.Type, Location: param.Location, XDR: param.XDR}
+				if n.decode && param.XDR != "" {
+					raw, err := n.decodeXDR(param.XDR)
+					if err != nil {
+						return nil, err
+					}
+					entry.Value = raw
+					entry.XDR = ""
+				}
+				line.SpecParams = append(line.SpecParams, entry)
+			}
 
 			if n.decode {
 				for _, t := range r.Event.TopicXDR {
@@ -492,6 +519,10 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 			line.ContractID = w.ContractID
 			line.WASMHash = w.WASMHash
 			line.WASMSize = w.WASMSize
+			line.WASMSizeLimitBytes = w.WASMSizeLimitBytes
+			line.WASMSizePercent = w.WASMSizePercent
+			line.WASMSizeWarning = w.WASMSizeWarning
+			line.WASMSizeExceeded = w.WASMSizeExceeded
 			line.Executable = w.Executable
 			line.TxHash = w.TxHash
 			line.OpIndex = w.OpIndex

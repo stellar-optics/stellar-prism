@@ -479,3 +479,47 @@ func TestWASMSourceDefaultsPageLimitAndPassphrase(t *testing.T) {
 		t.Errorf("WASMHash = %q, want the sha256 of the uploaded code", got)
 	}
 }
+
+func TestWASMSourceAnnotatesSizeAgainstLimit(t *testing.T) {
+	t.Parallel()
+
+	wasm := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+	tests := []struct {
+		name     string
+		limit    uint32
+		warning  bool
+		exceeded bool
+	}{
+		{name: "warning", limit: 10, warning: true},
+		{name: "exceeded", limit: 7, warning: true, exceeded: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fakerpc.NewTransactionServer([]protocol.TransactionInfo{
+				wasmTransaction(10, 1, "abc", encodeEnvelope(t, v1Envelope(hostFunctionOp(uploadFunction(wasm)))), protocol.TransactionStatusSuccess),
+			})
+			src, err := stream.NewWASMSource(srv, stream.WASMQuery{MaxContractSizeBytes: tc.limit})
+			if err != nil {
+				t.Fatalf("NewWASMSource() error = %v", err)
+			}
+			records := fetchWASM(t, src)
+			if len(records) != 1 {
+				t.Fatalf("got %d records, want 1", len(records))
+			}
+			event := records[0].WASMDeployment
+			if event.WASMSizeLimitBytes != tc.limit {
+				t.Errorf("WASMSizeLimitBytes = %d, want %d", event.WASMSizeLimitBytes, tc.limit)
+			}
+			if event.WASMSizeWarning != tc.warning {
+				t.Errorf("WASMSizeWarning = %t, want %t", event.WASMSizeWarning, tc.warning)
+			}
+			if event.WASMSizeExceeded != tc.exceeded {
+				t.Errorf("WASMSizeExceeded = %t, want %t", event.WASMSizeExceeded, tc.exceeded)
+			}
+			wantPercent := float64(len(wasm)) / float64(tc.limit) * 100
+			if event.WASMSizePercent != wantPercent {
+				t.Errorf("WASMSizePercent = %f, want %f", event.WASMSizePercent, wantPercent)
+			}
+		})
+	}
+}
