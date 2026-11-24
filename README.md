@@ -517,6 +517,17 @@ resource fees (see [docs/guides/offline_simulation.md](docs/guides/offline_simul
 prism simulate --tx-envelope AAA... --follow --json
 ```
 
+### `prism aggregate` - windowed event and throughput analytics
+
+Aggregates Soroban contract events into epoch-aligned tumbling time windows
+(`10s`, `30s`, `1m`, `5m`, `15m`, `1h`) and pairs with `prism fee-stats` for
+ledger throughput and fee analytics (see
+[docs/guides/multi_stream_aggregation.md](docs/guides/multi_stream_aggregation.md)):
+
+```sh
+prism aggregate --contract CDLZF... --window 1m --metric count --follow --json
+```
+
 ## What prism guarantees
 
 This is a streaming tool, so the guarantee matters more than the feature list:
