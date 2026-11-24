@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
@@ -143,8 +144,8 @@ func TestTopicPatternCompileErrors(t *testing.T) {
 	}
 }
 
-// TestCompileTopicPatterns checks the list-level compile rules: count bounds
-// and fail-fast on the first malformed pattern.
+// TestCompileTopicPatterns checks the list-level compiler and fail-fast
+// behaviour on the first malformed pattern.
 func TestCompileTopicPatterns(t *testing.T) {
 	t.Parallel()
 
@@ -164,17 +165,95 @@ func TestCompileTopicPatterns(t *testing.T) {
 		t.Errorf("nil input compiled %d patterns, want 0", len(empty))
 	}
 
-	tooMany := make([]string, stream.MaxTopicFilters+1)
-	for i := range tooMany {
-		tooMany[i] = "*"
+	many := make([]string, 1000)
+	for i := range many {
+		many[i] = fmt.Sprintf("topic-%04d", i)
 	}
-	if _, err := stream.CompileTopicPatterns(tooMany); err == nil {
-		t.Error("CompileTopicPatterns(too many) error = nil, want a count failure")
+	compiled, err := stream.CompileTopicPatterns(many)
+	if err != nil {
+		t.Fatalf("CompileTopicPatterns(1000 patterns) error = %v", err)
+	}
+	if len(compiled) != len(many) {
+		t.Errorf("compiled %d patterns, want %d", len(compiled), len(many))
 	}
 
 	if _, err := stream.CompileTopicPatterns([]string{"*", "a,,b"}); err == nil {
 		t.Error("CompileTopicPatterns(bad second) error = nil, want fail-fast on the bad pattern")
 	}
+}
+
+func TestTopicPatternMatcher(t *testing.T) {
+	matcher, err := stream.CompileTopicPatternMatcher([]string{
+		"transfer",
+		"stellar*",
+		"[mint, *]",
+		"re:burn.*",
+	})
+	if err != nil {
+		t.Fatalf("CompileTopicPatternMatcher() error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		topics []string
+		want   bool
+	}{
+		{name: "exact", topics: []string{"transfer"}, want: true},
+		{name: "exact rejects substring", topics: []string{"pretransfer"}, want: false},
+		{name: "prefix wildcard", topics: []string{"stellar-token"}, want: true},
+		{name: "prefix anchored", topics: []string{"prestellar-token"}, want: false},
+		{name: "tuple and wildcard", topics: []string{"mint", "7"}, want: true},
+		{name: "tuple requires exact topic count", topics: []string{"mint", "7", "extra"}, want: false},
+		{name: "regex fallback", topics: []string{"burn.amount"}, want: true},
+		{name: "no tuple matches", topics: []string{"unrelated"}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := matcher.Matches(tc.topics); got != tc.want {
+				t.Errorf("Matches(%v) = %v, want %v", tc.topics, got, tc.want)
+			}
+		})
+	}
+
+	allocations := testing.AllocsPerRun(100, func() {
+		matcher.Matches([]string{"not-a-match"})
+	})
+	if allocations != 0 {
+		t.Errorf("Matches() allocated %v times per call, want zero", allocations)
+	}
+}
+
+func BenchmarkTopicPatternMatcher1000(b *testing.B) {
+	specs := make([]string, 1000)
+	patterns := make([]*regexp.Regexp, len(specs))
+	for i := range specs {
+		specs[i] = fmt.Sprintf("topic-%04d", i)
+		patterns[i] = regexp.MustCompile("^" + regexp.QuoteMeta(specs[i]) + "$")
+	}
+	matcher, err := stream.CompileTopicPatternMatcher(specs)
+	if err != nil {
+		b.Fatal(err)
+	}
+	text := "topic-0999"
+
+	b.Run("aho-corasick", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			matcher.Matches([]string{text})
+		}
+	})
+	b.Run("linear-regexp", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for _, pattern := range patterns {
+				if pattern.MatchString(text) {
+					break
+				}
+			}
+		}
+	})
 }
 
 // TestPatternSinkFiltersEvents checks that only matching event records reach
