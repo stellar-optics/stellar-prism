@@ -2,12 +2,17 @@ package stream
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unsafe"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
@@ -352,4 +357,487 @@ func topicSegments(filter string) (protocol.TopicFilter, error) {
 		segs = append(segs, protocol.SegmentFilter{ScVal: scv})
 	}
 	return segs, nil
+}
+
+// -----------------------------------------------------------------------------
+// Zero-Copy & Object Pooling Optimizations for Event Extraction (Issue #346)
+// -----------------------------------------------------------------------------
+
+var (
+	recordPool = sync.Pool{
+		New: func() any {
+			return &Record{
+				Kind: KindEvent,
+				Event: &Event{
+					TopicXDR: make([]string, 0, 4),
+				},
+			}
+		},
+	}
+
+	eventPool = sync.Pool{
+		New: func() any {
+			return &Event{
+				TopicXDR: make([]string, 0, 4),
+			}
+		},
+	}
+
+	topicSlicePool = sync.Pool{
+		New: func() any {
+			s := make([]string, 0, 8)
+			return &s
+		},
+	}
+
+	byteBufferPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 1024)
+			return &b
+		},
+	}
+)
+
+// GetRecord borrows a Record from the pool.
+func GetRecord() *Record {
+	r := recordPool.Get().(*Record)
+	if r.Event == nil {
+		r.Event = GetEvent()
+	}
+	r.Kind = KindEvent
+	return r
+}
+
+// PutRecord returns a Record and its nested Event to the pool.
+func PutRecord(r *Record) {
+	if r == nil {
+		return
+	}
+	if r.Event != nil {
+		PutEvent(r.Event)
+		r.Event = nil
+	}
+	*r = Record{}
+	recordPool.Put(r)
+}
+
+// GetEvent borrows an Event from the pool.
+func GetEvent() *Event {
+	e := eventPool.Get().(*Event)
+	e.TopicXDR = e.TopicXDR[:0]
+	e.InvocationPath = nil
+	return e
+}
+
+// PutEvent returns an Event to the pool.
+func PutEvent(e *Event) {
+	if e == nil {
+		return
+	}
+	if cap(e.TopicXDR) > 64 {
+		e.TopicXDR = make([]string, 0, 4)
+	} else {
+		e.TopicXDR = e.TopicXDR[:0]
+	}
+	e.Type = ""
+	e.ContractID = ""
+	e.TxHash = ""
+	e.TxIndex = 0
+	e.OpIndex = 0
+	e.EventIndex = 0
+	e.ValueXDR = ""
+	e.CallDepth = 0
+	e.ParentContractID = ""
+	e.InvocationPath = nil
+	eventPool.Put(e)
+}
+
+// GetTopicSlice borrows a string slice for topics from the pool.
+func GetTopicSlice(capacity int) []string {
+	ptr := topicSlicePool.Get().(*[]string)
+	s := *ptr
+	if cap(s) < capacity {
+		s = make([]string, 0, capacity)
+	} else {
+		s = s[:0]
+	}
+	return s
+}
+
+// PutTopicSlice returns a string slice to the pool.
+func PutTopicSlice(s []string) {
+	if cap(s) > 64 {
+		return
+	}
+	s = s[:0]
+	topicSlicePool.Put(&s)
+}
+
+// EventPageArena provides a zero-copy memory arena for extracting events
+// across a ledger or page with bounded lifetime.
+type EventPageArena struct {
+	buf []byte
+	enc *xdr.EncodingBuffer
+}
+
+var eventPageArenaPool = sync.Pool{
+	New: func() any {
+		return &EventPageArena{
+			buf: make([]byte, 0, 64*1024),
+			enc: xdr.NewEncodingBuffer(),
+		}
+	},
+}
+
+// Reset clears the arena buffer for reuse.
+func (a *EventPageArena) Reset() {
+	a.buf = a.buf[:0]
+}
+
+// EncodeScValBase64 encodes an ScVal into base64 directly inside the arena buffer,
+// returning a zero-copy string reference.
+func (a *EventPageArena) EncodeScValBase64(val xdr.EncoderTo) (string, error) {
+	if val == nil {
+		return "", nil
+	}
+	raw, err := a.enc.UnsafeMarshalBinary(val)
+	if err != nil {
+		return "", err
+	}
+	encLen := base64.StdEncoding.EncodedLen(len(raw))
+	start := len(a.buf)
+	if cap(a.buf)-start < encLen {
+		newCap := cap(a.buf) * 2
+		if newCap < start+encLen {
+			newCap = start + encLen + 1024
+		}
+		newBuf := make([]byte, start, newCap)
+		copy(newBuf, a.buf)
+		a.buf = newBuf
+	}
+	a.buf = a.buf[:start+encLen]
+	base64.StdEncoding.Encode(a.buf[start:], raw)
+	return unsafe.String(&a.buf[start], encLen), nil
+}
+
+// FormatID formats a record ID directly into the arena buffer.
+func (a *EventPageArena) FormatID(seq uint32, txIdx, evtIdx int) string {
+	start := len(a.buf)
+	needed := 24 // "0001234567-000000-000000"
+	if cap(a.buf)-start < needed {
+		a.buf = append(a.buf, make([]byte, needed)...)
+		a.buf = a.buf[:start]
+	}
+	formatted := fmt.Sprintf("%010d-%06d-%06d", seq, txIdx, evtIdx)
+	a.buf = append(a.buf, formatted...)
+	return unsafe.String(&a.buf[start], len(formatted))
+}
+
+// FormatTxHash formats a transaction hash hex directly into the arena buffer.
+func (a *EventPageArena) FormatTxHash(h xdr.Hash) string {
+	start := len(a.buf)
+	needed := hex.EncodedLen(len(h))
+	if cap(a.buf)-start < needed {
+		a.buf = append(a.buf, make([]byte, needed)...)
+		a.buf = a.buf[:start]
+	}
+	curLen := len(a.buf)
+	a.buf = a.buf[:curLen+needed]
+	hex.Encode(a.buf[curLen:], h[:])
+	return unsafe.String(&a.buf[start], needed)
+}
+
+// EncodeScValBase64ZeroCopy serializes an ScVal to base64 using pooled buffers
+// and zero-copy byte-to-string slicing where lifetime is bounded by page processing.
+func EncodeScValBase64ZeroCopy(val *xdr.ScVal) (string, error) {
+	if val == nil {
+		return "", nil
+	}
+	arena := eventPageArenaPool.Get().(*EventPageArena)
+	arena.Reset()
+	defer eventPageArenaPool.Put(arena)
+	return arena.EncodeScValBase64(val)
+}
+
+// ExtractEventsFromLedgerCloseMeta extracts Soroban events from LedgerCloseMeta
+// using zero-copy byte slicing and sync.Pool optimizations.
+func ExtractEventsFromLedgerCloseMeta(lcm *xdr.LedgerCloseMeta) []Record {
+	if lcm == nil {
+		return nil
+	}
+
+	seq := lcm.LedgerSequence()
+	closeTime := lcm.ClosedAt()
+	txCount := lcm.CountTransactions()
+
+	arena := eventPageArenaPool.Get().(*EventPageArena)
+	arena.Reset()
+	defer eventPageArenaPool.Put(arena)
+
+	records := make([]Record, 0, txCount*4)
+
+	for txIdx := 0; txIdx < txCount; txIdx++ {
+		txHash := arena.FormatTxHash(lcm.TransactionHash(txIdx))
+		meta := lcm.TxApplyProcessing(txIdx)
+
+		var events []xdr.ContractEvent
+		if meta.V == 3 && meta.V3 != nil && meta.V3.SorobanMeta != nil {
+			events = meta.V3.SorobanMeta.Events
+		} else if meta.V == 4 && meta.V4 != nil {
+			for _, ce := range meta.V4.Events {
+				events = append(events, ce.Event)
+			}
+		}
+
+		for evtIdx, evt := range events {
+			var contractID string
+			if evt.ContractId != nil {
+				if id, err := strkey.Encode(strkey.VersionByteContract, evt.ContractId[:]); err == nil {
+					contractID = id
+				}
+			}
+
+			var eventType string
+			switch evt.Type {
+			case xdr.ContractEventTypeContract:
+				eventType = protocol.EventTypeContract
+			case xdr.ContractEventTypeSystem:
+				eventType = protocol.EventTypeSystem
+			case xdr.ContractEventTypeDiagnostic:
+				eventType = protocol.EventTypeDiagnostic
+			default:
+				eventType = "unknown"
+			}
+
+			topicCount := 0
+			if evt.Body.V0 != nil {
+				topicCount = len(evt.Body.V0.Topics)
+			}
+
+			topics := GetTopicSlice(topicCount)
+			if evt.Body.V0 != nil {
+				for i := range evt.Body.V0.Topics {
+					topicStr, err := arena.EncodeScValBase64(&evt.Body.V0.Topics[i])
+					if err == nil {
+						topics = append(topics, topicStr)
+					}
+				}
+			}
+
+			var valueStr string
+			if evt.Body.V0 != nil {
+				valueStr, _ = arena.EncodeScValBase64(&evt.Body.V0.Data)
+			}
+
+			id := arena.FormatID(seq, txIdx, evtIdx)
+			r := Record{
+				ID:       id,
+				Sequence: seq,
+				Time:     closeTime,
+				Kind:     KindEvent,
+				Event: &Event{
+					Type:       eventType,
+					ContractID: contractID,
+					TxHash:     txHash,
+					TxIndex:    uint32(txIdx),
+					OpIndex:    0,
+					EventIndex: uint32(evtIdx),
+					TopicXDR:   topics,
+					ValueXDR:   valueStr,
+				},
+			}
+			records = append(records, r)
+		}
+	}
+
+	return records
+}
+
+// ExtractEventsFromLedgerCloseMetaPooled extracts events returning pooled *Record instances.
+// Callers can process records within page lifetime and call ReleaseEvents when finished.
+func ExtractEventsFromLedgerCloseMetaPooled(lcm *xdr.LedgerCloseMeta) []*Record {
+	if lcm == nil {
+		return nil
+	}
+
+	seq := lcm.LedgerSequence()
+	closeTime := lcm.ClosedAt()
+	txCount := lcm.CountTransactions()
+
+	arena := eventPageArenaPool.Get().(*EventPageArena)
+	arena.Reset()
+
+	records := make([]*Record, 0, txCount*4)
+
+	for txIdx := 0; txIdx < txCount; txIdx++ {
+		txHash := arena.FormatTxHash(lcm.TransactionHash(txIdx))
+		meta := lcm.TxApplyProcessing(txIdx)
+
+		var events []xdr.ContractEvent
+		if meta.V == 3 && meta.V3 != nil && meta.V3.SorobanMeta != nil {
+			events = meta.V3.SorobanMeta.Events
+		} else if meta.V == 4 && meta.V4 != nil {
+			for _, ce := range meta.V4.Events {
+				events = append(events, ce.Event)
+			}
+		}
+
+		for evtIdx, evt := range events {
+			var contractID string
+			if evt.ContractId != nil {
+				if id, err := strkey.Encode(strkey.VersionByteContract, evt.ContractId[:]); err == nil {
+					contractID = id
+				}
+			}
+
+			var eventType string
+			switch evt.Type {
+			case xdr.ContractEventTypeContract:
+				eventType = protocol.EventTypeContract
+			case xdr.ContractEventTypeSystem:
+				eventType = protocol.EventTypeSystem
+			case xdr.ContractEventTypeDiagnostic:
+				eventType = protocol.EventTypeDiagnostic
+			default:
+				eventType = "unknown"
+			}
+
+			topicCount := 0
+			if evt.Body.V0 != nil {
+				topicCount = len(evt.Body.V0.Topics)
+			}
+
+			topics := GetTopicSlice(topicCount)
+			if evt.Body.V0 != nil {
+				for i := range evt.Body.V0.Topics {
+					topicStr, err := arena.EncodeScValBase64(&evt.Body.V0.Topics[i])
+					if err == nil {
+						topics = append(topics, topicStr)
+					}
+				}
+			}
+
+			var valueStr string
+			if evt.Body.V0 != nil {
+				valueStr, _ = arena.EncodeScValBase64(&evt.Body.V0.Data)
+			}
+
+			r := GetRecord()
+			r.ID = arena.FormatID(seq, txIdx, evtIdx)
+			r.Sequence = seq
+			r.Time = closeTime
+			r.Kind = KindEvent
+			r.Event.Type = eventType
+			r.Event.ContractID = contractID
+			r.Event.TxHash = txHash
+			r.Event.TxIndex = uint32(txIdx)
+			r.Event.OpIndex = 0
+			r.Event.EventIndex = uint32(evtIdx)
+			r.Event.TopicXDR = topics
+			r.Event.ValueXDR = valueStr
+
+			records = append(records, r)
+		}
+	}
+
+	eventPageArenaPool.Put(arena)
+	return records
+}
+
+// ReleaseEvents returns a batch of pooled *Record instances back to the pool.
+func ReleaseEvents(records []*Record) {
+	for _, r := range records {
+		if r != nil {
+			if r.Event != nil && len(r.Event.TopicXDR) > 0 {
+				PutTopicSlice(r.Event.TopicXDR)
+				r.Event.TopicXDR = nil
+			}
+			PutRecord(r)
+		}
+	}
+}
+
+// ExtractEventsFromLedgerCloseMetaStandard extracts events using standard unoptimized allocations,
+// used as a baseline to benchmark the zero-copy and pooling improvements.
+func ExtractEventsFromLedgerCloseMetaStandard(lcm *xdr.LedgerCloseMeta) []Record {
+	if lcm == nil {
+		return nil
+	}
+
+	seq := lcm.LedgerSequence()
+	closeTime := lcm.ClosedAt()
+	txCount := lcm.CountTransactions()
+
+	var records []Record
+
+	for txIdx := 0; txIdx < txCount; txIdx++ {
+		txHashBytes := lcm.TransactionHash(txIdx)
+		txHash := hex.EncodeToString(txHashBytes[:])
+		meta := lcm.TxApplyProcessing(txIdx)
+
+		var events []xdr.ContractEvent
+		if meta.V == 3 && meta.V3 != nil && meta.V3.SorobanMeta != nil {
+			events = meta.V3.SorobanMeta.Events
+		} else if meta.V == 4 && meta.V4 != nil {
+			for _, ce := range meta.V4.Events {
+				events = append(events, ce.Event)
+			}
+		}
+
+		for evtIdx, evt := range events {
+			var contractID string
+			if evt.ContractId != nil {
+				if id, err := strkey.Encode(strkey.VersionByteContract, evt.ContractId[:]); err == nil {
+					contractID = id
+				}
+			}
+
+			var eventType string
+			switch evt.Type {
+			case xdr.ContractEventTypeContract:
+				eventType = protocol.EventTypeContract
+			case xdr.ContractEventTypeSystem:
+				eventType = protocol.EventTypeSystem
+			case xdr.ContractEventTypeDiagnostic:
+				eventType = protocol.EventTypeDiagnostic
+			default:
+				eventType = "unknown"
+			}
+
+			var topics []string
+			if evt.Body.V0 != nil {
+				topics = make([]string, 0, len(evt.Body.V0.Topics))
+				for _, t := range evt.Body.V0.Topics {
+					if s, err := xdr.MarshalBase64(t); err == nil {
+						topics = append(topics, s)
+					}
+				}
+			}
+
+			var valueStr string
+			if evt.Body.V0 != nil {
+				valueStr, _ = xdr.MarshalBase64(evt.Body.V0.Data)
+			}
+
+			r := Record{
+				ID:       fmt.Sprintf("%010d-%06d-%06d", seq, txIdx, evtIdx),
+				Sequence: seq,
+				Time:     closeTime,
+				Kind:     KindEvent,
+				Event: &Event{
+					Type:       eventType,
+					ContractID: contractID,
+					TxHash:     txHash,
+					TxIndex:    uint32(txIdx),
+					OpIndex:    0,
+					EventIndex: uint32(evtIdx),
+					TopicXDR:   topics,
+					ValueXDR:   valueStr,
+				},
+			}
+			records = append(records, r)
+		}
+	}
+
+	return records
 }
