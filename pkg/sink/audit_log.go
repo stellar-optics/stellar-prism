@@ -177,6 +177,9 @@ type AuditOptions struct {
 // The trail is append-only across runs: a new sink continues the chain of an
 // existing log instead of starting a new one, and refuses to continue a log
 // that was signed with a different key.
+//
+// See docs/compliance/audit_logging_and_aml.md for operator configuration,
+// verification, and AML monitoring recipes.
 type AuditSink struct {
 	opts   AuditOptions
 	file   *os.File
