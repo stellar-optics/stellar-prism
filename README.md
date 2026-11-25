@@ -634,7 +634,9 @@ See [docs/roadmap.md](docs/roadmap.md).
 
 Adding a stream source or an output sink is designed to be a one-file change.
 See [CONTRIBUTING.md](CONTRIBUTING.md) and
-[docs/architecture.md](docs/architecture.md).
+[docs/architecture.md](docs/architecture.md), and consult the
+[streaming and indexing glossary](docs/reference/glossary.md) for shared
+terminology.
 
 ## License
 
