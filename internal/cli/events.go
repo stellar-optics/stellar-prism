@@ -173,7 +173,7 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
 		"emit NDJSON, one record per line")
 	cmd.Flags().StringVar(&s.format, "format", "", "output format: csv or tsv (default is human-readable; --json remains supported)")
-	cmd.Flags().StringVar(&s.csvFields, "csv-fields", "", "comma-separated CSV/TSV columns: id,ledger,time,kind,contract,tx,topic0,value")
+	cmd.Flags().StringVar(&s.csvFields, "csv-fields", "", "comma-separated CSV/TSV columns: timestamp,ledger,tx_hash,contract_id,topics,value")
 	cmd.Flags().BoolVar(&s.tsv, "tsv", false, "write tab-separated output (equivalent to --format tsv)")
 	cmd.Flags().BoolVar(&s.raw, "raw", false,
 		"leave XDR base64-encoded instead of decoding it")
