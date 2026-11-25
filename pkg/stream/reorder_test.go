@@ -131,7 +131,7 @@ func (c *collectSink) Emit(r Record) error {
 	return nil
 }
 func (c *collectSink) Flush() error { return nil }
-func (c *collectSink) Close() error                { return nil }
+func (c *collectSink) Close() error { return nil }
 
 func TestTailerUsesResequenceBufferWhenBackfillWorkersGt1(t *testing.T) {
 	src := &sliceSource{
