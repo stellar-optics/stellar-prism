@@ -58,6 +58,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   completion.go       bash/zsh/fish/powershell script generation
   config.go           Viper-based configuration file resolution (~/.config/prism/config.yaml, .prism.yaml)
   config_test.go      unit tests for config resolution
+  config_apply.go     fills unset flags from PRISM_* variables and config files (flag > env > file > default)
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
   state.go            the cursor journal, the pruner, and the resume point
   runtime.go          the health server, the lease and the state key source
@@ -242,6 +243,11 @@ is still announced: it reaches `Options.OnGap`, the CLI prints it on stderr,
 and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
 how many times a stream may skip ahead. A source without `Rewinder` cannot
 resume and fails exactly as it would under the default policy.
+
+The operator-facing side, covering diagnosing a gap, re-anchoring each kind
+of cursor store, backfilling from a longer-retention provider, and preventing
+lag from turning into a gap, is in
+[docs/troubleshooting/streaming_gaps_and_lag.md](troubleshooting/streaming_gaps_and_lag.md).
 
 ### Durable cursors (`--state-file`)
 
@@ -1388,6 +1394,12 @@ whatever is buffered there; the CLI closes the sink it built. Decode XDR through
 `lens` rather than reaching for `xdr` directly, so output stays consistent with
 the rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
+
+The tailer persists the cursor as soon as `Emit` returns nil, so a sink that
+buffers must bound its buffer and block when it is full rather than drop or
+queue without limit. The full guide, covering the lifecycle, backpressure and
+concurrency rules, and a complete Redis Streams sink with offline tests, is
+[docs/contributing/authoring_custom_sinks.md](contributing/authoring_custom_sinks.md).
 
 ### Built-in sinks
 
