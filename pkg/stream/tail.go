@@ -447,9 +447,11 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 			t.stats.Gaps++
 			recovered, recoverErr := t.recovery.Handle(t.src, gapErr)
 			if recoverErr != nil {
+				t.releaseBatchRecords(batch)
 				return recoverErr
 			}
 			if recovered {
+				t.releaseBatchRecords(batch)
 				t.stats.Recovered = t.recovery.Recovered()
 				t.cursor = ""
 				continue
@@ -459,12 +461,14 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		t.queuePage(batch)
 		done, _, err := t.emit(ctx, batch)
 		if err != nil {
+			t.releaseBatchRecords(batch)
 			if IsCancellation(err) {
 				return t.finish(nil)
 			}
 			return err
 		}
 		t.reportProgress(batch)
+		t.releaseBatchRecords(batch)
 		// A bounded follow has all it needs once the available pages are
 		// drained and the buffered suffix satisfies the limit. Do not wait
 		// for another ledger just to finish an explicitly bounded request.
@@ -519,6 +523,17 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		if err := t.opts.Clock.Sleep(ctx, t.wait(batch)); err != nil {
 			return t.finish(nil)
 		}
+	}
+}
+
+func (t *Tailer) releaseBatchRecords(batch Batch) {
+	// Process receives the source's backing slice and may retain it. Otherwise
+	// only the slice storage is recycled; the Records' payloads remain owned.
+	if t.opts.Process != nil {
+		return
+	}
+	if source, ok := t.src.(interface{ releaseRecords([]Record) }); ok {
+		source.releaseRecords(batch.Records)
 	}
 }
 

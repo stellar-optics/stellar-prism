@@ -1269,6 +1269,7 @@ path; the reported `events/op` makes the scale explicit, and the custom
 | `BenchmarkDedupSinkFiftyThousandEvents` | fingerprinting plus the bounded de-duplication ring |
 | `BenchmarkReorderBufferFiftyThousandEvents` | per-ledger sorting and release |
 | `BenchmarkEventKeyFiftyThousandEvents` | the de-duplication key itself |
+| `BenchmarkEventPipelineAllocations` | RPC event mapping, ID de-duplication and pooled page buffers |
 
 The benchmarks use a fixed in-memory source and no wall-clock waits, so they
 make no network calls and produce the same record IDs on every run. `TestStreamingFiftyThousandEvents`

@@ -9,7 +9,54 @@
 // docs/architecture.md for the delivery guarantee and how it is proven.
 package stream
 
-import "time"
+import (
+	"sync"
+	"time"
+)
+
+var recordBufferPool = sync.Pool{
+	New: func() any {
+		records := make([]Record, 0, DefaultPageLimit)
+		return &records
+	},
+}
+
+var eventIDSetPool = sync.Pool{
+	New: func() any {
+		return make(map[string]struct{}, DefaultPageLimit)
+	},
+}
+
+func getRecordBuffer(minCapacity int) []Record {
+	if minCapacity > DefaultPageLimit {
+		return make([]Record, 0, minCapacity)
+	}
+	if records, ok := recordBufferPool.Get().(*[]Record); ok && cap(*records) >= minCapacity {
+		return (*records)[:0]
+	}
+	return make([]Record, 0, DefaultPageLimit)
+}
+
+func putRecordBuffer(records []Record) {
+	if cap(records) == 0 || cap(records) > DefaultPageLimit {
+		return
+	}
+	clear(records[:cap(records)])
+	reusable := records[:0]
+	recordBufferPool.Put(&reusable)
+}
+
+func getEventIDSet() map[string]struct{} {
+	if seen, ok := eventIDSetPool.Get().(map[string]struct{}); ok {
+		return seen
+	}
+	return make(map[string]struct{}, DefaultPageLimit)
+}
+
+func putEventIDSet(seen map[string]struct{}) {
+	clear(seen)
+	eventIDSetPool.Put(seen)
+}
 
 // Kind identifies which sort of record a Record carries.
 type Kind string
