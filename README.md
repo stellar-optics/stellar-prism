@@ -607,7 +607,8 @@ before v1.0.
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue from it. Still not exactly-once across restarts.
 - Covered twice: by an offline suite with no network, and by an opt-in
-  end-to-end run against a local Quickstart network (`make test-e2e`).
+  end-to-end run against a local Quickstart network (`make test-e2e`; see
+  the [local Quickstart testing guide](docs/development/local_quickstart_testing.md)).
 
 See [docs/roadmap.md](docs/roadmap.md).
 
