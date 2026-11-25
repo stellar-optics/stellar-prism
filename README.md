@@ -82,6 +82,25 @@ go install github.com/stellar-optics/stellar-prism/cmd/prism@latest
 Requires Go 1.25 or later. Defaults to Stellar **testnet**, so it works with no
 configuration; point elsewhere with `--rpc-url` or `SOROBAN_RPC_URL`.
 
+Every flag can also be set with a `PRISM_<FLAG>` environment variable or in a
+`.prism.yaml` / `~/.config/prism/config.yaml` file; precedence is CLI flag >
+environment > config file > default. See
+[configuration files and environment variables](docs/cli/config_options.md).
+
+## Documentation
+
+| Guide | What it covers |
+|---|---|
+| [Command reference](docs/cli/command_reference.md) | Every command, argument and flag, with defaults and examples |
+| [Configuration and environment variables](docs/cli/config_options.md) | `.prism.yaml` format, every config key, `PRISM_*` variables and precedence |
+| [Troubleshooting gaps and RPC lag](docs/troubleshooting/streaming_gaps_and_lag.md) | Diagnosing and recovering from `GapError`, lag behind the chain head, and HTTP 429/5xx throttling |
+| [Streaming fee stats](docs/guides/fee_stats_streaming.md) | The `fee-stats` payload, percentile and surge-pricing methodology, and wallet fee recipes |
+| [Offline simulation](docs/guides/offline_simulation.md) | Following transaction simulation and resource fees |
+| [Multi-stream aggregation](docs/guides/multi_stream_aggregation.md) | Windowed event and throughput analytics |
+| [Migrating from Horizon SSE](docs/migration/from_horizon_sse.md) | Moving Horizon streaming consumers to prism |
+| [Authoring custom sinks](docs/contributing/authoring_custom_sinks.md) | Writing your own output sink in Go, with a Redis Streams example |
+| [Architecture](docs/architecture.md) | How the streaming engine, sources and sinks fit together |
+
 ## Usage
 
 ### `prism events` — tail contract events
@@ -473,7 +492,11 @@ prism trades --pair XLM/USDC --follow
 ```
 
 `fee-stats` reports base fee and reserve, fee pool, circulating coins,
-Soroban resource fees, and rolling 10 and 50 ledger transaction fee averages.
+Soroban resource fees, rolling 10 and 50 ledger transaction fee averages,
+per-operation inclusion fee percentiles (min, mode, p10, p50, p90, p99, max)
+for what was bid and what was charged, ledger capacity usage, and a
+`surgePricing` flag. The methodology and client fee recipes are in
+[docs/guides/fee_stats_streaming.md](docs/guides/fee_stats_streaming.md).
 `contracts` reports ledger-key TTL and warns below 1,000 remaining ledgers;
 RPC does not associate TTL key hashes with contract IDs, so TTL changes are
 included even when `--watch` selects contracts. `trades` normalizes classic
@@ -583,7 +606,8 @@ This is a streaming tool, so the guarantee matters more than the feature list:
   rather than carrying on with a hole in the stream. If losing the pruned range
   is acceptable, `--gap-strategy resume` reports it and continues from the
   oldest ledger the server still retains; the skip is counted in the stats and
-  printed on stderr.
+  printed on stderr. Recovery steps are in
+  [the troubleshooting guide](docs/troubleshooting/streaming_gaps_and_lag.md).
 - **Not exactly-once across restarts.** prism cannot atomically emit a record
   and commit its cursor, so a process killed between the two re-emits on
   restart. `--state-file` records the position after every delivered page and
@@ -661,8 +685,9 @@ See [docs/roadmap.md](docs/roadmap.md).
 ## Contributing
 
 Adding a stream source or an output sink is designed to be a one-file change.
-See [CONTRIBUTING.md](CONTRIBUTING.md) and
-[docs/architecture.md](docs/architecture.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md),
+[docs/architecture.md](docs/architecture.md) and the
+[custom sink guide](docs/contributing/authoring_custom_sinks.md).
 
 ## License
 

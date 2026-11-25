@@ -38,6 +38,8 @@ type streamFlags struct {
 	heartbeat        time.Duration
 	pageSize         uint
 	retries          int
+	retryBackoff     time.Duration // first retry wait; see backoff
+	retryBackoffMax  time.Duration // retry wait ceiling; see backoff
 	adaptive         bool
 	backfillWorkers  int
 	batch            bool
@@ -181,6 +183,11 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	defaultBackoff := stream.DefaultBackoff()
+	cmd.Flags().DurationVar(&s.retryBackoff, "retry-backoff", defaultBackoff.Initial,
+		"wait before the first retry of a failed RPC call; each further retry doubles it, with jitter (0 uses the default)")
+	cmd.Flags().DurationVar(&s.retryBackoffMax, "retry-backoff-max", defaultBackoff.Max,
+		"longest wait between retries of a failed RPC call (0 uses the default)")
 	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
 		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
 	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
@@ -304,6 +311,13 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
+	}
+	if s.retryBackoff < 0 || s.retryBackoffMax < 0 {
+		return fmt.Errorf("--retry-backoff and --retry-backoff-max must not be negative")
+	}
+	if b := s.backoff(); b.Max < b.Initial && s.retryBackoffMax > 0 {
+		return fmt.Errorf("--retry-backoff-max (%s) must not be less than --retry-backoff (%s)",
+			b.Max, b.Initial)
 	}
 	if _, _, err := s.rewindDistance(); err != nil {
 		return err
@@ -686,6 +700,24 @@ func closeSink(s stream.Sink) {
 }
 
 // options builds the tailer options implied by the flags.
+// backoff is the retry schedule for failed RPC calls: --retry-backoff,
+// doubled after each consecutive failure up to --retry-backoff-max, with
+// full jitter so several instances do not retry in lockstep. Unset values
+// leave the zero Backoff, which the tailer replaces with its default.
+func (s *streamFlags) backoff() stream.Backoff {
+	if s.retryBackoff <= 0 && s.retryBackoffMax <= 0 {
+		return stream.Backoff{}
+	}
+	b := stream.DefaultBackoff()
+	if s.retryBackoff > 0 {
+		b.Initial = s.retryBackoff
+	}
+	if s.retryBackoffMax > 0 {
+		b.Max = s.retryBackoffMax
+	}
+	return b
+}
+
 func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, error) {
 	strategy, err := stream.ParseGapStrategy(s.gapStrategy)
 	if err != nil {
@@ -710,6 +742,7 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		Filter:       s.filter,
 		PollInterval: s.poll,
 		MaxRetries:   s.retries,
+		Backoff:      s.backoff(),
 		// DrainTimeout bounds the final flush, so a sink that cannot be
 		// written does not hold the process past the grace period an
 		// orchestrator gives it.
