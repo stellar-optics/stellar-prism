@@ -20,6 +20,10 @@ func TestAverageFeesUsesMostRecentLedgers(t *testing.T) {
 func TestNearestRank(t *testing.T) {
 	t.Parallel()
 	ten := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	twenty := make([]int64, 20)
+	for i := range twenty {
+		twenty[i] = int64(i + 1)
+	}
 	tests := []struct {
 		name   string
 		sorted []int64
@@ -30,6 +34,8 @@ func TestNearestRank(t *testing.T) {
 		{name: "p10 of ten", sorted: ten, p: 10, want: 1},
 		{name: "p50 of ten", sorted: ten, p: 50, want: 5},
 		{name: "p90 of ten", sorted: ten, p: 90, want: 9},
+		{name: "p95 of ten rounds up to the last", sorted: ten, p: 95, want: 10},
+		{name: "p95 of twenty is the nineteenth", sorted: twenty, p: 95, want: 19},
 		{name: "p99 of ten rounds up to the last", sorted: ten, p: 99, want: 10},
 		{name: "p50 of an odd count is the middle", sorted: []int64{1, 2, 3}, p: 50, want: 2},
 		{name: "p0 clamps to the first rank", sorted: ten, p: 0, want: 1},
@@ -55,12 +61,12 @@ func TestFeeDistribution(t *testing.T) {
 		{
 			name:   "unsorted input with a clear mode",
 			values: []int64{500, 100, 100, 100, 200, 1000},
-			want:   &FeeDistribution{Min: 100, Mode: 100, P10: 100, P50: 100, P90: 1000, P99: 1000, Max: 1000},
+			want:   &FeeDistribution{Min: 100, Mode: 100, P10: 100, P50: 100, P90: 1000, P95: 1000, P99: 1000, Max: 1000},
 		},
 		{
 			name:   "tied mode resolves to the smallest value",
 			values: []int64{300, 200, 300, 200},
-			want:   &FeeDistribution{Min: 200, Mode: 200, P10: 200, P50: 200, P90: 300, P99: 300, Max: 300},
+			want:   &FeeDistribution{Min: 200, Mode: 200, P10: 200, P50: 200, P90: 300, P95: 300, P99: 300, Max: 300},
 		},
 	}
 	for _, tc := range tests {
@@ -130,12 +136,12 @@ func TestSummarizeFeeMarket(t *testing.T) {
 		t.Fatalf("capacity = %d / %v, want 10 / 0.5", stats.MaxTxSetSize, stats.CapacityUsage)
 	}
 	// Charged per op: 100, 200, 100.
-	wantCharged := &FeeDistribution{Min: 100, Mode: 100, P10: 100, P50: 100, P90: 200, P99: 200, Max: 200}
+	wantCharged := &FeeDistribution{Min: 100, Mode: 100, P10: 100, P50: 100, P90: 200, P95: 200, P99: 200, Max: 200}
 	if !reflect.DeepEqual(stats.InclusionFeeCharged, wantCharged) {
 		t.Fatalf("charged = %+v, want %+v", stats.InclusionFeeCharged, wantCharged)
 	}
 	// Bid per op: 500, 300, 100, 300.
-	wantBid := &FeeDistribution{Min: 100, Mode: 300, P10: 100, P50: 300, P90: 500, P99: 500, Max: 500}
+	wantBid := &FeeDistribution{Min: 100, Mode: 300, P10: 100, P50: 300, P90: 500, P95: 500, P99: 500, Max: 500}
 	if !reflect.DeepEqual(stats.InclusionFeeBid, wantBid) {
 		t.Fatalf("bid = %+v, want %+v", stats.InclusionFeeBid, wantBid)
 	}
