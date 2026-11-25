@@ -201,6 +201,9 @@ type Transaction struct {
 }
 
 // FeeStats contains ledger fee-market measurements and rolling fee averages.
+//
+// The percentile, capacity and surge fields are derived per ledger; see
+// FeeStatsSource and docs/guides/fee_stats_streaming.md for the methodology.
 type FeeStats struct {
 	BaseFee            uint32  `json:"baseFee"`
 	BaseReserve        uint32  `json:"baseReserve"`
@@ -211,6 +214,53 @@ type FeeStats struct {
 	Transactions       uint32  `json:"transactions"`
 	SorobanResourceFee int64   `json:"sorobanResourceFee"`
 	SorobanFeeBid      int64   `json:"sorobanFeeBid"`
+
+	// Operations is the number of operations in the ledger's transactions,
+	// counting a fee-bump wrapper as one extra operation, as fees do.
+	Operations uint32 `json:"operations"`
+	// ClassicOperations is the part of Operations outside Soroban
+	// transactions, which is what MaxTxSetSize limits.
+	ClassicOperations uint32 `json:"classicOperations"`
+	// MaxTxSetSize is the ledger header's classic capacity, in operations.
+	MaxTxSetSize uint32 `json:"maxTxSetSize"`
+	// CapacityUsage is ClassicOperations / MaxTxSetSize: 1 means the classic
+	// lane was full.
+	CapacityUsage float64 `json:"capacityUsage"`
+	// InclusionFeeCharged is the distribution of the inclusion fee each
+	// transaction actually paid, per operation, in stroops. Soroban resource
+	// fees are excluded. Nil for a ledger with no transactions.
+	InclusionFeeCharged *FeeDistribution `json:"inclusionFeeCharged,omitempty"`
+	// InclusionFeeBid is the distribution of the maximum inclusion fee each
+	// transaction offered, per operation, in stroops.
+	InclusionFeeBid *FeeDistribution `json:"inclusionFeeBid,omitempty"`
+	// SurgePricing reports that the ledger closed under surge pricing:
+	// inclusion was competitive rather than available at the base fee.
+	SurgePricing bool `json:"surgePricing"`
+	// SurgeReason names the trigger: SurgeReasonCapacity,
+	// SurgeReasonFee, or both joined with "+". Empty when not surging.
+	SurgeReason string `json:"surgeReason,omitempty"`
+}
+
+// Surge pricing triggers reported in FeeStats.SurgeReason.
+const (
+	// SurgeReasonCapacity: the classic lane reached MaxTxSetSize.
+	SurgeReasonCapacity = "capacity"
+	// SurgeReasonFee: every transaction paid more than the base fee per
+	// operation, which the network only charges when bids compete.
+	SurgeReasonFee = "fee"
+)
+
+// FeeDistribution summarises per-operation fees across one ledger's
+// transactions, in stroops. Percentiles use the nearest-rank method over
+// one value per transaction.
+type FeeDistribution struct {
+	Min  int64 `json:"min"`
+	Mode int64 `json:"mode"`
+	P10  int64 `json:"p10"`
+	P50  int64 `json:"p50"`
+	P90  int64 `json:"p90"`
+	P99  int64 `json:"p99"`
+	Max  int64 `json:"max"`
 }
 
 // Trade describes a classic or Soroban asset exchange in one operation.
