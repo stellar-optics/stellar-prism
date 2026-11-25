@@ -98,7 +98,19 @@ func (h *Human) emitRecord(r stream.Record) error {
 			return fmt.Errorf("human: fee stats record %s has no payload", r.ID)
 		}
 		f := r.FeeStats
-		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  base fee %d stroops  base reserve %d stroops  fee pool %d  coins %d  avg fee 10/50 %.2f/%.2f  tx %d  Soroban resource/bid %d/%d\n", formatTime(r.Time), r.Sequence, f.BaseFee, f.BaseReserve, f.FeePool, f.CoinsInCirculation, f.AverageFee10, f.AverageFee50, f.Transactions, f.SorobanResourceFee, f.SorobanFeeBid); err != nil {
+		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  base fee %d stroops  base reserve %d stroops  fee pool %d  coins %d  avg fee 10/50 %.2f/%.2f  tx %d  Soroban resource/bid %d/%d", formatTime(r.Time), r.Sequence, f.BaseFee, f.BaseReserve, f.FeePool, f.CoinsInCirculation, f.AverageFee10, f.AverageFee50, f.Transactions, f.SorobanResourceFee, f.SorobanFeeBid); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		if d := f.InclusionFeeCharged; d != nil {
+			if _, err := fmt.Fprintf(h.w, "  inclusion fee/op p50/p90/p99 %d/%d/%d", d.P50, d.P90, d.P99); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		surge := "no"
+		if f.SurgePricing {
+			surge = "yes (" + f.SurgeReason + ")"
+		}
+		if _, err := fmt.Fprintf(h.w, "  capacity %.0f%%  surge %s\n", f.CapacityUsage*100, surge); err != nil {
 			return fmt.Errorf("human: write: %w", err)
 		}
 	case stream.KindTrade:

@@ -61,7 +61,16 @@ type Source interface {
 // Sink applies natural backpressure to polling. That is deliberate: there is
 // no internal queue to grow without bound when a downstream consumer stalls.
 //
-// To add a new output format, implement this interface. See
+// The tailer persists the stream position as soon as Emit returns nil, so a
+// nil return is the sink taking responsibility for the record. A sink that
+// buffers internally should bound the buffer and block in Emit when it is
+// full rather than drop records, and deliver everything it holds in Flush.
+// A sink that owns connections or goroutines should also implement
+// io.Closer; the CLI calls Close after the final Flush.
+//
+// To add a new output format, implement this interface. The step-by-step
+// guide, including backpressure and concurrency rules and a complete Redis
+// Streams sink, is docs/contributing/authoring_custom_sinks.md; see also
 // docs/architecture.md.
 type Sink interface {
 	// Emit writes a single record.
@@ -93,7 +102,13 @@ type WriterFlusher interface {
 //
 // This is the only way prism can lose records, and it is always reported
 // rather than silently skipped: a stream with an unannounced hole is worse
-// than one that stops.
+// than one that stops. The CLI exits with status 2 on a GapError.
+//
+// It happens when a consumer is stopped, or falls behind, for longer than the
+// RPC node's retention window. Diagnosis and recovery (--gap-strategy,
+// re-anchoring with --from, `prism rewind`, backfilling the missed range from
+// another provider) are covered step by step in
+// docs/troubleshooting/streaming_gaps_and_lag.md.
 type GapError struct {
 	// Source names the stream that gapped.
 	Source string
