@@ -67,8 +67,15 @@ type sinkFlags struct {
 	auditFile        string
 	auditKeyFile     string
 	auditCheckpoint  int
-	parquetDir       string
-	sqsQueue         string
+	parquetDir          string
+	parquetCodec        string
+	parquetRowGroupSize int64
+	clickhouseAddr      string
+	clickhouseDB        string
+	clickhouseUser      string
+	clickhousePassword  string
+	clickhouseBatchSize int
+	sqsQueue            string
 	snsTopic         string
 	awsRegion        string
 	pubsubTopic      string
@@ -139,12 +146,21 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.IntVar(&s.auditCheckpoint, "sink-audit-checkpoint", sink.DefaultAuditCheckpointRecords,
 		"write a signed audit checkpoint every this many records (0 writes one after every record)")
 	flags.StringVar(&s.parquetDir, "sink-parquet-dir", "", "write partitioned Parquet files under this directory")
+	flags.StringVar(&s.parquetDir, "parquet-dir", "", "alias for --sink-parquet-dir")
+	flags.StringVar(&s.parquetCodec, "parquet-codec", "snappy", "Parquet compression codec: snappy, zstd, gzip, or uncompressed")
+	flags.Int64Var(&s.parquetRowGroupSize, "parquet-row-group-size", 128*1024*1024, "Parquet row group size in bytes (default: 128MB)")
+	flags.StringVar(&s.clickhouseAddr, "clickhouse-addr", "", "ClickHouse native TCP endpoint (host:port, default port 9000)")
+	flags.StringVar(&s.clickhouseDB, "clickhouse-db", "default", "ClickHouse database name")
+	flags.StringVar(&s.clickhouseUser, "clickhouse-user", "default", "ClickHouse user")
+	flags.StringVar(&s.clickhousePassword, "clickhouse-password", "", "ClickHouse password")
+	flags.IntVar(&s.clickhouseBatchSize, "clickhouse-batch-size", 5000, "ClickHouse bulk insert batch size")
 	flags.StringVar(&s.sqsQueue, "sink-sqs-queue", "", "AWS SQS queue URL")
 	flags.StringVar(&s.snsTopic, "sink-sns-topic", "", "AWS SNS topic ARN")
 	flags.StringVar(&s.awsRegion, "sink-region", "", "AWS region (uses SDK defaults when empty)")
 	flags.StringVar(&s.pubsubTopic, "sink-pubsub-topic", "", "Google Pub/Sub topic as projects/PROJECT/topics/TOPIC")
 
 	registerFlagCompletion(cmd, "cloud-provider", "s3", "gcs")
+	registerFlagCompletion(cmd, "parquet-codec", "snappy", "zstd", "gzip", "uncompressed")
 	registerFlagCompletion(cmd, "syslog-format", string(sink.SyslogRFC5424), string(sink.SyslogJournald))
 	registerFlagCompletion(cmd, "syslog-facility",
 		"local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7",
@@ -217,6 +233,18 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.parquetDir != "" && strings.TrimSpace(s.parquetDir) == "" {
 		return fmt.Errorf("--sink-parquet-dir must not be blank")
+	}
+	if s.parquetCodec != "" {
+		c := strings.ToLower(s.parquetCodec)
+		if c != "snappy" && c != "zstd" && c != "gzip" && c != "uncompressed" {
+			return fmt.Errorf("invalid --parquet-codec %q: want snappy, zstd, gzip, or uncompressed", s.parquetCodec)
+		}
+	}
+	if s.parquetRowGroupSize < 0 {
+		return fmt.Errorf("--parquet-row-group-size must not be negative")
+	}
+	if s.clickhouseAddr != "" && s.clickhouseBatchSize <= 0 {
+		return fmt.Errorf("--clickhouse-batch-size must be greater than zero")
 	}
 	return s.validateAudit(cmd)
 }
@@ -396,12 +424,30 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 		sinks = append(sinks, zmqSink)
 	}
 	if s.parquetDir != "" {
-		parquetSink, parquetErr := sink.NewParquetSink(s.parquetDir)
+		parquetSink, parquetErr := sink.NewParquet(context.Background(), sink.ParquetConfig{
+			Dir:          s.parquetDir,
+			Compression:  s.parquetCodec,
+			RowGroupSize: s.parquetRowGroupSize,
+		})
 		if parquetErr != nil {
 			return nil, parquetErr
 		}
 		s.constructedSinks = append(s.constructedSinks, parquetSink)
 		sinks = append(sinks, parquetSink)
+	}
+	if s.clickhouseAddr != "" {
+		chSink, chErr := sink.NewClickHouse(context.Background(), sink.ClickHouseConfig{
+			Addr:      s.clickhouseAddr,
+			Database:  s.clickhouseDB,
+			User:      s.clickhouseUser,
+			Password:  s.clickhousePassword,
+			BatchSize: s.clickhouseBatchSize,
+		})
+		if chErr != nil {
+			return nil, chErr
+		}
+		s.constructedSinks = append(s.constructedSinks, chSink)
+		sinks = append(sinks, chSink)
 	}
 	if s.sqsQueue != "" || s.snsTopic != "" {
 		loadOpts := []func(*config.LoadOptions) error{}

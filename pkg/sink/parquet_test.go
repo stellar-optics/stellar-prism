@@ -380,7 +380,7 @@ func TestParquetZeroTimeIsNull(t *testing.T) {
 func TestParquetHonoursCompression(t *testing.T) {
 	t.Parallel()
 
-	for _, codec := range []string{"snappy", "gzip", "uncompressed"} {
+	for _, codec := range []string{"snappy", "zstd", "gzip", "uncompressed"} {
 		t.Run(codec, func(t *testing.T) {
 			dir := t.TempDir()
 			s := newTestParquet(t, sink.ParquetConfig{Dir: dir, Compression: codec, BatchSize: 100})
@@ -394,6 +394,59 @@ func TestParquetHonoursCompression(t *testing.T) {
 				t.Errorf("read back %d rows with %s, want 1", got, codec)
 			}
 		})
+	}
+}
+
+func TestParquetCustomRowGroupSizeAndZstdRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	s := newTestParquet(t, sink.ParquetConfig{
+		Dir:          dir,
+		Compression:  "zstd",
+		RowGroupSize: 64 * 1024 * 1024,
+		BatchSize:    10,
+	})
+
+	records := []stream.Record{
+		eventRecord(),
+		ledgerRecord(),
+		transactionRecord(),
+	}
+
+	for _, r := range records {
+		if err := s.Emit(r); err != nil {
+			t.Fatalf("Emit() error = %v", err)
+		}
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	parts := readParts(t, dir)
+	if len(parts) != len(records) {
+		t.Fatalf("read back %d rows, want %d", len(parts), len(records))
+	}
+}
+
+func TestParquetSinkOptions(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	ps, err := sink.NewParquetSink(dir,
+		sink.WithParquetSinkCompression("zstd"),
+		sink.WithParquetSinkRowGroupSize(64*1024*1024),
+	)
+	if err != nil {
+		t.Fatalf("NewParquetSink() error = %v", err)
+	}
+	defer ps.Close()
+
+	if err := ps.Emit(eventRecord()); err != nil {
+		t.Fatalf("ParquetSink.Emit() error = %v", err)
+	}
+	if err := ps.Flush(); err != nil {
+		t.Fatalf("ParquetSink.Flush() error = %v", err)
 	}
 }
 
