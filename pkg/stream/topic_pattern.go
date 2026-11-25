@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
@@ -25,8 +26,10 @@ import (
 //	**           matches zero or more topics; must be the last segment
 //	re:EXPR      the topic text matches the regular expression
 //	prefix:TEXT  the topic text starts with TEXT
-//	TEXT         matches TEXT exactly; "*", "?" and "[...]" glob characters
-//	             make it a glob instead, with "?" matching any one character
+//	TEXT         matches TEXT exactly; "*" and "?" make it a glob instead,
+//	             with "?" matching any one character
+//
+// Brackets may surround a tuple, as in "[transfer, *]".
 //
 // Each pattern anchored at its segment boundaries: a compiled segment matches
 // the whole topic text, not a substring of it. Regular expressions are the
@@ -64,14 +67,22 @@ type topicSeg struct {
 	// re is nil for segAnyOne and segAnySeq; for segMatch it is the compiled
 	// matcher, anchored for literal, glob and prefix segments.
 	re *regexp.Regexp
+	// literal and prefix identify the topic text patterns indexed by the
+	// multi-pattern automaton. Other regular expressions use re directly.
+	literal string
+	prefix  bool
 }
 
 // CompileTopicPattern compiles one pattern specification or returns a
 // descriptive error, so an invalid pattern surfaces once at construction
 // time rather than silently filtering nothing on every record.
 func CompileTopicPattern(spec string) (TopicPattern, error) {
-	parts := strings.Split(spec, ",")
-	if spec == "" || (len(parts) == 1 && parts[0] == "") {
+	partsSpec := strings.TrimSpace(spec)
+	if strings.HasPrefix(partsSpec, "[") && strings.HasSuffix(partsSpec, "]") {
+		partsSpec = strings.TrimSpace(partsSpec[1 : len(partsSpec)-1])
+	}
+	parts := strings.Split(partsSpec, ",")
+	if partsSpec == "" || (len(parts) == 1 && parts[0] == "") {
 		return TopicPattern{}, fmt.Errorf("empty topic pattern")
 	}
 	if len(parts) > MaxTopicSegments+1 { // +1 allows a trailing "**"
@@ -103,9 +114,6 @@ func CompileTopicPattern(spec string) (TopicPattern, error) {
 // list compiles successfully to an empty guard: callers that combine several
 // patterns with AND semantics keep one code path for both cases.
 func CompileTopicPatterns(specs []string) ([]TopicPattern, error) {
-	if len(specs) > MaxTopicFilters {
-		return nil, fmt.Errorf("at most %d topic patterns may be given, got %d", MaxTopicFilters, len(specs))
-	}
 	out := make([]TopicPattern, 0, len(specs))
 	for _, spec := range specs {
 		p, err := CompileTopicPattern(spec)
@@ -115,6 +123,360 @@ func CompileTopicPatterns(specs []string) ([]TopicPattern, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// TopicPatternMatcher is an immutable compiled set of decoded topic patterns.
+// It matches when any registered tuple matches. Exact and simple prefix
+// segments share an Aho-Corasick automaton; regular expressions and complex
+// globs retain the existing regexp semantics.
+type TopicPatternMatcher struct {
+	patterns         []TopicPattern
+	nodes            []topicAutomatonNode
+	outputs          []topicAutomatonOutput
+	offsets          []int
+	minTopics        []int
+	exactTopicCount  []bool
+	requiredSegments []int
+	wildcardsByTopic [][]topicAutomatonOutput
+	regexpsByTopic   [][]topicAutomatonOutput
+	alwaysMatches    bool
+	scratchMu        sync.Mutex
+	scratch          topicPatternScratch
+}
+
+type topicAutomatonNode struct {
+	next    map[byte]int
+	fail    int
+	outputs []int
+}
+
+type topicAutomatonOutput struct {
+	pattern int
+	segment int
+	length  int
+	prefix  bool
+}
+
+type topicPatternScratch struct {
+	matched     []bool
+	seen        []uint32
+	patternSeen []uint32
+	progress    []int
+	generation  uint32
+}
+
+// CompileTopicPatternMatcher compiles any number of pattern specifications.
+// Each specification is one tuple, and a match succeeds when any tuple
+// matches. A tuple may be written as "transfer,*" or "[transfer, *]".
+func CompileTopicPatternMatcher(specs []string) (*TopicPatternMatcher, error) {
+	patterns := make([]TopicPattern, 0, len(specs))
+	for _, spec := range specs {
+		pattern, err := CompileTopicPattern(spec)
+		if err != nil {
+			return nil, err
+		}
+		patterns = append(patterns, pattern)
+	}
+	return newTopicPatternMatcher(patterns), nil
+}
+
+func newTopicPatternMatcher(patterns []TopicPattern) *TopicPatternMatcher {
+	matcher := &TopicPatternMatcher{
+		patterns:         patterns,
+		nodes:            []topicAutomatonNode{{next: make(map[byte]int)}},
+		offsets:          make([]int, len(patterns)),
+		minTopics:        make([]int, len(patterns)),
+		exactTopicCount:  make([]bool, len(patterns)),
+		requiredSegments: make([]int, len(patterns)),
+	}
+	segmentCount := 0
+	maxSegments := 0
+	for patternIndex, pattern := range patterns {
+		matcher.offsets[patternIndex] = segmentCount
+		segmentCount += len(pattern.segs)
+		if len(pattern.segs) > maxSegments {
+			maxSegments = len(pattern.segs)
+		}
+		matcher.minTopics[patternIndex] = len(pattern.segs)
+		matcher.exactTopicCount[patternIndex] = true
+		if len(pattern.segs) > 0 && pattern.segs[len(pattern.segs)-1].kind == segAnySeq {
+			matcher.minTopics[patternIndex]--
+			matcher.exactTopicCount[patternIndex] = false
+		}
+		for segmentIndex, segment := range pattern.segs {
+			switch segment.kind {
+			case segAnySeq:
+				continue
+			case segAnyOne:
+				matcher.requiredSegments[patternIndex]++
+				continue
+			}
+			matcher.requiredSegments[patternIndex]++
+			if segment.literal == "" {
+				continue
+			}
+			state := 0
+			for i := 0; i < len(segment.literal); i++ {
+				ch := segment.literal[i]
+				next, ok := matcher.nodes[state].next[ch]
+				if !ok {
+					next = len(matcher.nodes)
+					matcher.nodes[state].next[ch] = next
+					matcher.nodes = append(matcher.nodes, topicAutomatonNode{next: make(map[byte]int)})
+				}
+				state = next
+			}
+			outputIndex := len(matcher.outputs)
+			matcher.outputs = append(matcher.outputs, topicAutomatonOutput{
+				pattern: patternIndex,
+				segment: segmentIndex,
+				length:  len(segment.literal),
+				prefix:  segment.prefix,
+			})
+			matcher.nodes[state].outputs = append(matcher.nodes[state].outputs, outputIndex)
+		}
+		if matcher.requiredSegments[patternIndex] == 0 {
+			matcher.alwaysMatches = true
+		}
+	}
+	matcher.wildcardsByTopic = make([][]topicAutomatonOutput, maxSegments)
+	matcher.regexpsByTopic = make([][]topicAutomatonOutput, maxSegments)
+	for patternIndex, pattern := range patterns {
+		for segmentIndex, segment := range pattern.segs {
+			ref := topicAutomatonOutput{pattern: patternIndex, segment: segmentIndex}
+			switch {
+			case segment.kind == segAnyOne:
+				matcher.wildcardsByTopic[segmentIndex] = append(matcher.wildcardsByTopic[segmentIndex], ref)
+			case segment.kind == segMatch && segment.literal == "":
+				matcher.regexpsByTopic[segmentIndex] = append(matcher.regexpsByTopic[segmentIndex], ref)
+			}
+		}
+	}
+	matcher.buildFailureLinks()
+	matcher.scratch = topicPatternScratch{
+		matched:     make([]bool, segmentCount),
+		seen:        make([]uint32, segmentCount),
+		patternSeen: make([]uint32, len(patterns)),
+		progress:    make([]int, len(patterns)),
+	}
+	return matcher
+}
+
+func (m *TopicPatternMatcher) buildFailureLinks() {
+	queue := make([]int, 0, len(m.nodes))
+	for _, child := range m.nodes[0].next {
+		queue = append(queue, child)
+	}
+	for head := 0; head < len(queue); head++ {
+		state := queue[head]
+		for ch, child := range m.nodes[state].next {
+			failure := m.nodes[state].fail
+			for failure != 0 {
+				if _, ok := m.nodes[failure].next[ch]; ok {
+					break
+				}
+				failure = m.nodes[failure].fail
+			}
+			if next, ok := m.nodes[failure].next[ch]; ok {
+				m.nodes[child].fail = next
+			}
+			m.nodes[child].outputs = append(m.nodes[child].outputs, m.nodes[m.nodes[child].fail].outputs...)
+			queue = append(queue, child)
+		}
+	}
+}
+
+// Matches reports whether any compiled tuple matches the decoded topic texts.
+// Each element is one topic position. The matcher is safe for concurrent use;
+// reusable scratch space avoids allocations on the hot path.
+func (m *TopicPatternMatcher) Matches(topics []string) bool {
+	if m == nil || len(m.patterns) == 0 {
+		return false
+	}
+	if m.alwaysMatches {
+		return true
+	}
+	m.scratchMu.Lock()
+	defer m.scratchMu.Unlock()
+	scratch := &m.scratch
+	scratch.nextGeneration()
+	for topicIndex, topic := range topics {
+		if topicIndex < len(m.wildcardsByTopic) {
+			for _, ref := range m.wildcardsByTopic[topicIndex] {
+				if m.topicCountMatches(ref.pattern, len(topics)) &&
+					scratch.mark(m.offsets[ref.pattern]+ref.segment, ref.pattern, m.requiredSegments) {
+					return true
+				}
+			}
+			for _, ref := range m.regexpsByTopic[topicIndex] {
+				if !m.topicCountMatches(ref.pattern, len(topics)) {
+					continue
+				}
+				if m.patterns[ref.pattern].segs[ref.segment].re.MatchString(topic) &&
+					scratch.mark(m.offsets[ref.pattern]+ref.segment, ref.pattern, m.requiredSegments) {
+					return true
+				}
+			}
+		}
+		if m.scanCandidateAny(topic, topicIndex, len(topics), scratch) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *TopicPatternMatcher) matchesXDR(topics []string) bool {
+	if m == nil {
+		return true
+	}
+	m.scratchMu.Lock()
+	defer m.scratchMu.Unlock()
+	scratch := &m.scratch
+	clear(scratch.matched)
+	for topicIndex, topic := range topics {
+		candidates := topicCandidateTexts(topic)
+		for _, candidate := range candidates {
+			m.scanCandidate(candidate, topicIndex, scratch.matched)
+		}
+		for patternIndex, pattern := range m.patterns {
+			if topicIndex >= len(pattern.segs) {
+				continue
+			}
+			segment := pattern.segs[topicIndex]
+			offset := m.segmentOffset(patternIndex, topicIndex)
+			switch segment.kind {
+			case segAnyOne:
+				scratch.matched[offset] = true
+			case segMatch:
+				if segment.literal == "" && segMatches(segment.re, candidates) {
+					scratch.matched[offset] = true
+				}
+			}
+		}
+	}
+	matched := m.matchesCompiled(len(topics), scratch.matched)
+	return matched
+}
+
+func (m *TopicPatternMatcher) scanCandidate(text string, topicIndex int, matched []bool) {
+	state := 0
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		for state != 0 {
+			if _, ok := m.nodes[state].next[ch]; ok {
+				break
+			}
+			state = m.nodes[state].fail
+		}
+		if next, ok := m.nodes[state].next[ch]; ok {
+			state = next
+		}
+		for _, outputIndex := range m.nodes[state].outputs {
+			output := m.outputs[outputIndex]
+			start := i + 1 - output.length
+			if output.segment != topicIndex || start != 0 || (!output.prefix && i+1 != len(text)) {
+				continue
+			}
+			matched[m.offsets[output.pattern]+output.segment] = true
+		}
+	}
+}
+
+func (m *TopicPatternMatcher) scanCandidateAny(text string, topicIndex, topicCount int, scratch *topicPatternScratch) bool {
+	state := 0
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		for state != 0 {
+			if _, ok := m.nodes[state].next[ch]; ok {
+				break
+			}
+			state = m.nodes[state].fail
+		}
+		if next, ok := m.nodes[state].next[ch]; ok {
+			state = next
+		}
+		for _, outputIndex := range m.nodes[state].outputs {
+			output := m.outputs[outputIndex]
+			start := i + 1 - output.length
+			if output.segment != topicIndex || start != 0 ||
+				(!output.prefix && i+1 != len(text)) ||
+				!m.topicCountMatches(output.pattern, topicCount) {
+				continue
+			}
+			if scratch.mark(m.offsets[output.pattern]+output.segment, output.pattern, m.requiredSegments) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *TopicPatternMatcher) topicCountMatches(pattern, count int) bool {
+	if m.exactTopicCount[pattern] {
+		return count == m.minTopics[pattern]
+	}
+	return count >= m.minTopics[pattern]
+}
+
+func (s *topicPatternScratch) nextGeneration() {
+	s.generation++
+	if s.generation == 0 {
+		clear(s.seen)
+		clear(s.patternSeen)
+		s.generation = 1
+	}
+}
+
+func (s *topicPatternScratch) mark(segment, pattern int, required []int) bool {
+	if s.seen[segment] == s.generation {
+		return false
+	}
+	s.seen[segment] = s.generation
+	if s.patternSeen[pattern] != s.generation {
+		s.patternSeen[pattern] = s.generation
+		s.progress[pattern] = 0
+	}
+	s.progress[pattern]++
+	return s.progress[pattern] == required[pattern]
+}
+
+func (m *TopicPatternMatcher) matchesCompiled(topicCount int, matched []bool) bool {
+	if len(m.patterns) == 0 {
+		return true
+	}
+	offset := 0
+	for _, pattern := range m.patterns {
+		patternMatches := topicCount >= len(pattern.segs)
+		if len(pattern.segs) == 0 {
+			patternMatches = false
+		}
+		if len(pattern.segs) > 0 && pattern.segs[len(pattern.segs)-1].kind == segAnySeq {
+			patternMatches = topicCount >= len(pattern.segs)-1
+		} else if topicCount != len(pattern.segs) {
+			patternMatches = false
+		}
+		if patternMatches {
+			for i, segment := range pattern.segs {
+				if segment.kind == segAnySeq {
+					continue
+				}
+				if !matched[offset+i] {
+					patternMatches = false
+					break
+				}
+			}
+		}
+		if patternMatches {
+			offset += len(pattern.segs)
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (m *TopicPatternMatcher) segmentOffset(patternIndex, segmentIndex int) int {
+	return m.offsets[patternIndex] + segmentIndex
 }
 
 // String returns the pattern text the TopicPattern was compiled from.
@@ -185,11 +547,24 @@ func compileTopicSegment(seg, spec string) (topicSeg, error) {
 			return topicSeg{}, fmt.Errorf("topic segment %q has an empty prefix", spec)
 		}
 		// A prefix is a glob with an open-ended tail.
-		return topicSeg{kind: segMatch, re: compileAnchored(globToRegexpPattern(body) + ".*")}, nil
+		compiled := topicSeg{kind: segMatch, re: compileAnchored(globToRegexpPattern(body) + ".*")}
+		if !strings.ContainsAny(body, "*?") {
+			compiled.literal = body
+			compiled.prefix = true
+		}
+		return compiled, nil
 	default:
 		// Plain text, or text carrying glob characters; both go through the
 		// glob translation, which for wildcard-free input is an exact match.
-		return topicSeg{kind: segMatch, re: compileAnchored(globToRegexpPattern(seg))}, nil
+		compiled := topicSeg{kind: segMatch, re: compileAnchored(globToRegexpPattern(seg))}
+		switch {
+		case !strings.ContainsAny(seg, "*?"):
+			compiled.literal = seg
+		case strings.HasSuffix(seg, "*") && !strings.ContainsAny(strings.TrimSuffix(seg, "*"), "*?"):
+			compiled.literal = strings.TrimSuffix(seg, "*")
+			compiled.prefix = true
+		}
+		return compiled, nil
 	}
 }
 
@@ -306,13 +681,14 @@ type PatternSink struct {
 	inner Sink
 	// compiled patterns, all of which must match an event for it to pass.
 	patterns []TopicPattern
+	matcher  *TopicPatternMatcher
 }
 
 // NewPatternSink returns a Sink emitting, for each event record, only the
 // records matched by every pattern. Empty compiled input passes everything,
 // which is what a caller with no --topic-pattern flags wants.
 func NewPatternSink(inner Sink, patterns []TopicPattern) *PatternSink {
-	return &PatternSink{inner: inner, patterns: patterns}
+	return &PatternSink{inner: inner, patterns: patterns, matcher: newTopicPatternMatcher(patterns)}
 }
 
 // Emit implements Sink.
@@ -320,10 +696,8 @@ func (s *PatternSink) Emit(r Record) error {
 	if r.Kind != KindEvent || r.Event == nil {
 		return s.inner.Emit(r)
 	}
-	for _, p := range s.patterns {
-		if !p.Matches(r.Event.TopicXDR) {
-			return nil
-		}
+	if len(s.patterns) > 0 && !s.matcher.matchesXDR(r.Event.TopicXDR) {
+		return nil
 	}
 	return s.inner.Emit(r)
 }

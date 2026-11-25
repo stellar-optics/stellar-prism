@@ -950,7 +950,7 @@ start the next run where the last one stopped.`,
 	// StringArray, not StringSlice: a comma separates segment *patterns*
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
-		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
+		`client-side topic pattern over decoded topics: exact text, "transfer*", "[transfer, *]", "*", "**", "prefix:TEXT", "re:REGEX", or "*" and "?" globs; repeatable`)
 	cmd.Flags().StringArrayVar(&sf.excludeTopics, "exclude-topic", nil,
 		"topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable")
 	cmd.Flags().StringSliceVar(&sf.excludeContracts, "exclude-contract", nil,

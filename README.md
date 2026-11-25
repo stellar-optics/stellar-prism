@@ -111,7 +111,10 @@ XDR, with glob, prefix and regex segments:
 
 ```sh
 # Any topic whose first segment starts with "transfer" (e.g. a symbol)
-prism events --topic-pattern 'prefix:transfer' --limit 20
+prism events --topic-pattern 'transfer*' --limit 20
+
+# A two-topic tuple; "*" matches one topic position
+prism events --topic-pattern '[transfer, *]' --limit 20
 
 # Regex over the decoded topic text
 prism events --contract CBGSB... --topic-pattern 're:burn.*' --follow

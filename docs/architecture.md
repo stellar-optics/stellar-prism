@@ -394,7 +394,10 @@ the output sink. The text it matches against is derived from the same lens
 envelope `--json` prints, so a pattern tuned against `--json` output works
 unchanged here — and filtering lives at the sink seam rather than inside the
 tailer, so the delivery guarantee and cursor mechanics are untouched by
-output shaping.
+output shaping. Exact and simple prefix segments are indexed together in a
+compiled Aho-Corasick matcher, while regular expressions and complex globs keep
+their existing regexp behavior. Client-side pattern sets are not constrained
+by the server-side topic-filter limit.
 
 ### Expression filter rules
 
