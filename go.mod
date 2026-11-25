@@ -22,6 +22,7 @@ require (
 	github.com/spf13/viper v1.20.1
 	github.com/stellar-optics/stellar-xdr-lens v0.2.0
 	github.com/stellar/go-stellar-sdk v0.7.3
+	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 )
@@ -110,7 +111,6 @@ require (
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260924152758-ed294f943157 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
