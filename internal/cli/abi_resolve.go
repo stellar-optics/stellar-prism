@@ -96,9 +96,12 @@ hand.`,
 				})
 				if err != nil {
 					// Fallback to in-memory cache if disk directory cannot be created
-					cache, _ = stream.NewABICache(stream.ABICacheOptions{
+					cache, err = stream.NewABICache(stream.ABICacheOptions{
 						TTL: specCacheTTL,
 					})
+					if err != nil {
+						return fmt.Errorf("creating in-memory spec cache: %w", err)
+					}
 				}
 			}
 

@@ -20,9 +20,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
-	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 	"github.com/stellar-optics/stellar-prism/pkg/sink"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
+	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 )
 
 // replayFlags holds options specific to the `prism replay` command.
@@ -248,7 +248,7 @@ func fetchAndParseCheckpoint(ctx context.Context, client *http.Client, baseURL s
 		}
 		return metas, nil
 	}
-	return nil, fmt.Errorf("checkpoint %08x not found in archive (%v)", chk, lastErr)
+	return nil, fmt.Errorf("checkpoint %08x not found in archive (%w)", chk, lastErr)
 }
 
 func openArchiveResource(ctx context.Context, client *http.Client, baseURL, relPath string) (io.ReadCloser, error) {

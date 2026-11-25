@@ -13,13 +13,13 @@ import (
 )
 
 type mockClickHouseClient struct {
-	mu          sync.Mutex
-	queries     []string
-	inserts     map[string][][]any
-	insertCols  map[string][]string
-	execErr     error
-	insertErr   error
-	closed      bool
+	mu         sync.Mutex
+	queries    []string
+	inserts    map[string][][]any
+	insertCols map[string][]string
+	execErr    error
+	insertErr  error
+	closed     bool
 }
 
 func newMockClickHouseClient() *mockClickHouseClient {

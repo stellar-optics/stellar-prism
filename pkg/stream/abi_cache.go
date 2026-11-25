@@ -131,7 +131,7 @@ func (c *ABICache) Get(contractID string) (*CachedSpec, bool) {
 
 	// 1. Check in-memory LRU
 	if el, ok := c.items[contractID]; ok {
-		item := el.Value.(*lruItem)
+		item, _ := el.Value.(*lruItem) //nolint:errcheck // type is guaranteed by putMemory
 		if c.now().Sub(item.value.UpdatedAt) > c.ttl {
 			// Expired
 			c.removeElement(el)
@@ -224,7 +224,8 @@ func (c *ABICache) CheckAndInvalidate(contractID string, currentWasmHash xdr.Has
 
 	var cachedHash string
 	if el, ok := c.items[contractID]; ok {
-		cachedHash = el.Value.(*lruItem).value.WasmHash
+		item, _ := el.Value.(*lruItem) //nolint:errcheck // type is guaranteed by putMemory
+		cachedHash = item.value.WasmHash
 	} else if c.dir != "" {
 		data, err := os.ReadFile(c.filePath(contractID))
 		if err == nil {
@@ -276,7 +277,8 @@ func (c *ABICache) Clear() {
 func (c *ABICache) putMemory(key string, val *CachedSpec) {
 	if el, ok := c.items[key]; ok {
 		c.evictList.MoveToFront(el)
-		el.Value.(*lruItem).value = val
+		item, _ := el.Value.(*lruItem) //nolint:errcheck // type is guaranteed by putMemory
+		item.value = val
 		return
 	}
 
@@ -298,7 +300,7 @@ func (c *ABICache) evictOldest() {
 
 func (c *ABICache) removeElement(el *list.Element) {
 	c.evictList.Remove(el)
-	item := el.Value.(*lruItem)
+	item, _ := el.Value.(*lruItem) //nolint:errcheck // type is guaranteed by putMemory
 	delete(c.items, item.key)
 }
 
@@ -315,5 +317,7 @@ func (c *ABICache) saveToDisk(contractID string, spec *CachedSpec) {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, c.filePath(contractID))
+	if err := os.Rename(tmp, c.filePath(contractID)); err != nil {
+		_ = os.Remove(tmp)
+	}
 }

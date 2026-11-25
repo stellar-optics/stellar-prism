@@ -33,40 +33,40 @@ const (
 // commands. Every one is off unless its flag is set, so default behaviour is
 // unchanged and no network is touched.
 type sinkFlags struct {
-	webhookURL       string
-	webhookSecret    string
-	webhookBatch     int
-	webhookTimeout   time.Duration
-	webhookMaxRetry  int
-	cloudURL         string
-	cloudProvider    string
-	cloudBucket      string
-	cloudPrefix      string
-	cloudRegion      string
-	cloudRecords     int
-	cloudBytes       int
-	cloudTimeout     time.Duration
-	cloudCompress    bool
-	metricsAddr      string
-	syslogAddress    string
-	syslogFormat     string
-	syslogFacility   string
-	syslogAppName    string
-	esURL            string
-	esIndex          string
-	esUsername       string
-	esPassword       string
-	esAPIKey         string
-	esBatchSize      int
-	esFlushInterval  time.Duration
-	natsURL          string
-	natsSubject      string
-	natsJetStream    bool
-	zmqEndpoint      string
-	zmqTopic         string
-	auditFile        string
-	auditKeyFile     string
-	auditCheckpoint  int
+	webhookURL          string
+	webhookSecret       string
+	webhookBatch        int
+	webhookTimeout      time.Duration
+	webhookMaxRetry     int
+	cloudURL            string
+	cloudProvider       string
+	cloudBucket         string
+	cloudPrefix         string
+	cloudRegion         string
+	cloudRecords        int
+	cloudBytes          int
+	cloudTimeout        time.Duration
+	cloudCompress       bool
+	metricsAddr         string
+	syslogAddress       string
+	syslogFormat        string
+	syslogFacility      string
+	syslogAppName       string
+	esURL               string
+	esIndex             string
+	esUsername          string
+	esPassword          string
+	esAPIKey            string
+	esBatchSize         int
+	esFlushInterval     time.Duration
+	natsURL             string
+	natsSubject         string
+	natsJetStream       bool
+	zmqEndpoint         string
+	zmqTopic            string
+	auditFile           string
+	auditKeyFile        string
+	auditCheckpoint     int
 	parquetDir          string
 	parquetCodec        string
 	parquetRowGroupSize int64
@@ -76,11 +76,11 @@ type sinkFlags struct {
 	clickhousePassword  string
 	clickhouseBatchSize int
 	sqsQueue            string
-	snsTopic         string
-	awsRegion        string
-	pubsubTopic      string
-	metrics          *sink.Prometheus
-	constructedSinks []io.Closer
+	snsTopic            string
+	awsRegion           string
+	pubsubTopic         string
+	metrics             *sink.Prometheus
+	constructedSinks    []io.Closer
 }
 
 func (s *sinkFlags) register(cmd *cobra.Command) {

@@ -460,14 +460,29 @@ func (c *nativeTCPClient) handshake(ctx context.Context) error {
 		return fmt.Errorf("unexpected handshake packet type: %d", packetType)
 	}
 
-	// Consume ServerHello
-	_, _ = readString(c.rw) // server_name
-	_, _ = readVarUint(c.rw) // major
-	_, _ = readVarUint(c.rw) // minor
-	_, _ = readVarUint(c.rw) // protocol version
-	_, _ = readString(c.rw) // timezone
-	_, _ = readString(c.rw) // display_name
-	_, _ = readVarUint(c.rw) // patch version
+	// Consume ServerHello fields; errors are non-fatal since the handshake
+	// packet has already been validated by the type check above.
+	if _, err = readString(c.rw); err != nil { // server_name
+		return fmt.Errorf("reading server hello: %w", err)
+	}
+	if _, err = readVarUint(c.rw); err != nil { // major
+		return fmt.Errorf("reading server hello: %w", err)
+	}
+	if _, err = readVarUint(c.rw); err != nil { // minor
+		return fmt.Errorf("reading server hello: %w", err)
+	}
+	if _, err = readVarUint(c.rw); err != nil { // protocol version
+		return fmt.Errorf("reading server hello: %w", err)
+	}
+	if _, err = readString(c.rw); err != nil { // timezone
+		return fmt.Errorf("reading server hello: %w", err)
+	}
+	if _, err = readString(c.rw); err != nil { // display_name
+		return fmt.Errorf("reading server hello: %w", err)
+	}
+	if _, err = readVarUint(c.rw); err != nil { // patch version
+		return fmt.Errorf("reading server hello: %w", err)
+	}
 
 	return nil
 }
@@ -491,7 +506,7 @@ func (c *nativeTCPClient) Insert(ctx context.Context, table string, columns []st
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("INSERT INTO %s (%s) VALUES ", table, strings.Join(columns, ", ")))
+	fmt.Fprintf(&sb, "INSERT INTO %s (%s) VALUES ", table, strings.Join(columns, ", "))
 	for i, row := range rows {
 		if i > 0 {
 			sb.WriteString(", ")
@@ -572,16 +587,26 @@ func (c *nativeTCPClient) drainServerResponse() error {
 		case serverExceptionPacket:
 			return c.readException()
 		case serverProgressPacket:
-			_, _ = readVarUint(c.rw) // rows
-			_, _ = readVarUint(c.rw) // bytes
-			_, _ = readVarUint(c.rw) // total_rows
+			if _, err := readVarUint(c.rw); err != nil { // rows
+				return fmt.Errorf("reading progress: %w", err)
+			}
+			if _, err := readVarUint(c.rw); err != nil { // bytes
+				return fmt.Errorf("reading progress: %w", err)
+			}
+			if _, err := readVarUint(c.rw); err != nil { // total_rows
+				return fmt.Errorf("reading progress: %w", err)
+			}
 		case serverDataPacket:
 			// Read block
-			_, _ = readString(c.rw) // temp table
-			cols, _ := readVarUint(c.rw)
-			rows, _ := readVarUint(c.rw)
-			_ = cols
-			_ = rows
+			if _, err := readString(c.rw); err != nil { // temp table
+				return fmt.Errorf("reading data block: %w", err)
+			}
+			if _, err := readVarUint(c.rw); err != nil { // cols
+				return fmt.Errorf("reading data block: %w", err)
+			}
+			if _, err := readVarUint(c.rw); err != nil { // rows
+				return fmt.Errorf("reading data block: %w", err)
+			}
 		default:
 			return nil
 		}
@@ -589,14 +614,29 @@ func (c *nativeTCPClient) drainServerResponse() error {
 }
 
 func (c *nativeTCPClient) readException() error {
-	code, _ := readVarUint(c.rw)
-	name, _ := readString(c.rw)
-	msg, _ := readString(c.rw)
-	stack, _ := readString(c.rw)
-	_ = stack
-	hasNested, _ := readVarUint(c.rw)
+	code, err := readVarUint(c.rw)
+	if err != nil {
+		return fmt.Errorf("reading exception code: %w", err)
+	}
+	name, err := readString(c.rw)
+	if err != nil {
+		return fmt.Errorf("reading exception name: %w", err)
+	}
+	msg, err := readString(c.rw)
+	if err != nil {
+		return fmt.Errorf("reading exception message: %w", err)
+	}
+	if _, err := readString(c.rw); err != nil { // stack
+		return fmt.Errorf("reading exception stack: %w", err)
+	}
+	hasNested, err := readVarUint(c.rw)
+	if err != nil {
+		return fmt.Errorf("reading exception nested flag: %w", err)
+	}
 	if hasNested != 0 {
-		_ = c.readException()
+		if nestedErr := c.readException(); nestedErr != nil {
+			return fmt.Errorf("clickhouse exception %d (%s): %s (nested: %w)", code, name, msg, nestedErr)
+		}
 	}
 	return fmt.Errorf("clickhouse exception %d (%s): %s", code, name, msg)
 }
