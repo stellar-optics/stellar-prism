@@ -90,11 +90,12 @@ func (s *LedgerSource) Fetch(ctx context.Context, cursor string) (Batch, error) 
 	}
 
 	batch := Batch{
-		Records:    make([]Record, 0, len(resp.Ledgers)),
-		NextCursor: resp.Cursor,
-		Latest:     resp.LatestLedger,
-		Oldest:     resp.OldestLedger,
-		Full:       uint(len(resp.Ledgers)) >= s.query.PageLimit,
+		Records:         make([]Record, 0, len(resp.Ledgers)),
+		NextCursor:      resp.Cursor,
+		Latest:          resp.LatestLedger,
+		LatestCloseTime: unixCloseTime(resp.LatestLedgerCloseTime),
+		Oldest:          resp.OldestLedger,
+		Full:            uint(len(resp.Ledgers)) >= s.query.PageLimit,
 	}
 	for _, l := range resp.Ledgers {
 		r := ledgerRecord(l)

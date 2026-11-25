@@ -145,6 +145,13 @@ type streamFlags struct {
 	topicPatterns []string
 	fanoutDir     string
 
+	// aggregate, aggregateWindow and aggregateEvery are events-only. With
+	// aggregate set, records feed a sliding time window and rolling
+	// throughput is printed in place of each event.
+	aggregate       bool
+	aggregateWindow time.Duration
+	aggregateEvery  time.Duration
+
 	// dedupWindow is the events-only re-poll de-duplicator window. Zero
 	// disables it.
 	dedupWindow int
@@ -199,7 +206,7 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
 		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
-		"tune the wait between polls from how many new ledgers close each interval (with --follow)")
+		"schedule each poll for the predicted next ledger close, from a moving average of recent close intervals (with --follow)")
 	cmd.Flags().IntVar(&s.backfillWorkers, "backfill-workers", 1,
 		"fetch historical pages concurrently with this many workers when --from is set (1 means sequential)")
 	cmd.Flags().BoolVar(&s.batch, "batch", false,
@@ -384,6 +391,9 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.statsBar && !s.follow {
 		return fmt.Errorf("--stats-bar requires --follow")
+	}
+	if err := s.validateAggregate(cmd); err != nil {
+		return err
 	}
 	if err := s.validateState(cmd); err != nil {
 		return err
@@ -826,6 +836,7 @@ func newEventsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		filterExpr    string
 		topicRegex    []string
 		contractsFile string
+		watchlistFile string
 	)
 
 	cmd := &cobra.Command{
@@ -843,8 +854,10 @@ last. The semantics are identical to ` + "`stellar events --topic`" + `.
 
 Use --filter-expr for client-side predicates over decoded values and topics,
 or --topic-regex for regular expressions over decoded topic symbols and
-strings. --contracts-file reads a hot-reloaded watchlist; addresses beyond
-the RPC limit of five are queried in coordinated groups.
+strings. --watchlist reads contract IDs from a file and reloads it whenever it
+changes, so contracts can be added or removed without restarting a --follow
+stream; addresses beyond the RPC limit of five are queried in coordinated
+groups.
 
 Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
@@ -869,10 +882,13 @@ start the next run where the last one stopped.`,
   prism events --filter-expr 'value.amount > 1000000000 && topics[0].symbol == "transfer"'
 
   # Match related topic names and hot-reload a larger contract set
-  prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
+  prism events --watchlist /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
 
   # Backfill from a ledger then keep following
   prism events --from 1234567 --follow
+
+  # Rolling throughput over the last minute, printed every 10s
+  prism events --watchlist ./watchlist.txt --follow --aggregate --window 1m
 
   # Resume across restarts with a durable cursor in PostgreSQL
   prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"
@@ -902,31 +918,45 @@ start the next run where the last one stopped.`,
 				}
 				filters = append(filters, compiled)
 			}
-			if len(filters) > 0 {
-				sf.filter = filters
+			watchPath, err := resolveWatchlistFlag(watchlistFile, contractsFile)
+			if err != nil {
+				return err
 			}
-			var watchlist *stream.WatchlistManager
-			var cancelWatch context.CancelFunc
-			if contractsFile != "" {
+			var watchlist *stream.WatchlistFilter
+			if watchPath != "" {
 				if len(contractIDs) != 0 {
-					return fmt.Errorf("--contract cannot be combined with --contracts-file")
+					return fmt.Errorf("--contract cannot be combined with --watchlist")
 				}
-				var err error
-				watchlist, err = stream.NewWatchlistManager(contractsFile)
+				watchlist, err = stream.NewWatchlistFilter(watchPath)
 				if err != nil {
 					return err
 				}
-				watchCtx, cancel := context.WithCancel(cmd.Context())
-				cancelWatch = cancel
+				watchlist.OnChange(func(change stream.WatchlistChange) {
+					if !sf.quiet {
+						logWatchlistChange(stderr, watchPath, change)
+					}
+				})
+				watchCtx, cancelWatch := context.WithCancel(cmd.Context())
 				defer cancelWatch()
 				if err := watchlist.Start(watchCtx); err != nil {
 					return err
 				}
 				go func() {
 					for err := range watchlist.Errors() {
-						fmt.Fprintf(stderr, "prism: %v\n", err)
+						fmt.Fprintf(stderr, "prism: %v; keeping the previous watchlist\n", err)
 					}
 				}()
+				if !sf.quiet {
+					fmt.Fprintf(stderr, "prism: watching %d contracts from %s (hot-reload enabled)\n", watchlist.Len(), watchPath)
+				}
+				// The RPC filter already narrows each request to the active
+				// set; the client-side filter additionally drops records from
+				// a contract removed after its page was fetched, so a removal
+				// takes effect on the very next record.
+				filters = append(filters, watchlist)
+			}
+			if len(filters) > 0 {
+				sf.filter = filters
 			}
 
 			client, closeClient, err := openClient(g, stderr)
@@ -994,7 +1024,9 @@ start the next run where the last one stopped.`,
 		"event type to include: contract, system or diagnostic (default: all)")
 	cmd.Flags().StringVar(&filterExpr, "filter-expr", "", "client-side boolean expression evaluated against decoded event payloads")
 	cmd.Flags().StringArrayVar(&topicRegex, "topic-regex", nil, "client-side topic rule as segment-index:regexp; repeatable and all rules must match")
-	cmd.Flags().StringVar(&contractsFile, "contracts-file", "", "read and hot-reload contract IDs from this file (one per line)")
+	cmd.Flags().StringVar(&watchlistFile, "watchlist", "",
+		"read contract IDs from this file (one per line, # comments allowed) and hot-reload it while streaming; lifts the 5-contract limit")
+	cmd.Flags().StringVar(&contractsFile, "contracts-file", "", "alias for --watchlist")
 	// StringArray, not StringSlice: a comma separates segment *patterns*
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
@@ -1003,6 +1035,12 @@ start the next run where the last one stopped.`,
 		"topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable")
 	cmd.Flags().StringSliceVar(&sf.excludeContracts, "exclude-contract", nil,
 		"contract ID to exclude; repeatable")
+	cmd.Flags().BoolVar(&sf.aggregate, "aggregate", false,
+		"print rolling throughput (event count, events/sec, unique senders) over a sliding --window instead of each event")
+	cmd.Flags().DurationVar(&sf.aggregateWindow, "window", time.Minute,
+		"sliding window length for --aggregate (e.g. 30s, 1m, 5m)")
+	cmd.Flags().DurationVar(&sf.aggregateEvery, "aggregate-interval", 10*time.Second,
+		"how often --aggregate prints a window summary")
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
 	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", stream.DefaultDedupWindow,
@@ -1182,18 +1220,26 @@ func runStream(
 		from = target.Ledger
 	}
 
-	out, err := sf.newSink(stdout, stderr, g.color, func(err error) {
-		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
-	}, func(entry sink.DLQEntry) {
-		record := "-"
-		if entry.Record != nil {
-			record = entry.Record.ID
+	var out stream.Sink
+	if sf.aggregate {
+		// Aggregation replaces per-event output with periodic window
+		// summaries; the sink owns the ticker and prints a final summary
+		// when it is closed.
+		out = newWindowAggregateSink(stdout, sf.aggregateWindow, sf.aggregateEvery, sf.asJSON, nil)
+	} else {
+		out, err = sf.newSink(stdout, stderr, g.color, func(err error) {
+			fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
+		}, func(entry sink.DLQEntry) {
+			record := "-"
+			if entry.Record != nil {
+				record = entry.Record.ID
+			}
+			fmt.Fprintf(stderr, "prism: dead-lettered record %s (%s): %s\n",
+				record, entry.Stage, entry.Error)
+		})
+		if err != nil {
+			return err
 		}
-		fmt.Fprintf(stderr, "prism: dead-lettered record %s (%s): %s\n",
-			record, entry.Stage, entry.Error)
-	})
-	if err != nil {
-		return err
 	}
 	if sf.statsBar {
 		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
@@ -1638,4 +1684,43 @@ func latestLedger(ctx context.Context, client rpc.Client) (uint32, error) {
 		return 0, fmt.Errorf("server did not report a latest ledger; pass --from to choose a start point")
 	}
 	return resp.Sequence, nil
+}
+
+// resolveWatchlistFlag folds --contracts-file, the original spelling, into
+// --watchlist. Naming the same file twice is harmless; naming two different
+// files is ambiguous and rejected rather than silently picking one.
+func resolveWatchlistFlag(watchlist, contractsFile string) (string, error) {
+	switch {
+	case watchlist == "":
+		return contractsFile, nil
+	case contractsFile == "" || contractsFile == watchlist:
+		return watchlist, nil
+	default:
+		return "", fmt.Errorf("--watchlist and --contracts-file name different files; use only --watchlist")
+	}
+}
+
+// watchlistLogLimit caps how many addresses one reload line spells out, so
+// replacing a several-hundred-contract file does not flood stderr.
+const watchlistLogLimit = 10
+
+// logWatchlistChange reports a hot reload on stderr. The stream itself keeps
+// running; this line is the operator's confirmation that the edit landed.
+func logWatchlistChange(w io.Writer, path string, change stream.WatchlistChange) {
+	fmt.Fprintf(w, "prism: watchlist %s reloaded: +%d added, -%d removed, now watching %d contracts\n",
+		path, len(change.Added), len(change.Removed), change.Total)
+	logIDs := func(sign string, ids []string) {
+		for i, id := range ids {
+			if i == watchlistLogLimit {
+				fmt.Fprintf(w, "prism:   %s ... and %d more\n", sign, len(ids)-watchlistLogLimit)
+				return
+			}
+			fmt.Fprintf(w, "prism:   %s %s\n", sign, id)
+		}
+	}
+	logIDs("+", change.Added)
+	logIDs("-", change.Removed)
+	if change.Total == 0 {
+		fmt.Fprintln(w, "prism: watchlist is empty; the stream stays open and resumes when contracts are added")
+	}
 }

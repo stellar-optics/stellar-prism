@@ -149,7 +149,7 @@ heartbeat: 1m                     # stderr line after a minute of silence
 events:
   follow: true
   json: true
-  contract:                       # up to 5; use contracts-file for more
+  contract:                       # up to 5; use watchlist for more
     - CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
   # Filtering rules
   topic:                          # server-side, base64 ScVals with * and **
@@ -411,8 +411,10 @@ Put these in the matching command section.
 | `back` | `PRISM_BACK` | `rewind` |
 | `change` | `PRISM_CHANGE` | `storage` |
 | `consensus` | `PRISM_CONSENSUS` | `ledgers` |
+| `aggregate` | `PRISM_AGGREGATE` | `events`, `serve` |
+| `aggregate-interval` | `PRISM_AGGREGATE_INTERVAL` | `events`, `serve` |
 | `contract` | `PRISM_CONTRACT` | `aggregate`, `events`, `generate-types`, `serve`, `storage` |
-| `contracts-file` | `PRISM_CONTRACTS_FILE` | `events`, `serve` |
+| `contracts-file` | `PRISM_CONTRACTS_FILE` | `events`, `serve` (alias for `watchlist`) |
 | `dedup-window` | `PRISM_DEDUP_WINDOW` | `events`, `serve` |
 | `detect-conflicts` | `PRISM_DETECT_CONFLICTS` | `transactions` |
 | `entry` | `PRISM_ENTRY` | `storage` |
@@ -454,7 +456,8 @@ Put these in the matching command section.
 | `type` | `PRISM_TYPE` | `aggregate`, `events`, `operations`, `serve` |
 | `verbose` | `PRISM_VERBOSE` | `tx` |
 | `watch` | `PRISM_WATCH` | `contracts` |
-| `window` | `PRISM_WINDOW` | `aggregate` |
+| `watchlist` | `PRISM_WATCHLIST` | `events`, `serve` |
+| `window` | `PRISM_WINDOW` | `aggregate`, `events`, `serve` |
 
 ## Validation and troubleshooting
 

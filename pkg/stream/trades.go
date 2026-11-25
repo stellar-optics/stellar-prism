@@ -46,7 +46,7 @@ func (s *TradeSource) Fetch(ctx context.Context, c string) (Batch, error) {
 	if err != nil {
 		return Batch{}, err
 	}
-	out := Batch{Records: []Record{}, NextCursor: b.NextCursor, Latest: b.Latest, Oldest: b.Oldest, Full: b.Full}
+	out := Batch{Records: []Record{}, NextCursor: b.NextCursor, Latest: b.Latest, LatestCloseTime: b.LatestCloseTime, Oldest: b.Oldest, Full: b.Full}
 	for _, r := range b.Records {
 		t := r.Transaction
 		if t == nil || !t.Successful || t.EnvelopeXDR == "" || t.ResultXDR == "" {

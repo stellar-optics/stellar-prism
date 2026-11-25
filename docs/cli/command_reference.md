@@ -126,7 +126,7 @@ section lists only the flags that are specific to it, plus its default
 | `--limit`, `-n` | int | — | stop after this many records (0 means unlimited) |
 | `--page-size` | uint | `200` | how many records to request per RPC call |
 | `--poll` | duration | `5s` | how long to wait between polls once caught up |
-| `--adaptive` | bool | — | tune the wait between polls from how many new ledgers close each interval (with --follow) |
+| `--adaptive` | bool | — | schedule each poll for the predicted next ledger close, from a moving average of recent close intervals (with --follow) |
 | `--heartbeat` | duration | — | print a line on stderr after this long waiting in silence (with --follow; 0 disables) |
 | `--backfill-workers` | int | `1` | fetch historical pages concurrently with this many workers when --from is set (1 means sequential) |
 | `--drain-timeout` | duration | `15s` | how long a shutdown may take to flush records and commit the final cursor |
@@ -416,15 +416,26 @@ Topic filters (`--topic`) are evaluated by the RPC server and use its wildcard
 syntax: `*` matches exactly one segment and `**` matches zero or more and must
 come last. `--topic-pattern`, `--topic-regex`, `--filter-expr`,
 `--exclude-*`, `--sample-rate` and `--max-rate` are applied client-side after
-decoding. `--contracts-file` hot-reloads a watchlist; addresses beyond the
-RPC's limit of five are queried in coordinated groups.
+decoding. `--watchlist` (alias `--contracts-file`) reads contract IDs from a
+file and hot-reloads it while streaming: additions and removals take effect on
+the next poll of a running `--follow` stream, each reload is logged to stderr,
+and an invalid edit is reported while the previous set stays active.
+Addresses beyond the RPC's limit of five are queried in coordinated groups.
+
+`--aggregate` replaces per-event output with rolling throughput over a sliding
+`--window` (default `1m`), printed every `--aggregate-interval` (default
+`10s`) and once more on exit: event count, events per second, and unique
+senders (the first address-typed topic after the event name, which is `from`
+for SEP-41 transfers). `--json` prints each summary as an NDJSON object.
 
 Default `--page-size`: **200**.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--contract` | strings | — | contract ID to watch; repeatable, up to 5 |
-| `--contracts-file` | string | — | read and hot-reload contract IDs from this file (one per line) |
+| `--aggregate` | bool | `false` | print rolling throughput (event count, events/sec, unique senders) over a sliding --window instead of each event |
+| `--aggregate-interval` | duration | `10s` | how often --aggregate prints a window summary |
+| `--contracts-file` | string | — | alias for --watchlist |
 | `--dedup-window` | int | `10000` | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables) |
 | `--exclude-contract` | strings | — | contract ID to exclude; repeatable |
 | `--exclude-topic` | stringArray | — | topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable |
@@ -436,6 +447,8 @@ Default `--page-size`: **200**.
 | `--topic-pattern` | stringArray | — | client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5 |
 | `--topic-regex` | stringArray | — | client-side topic rule as segment-index:regexp; repeatable and all rules must match |
 | `--type` | strings | — | event type to include: contract, system or diagnostic (default: all) |
+| `--watchlist` | string | — | read contract IDs from this file (one per line, # comments allowed) and hot-reload it while streaming; lifts the 5-contract limit |
+| `--window` | duration | `1m` | sliding window length for --aggregate (e.g. 30s, 1m, 5m) |
 
 ```console
 # Follow one contract
@@ -448,7 +461,10 @@ prism events --contract CBGSB... --topic 'AAAAAQ==,*' --limit 20
 prism events --filter-expr 'value.amount > 1000000000 && contains(topic[0], "transfer")'
 
 # Hot-reloaded watchlist plus a topic regex
-prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*' --follow
+prism events --watchlist /etc/prism/watchlist.txt --topic-regex '0:^transfer.*' --follow
+
+# Rolling throughput over the last minute, printed every 10s
+prism events --watchlist /etc/prism/watchlist.txt --follow --aggregate --window 1m
 
 # Glob-style topic patterns over decoded topics
 prism events --contract CBGSB... --topic-pattern 'transfer,*,**' --follow

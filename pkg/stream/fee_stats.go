@@ -58,7 +58,7 @@ func (s *FeeStatsSource) Fetch(ctx context.Context, cursor string) (Batch, error
 	if err != nil {
 		return Batch{}, err
 	}
-	out := Batch{Records: make([]Record, 0, len(b.Records)), NextCursor: b.NextCursor, Latest: b.Latest, Oldest: b.Oldest, Full: b.Full}
+	out := Batch{Records: make([]Record, 0, len(b.Records)), NextCursor: b.NextCursor, Latest: b.Latest, LatestCloseTime: b.LatestCloseTime, Oldest: b.Oldest, Full: b.Full}
 	for _, ledger := range b.Records {
 		if ledger.Close == nil || ledger.Close.HeaderXDR == "" {
 			continue
