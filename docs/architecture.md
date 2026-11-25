@@ -94,8 +94,9 @@ pkg/stream/
   clock.go            Clock and Backoff, both injectable
   topic_pattern.go    client-side topic matching over decoded text
   demux.go            per-contract fan-out, queues + one goroutine each
-  time_window.go      --since → approximate start ledger
-  backoff.go          AdaptivePoller for --adaptive follow waits
+  time_window.go      --since → approximate start ledger; SlidingWindowBuffer for --aggregate
+  watchlist.go        WatchlistFilter: hot-reloaded --watchlist contract set
+  backoff.go          AdaptivePoller, the --adaptive fallback before close times are known
   state_file.go       durable cursor: atomic, file-backed stream position
 pkg/sink/
   ndjson.go           NDJSON, one object per line
@@ -470,16 +471,33 @@ and window selection guidelines, see
 
 ### Adaptive polling
 
-`--adaptive` replaces the fixed `--poll` wait with an `AdaptivePoller`
-(backoff.go) whose only signal is how many new ledgers closed during the last
-wait: at least one means the wait matched or beat the ledger cadence, so
-shorten; zero means mostly dead time, so lengthen. With no cadence parameter
-at all that rule converges on oscillating around the real close rate, tracking
-a network it is never told about — and the stretchy bounds (`--min-poll`-less
-defaults 1s..30s) keep the invariant: never faster than Min, never slower
-than Max. Jitter spreads each returned wait over its lower half so several
-prism instances do not poll in phase. The tuner is one number in one
-goroutine, so its tests run deterministically — no wall-clock flakiness.
+`--adaptive` replaces the fixed `--poll` wait with a ledger close estimator
+(`LedgerCloseEstimator` in tail.go). Stellar closes a ledger roughly every
+5s, but validator voting delays and load spikes stretch that to 8s or more
+for runs of ledgers, so the estimator keeps an exponential moving average of
+observed close intervals over the last ~10 ledgers (smoothing factor 2/11)
+and schedules each poll for when the next ledger should first be served:
+
+    sleep = (lastClose + emaInterval + margin) - now - estimatedRpcLatency
+
+clamped to 500ms..10s. `lastClose` is the server-reported
+`latestLedgerCloseTime` (carried on `Batch.LatestCloseTime` from getEvents,
+getLedgers and getTransactions) or, for sources without it, the time the
+advance was observed. `estimatedRpcLatency` is an EMA of fetch round trips.
+`margin` self-tunes for RPC ingestion lag and the one-second granularity of
+close times: it grows on each poll that arrives before its ledger and shrinks
+slowly on polls that find exactly one new ledger. An overdue ledger is retried
+from 500ms, doubling per consecutive empty poll up to one interval. In a
+simulated two hours of fluctuating 4-9s closes this cuts empty polls by about
+95% against the ledger-count poller (see
+`TestLedgerCloseEstimatorReducesEmptyPolls`).
+
+Until the head has advanced once there is no interval to predict from, so the
+`AdaptivePoller` (backoff.go) drives the wait: its only signal is how many new
+ledgers closed during the last wait, shortening when at least one did and
+lengthening on dead time within 1s..30s. It also remains the poller for
+sources that report no head ledger at all. Both run in the tailer's single
+goroutine and are tested deterministically against a fake clock.
 ### Parallel historical backfill
 
 `--backfill-workers N` (with an explicit `--from`) uses `Drainer` instead of

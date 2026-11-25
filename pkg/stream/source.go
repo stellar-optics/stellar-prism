@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 )
 
 // Batch is one page of records returned by a Source, together with the
@@ -17,6 +18,11 @@ type Batch struct {
 	NextCursor string
 	// Latest is the newest ledger the server has ingested.
 	Latest uint32
+	// LatestCloseTime is when Latest closed, when the server reports it. The
+	// adaptive poller uses it to measure real ledger close intervals instead
+	// of inferring them from when a poll happened to notice the head move.
+	// Zero means unknown.
+	LatestCloseTime time.Time
 	// Oldest is the oldest ledger the server still retains. Data before this
 	// point has been pruned and is unrecoverable — the only way a gap can
 	// occur.

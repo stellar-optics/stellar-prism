@@ -97,9 +97,9 @@ func (s *WASMSource) Fetch(ctx context.Context, cursor string) (Batch, error) {
 	out := Batch{
 		Records:    make([]Record, 0, len(batch.Records)),
 		NextCursor: batch.NextCursor,
-		Latest:     batch.Latest,
-		Oldest:     batch.Oldest,
-		Full:       batch.Full,
+		Latest:     batch.Latest, LatestCloseTime: batch.LatestCloseTime,
+		Oldest: batch.Oldest,
+		Full:   batch.Full,
 	}
 	for i := range batch.Records {
 		record := &batch.Records[i]

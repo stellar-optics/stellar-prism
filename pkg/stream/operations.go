@@ -55,7 +55,7 @@ func (s *OperationSource) Fetch(ctx context.Context, cursor string) (Batch, erro
 	if err != nil {
 		return Batch{}, err
 	}
-	out := Batch{NextCursor: batch.NextCursor, Latest: batch.Latest, Oldest: batch.Oldest, Full: batch.Full}
+	out := Batch{NextCursor: batch.NextCursor, Latest: batch.Latest, LatestCloseTime: batch.LatestCloseTime, Oldest: batch.Oldest, Full: batch.Full}
 	for _, record := range batch.Records {
 		if record.Transaction == nil || record.Transaction.EnvelopeXDR == "" {
 			continue
