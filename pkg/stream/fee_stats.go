@@ -289,6 +289,7 @@ func feeDistribution(values []int64) *FeeDistribution {
 		P10:  nearestRank(sorted, 10),
 		P50:  nearestRank(sorted, 50),
 		P90:  nearestRank(sorted, 90),
+		P95:  nearestRank(sorted, 95),
 		P99:  nearestRank(sorted, 99),
 		Max:  sorted[len(sorted)-1],
 	}

@@ -83,8 +83,11 @@ type streamFlags struct {
 	rotateCompress bool
 	rotateKeep     int
 
-	stateFile     string
-	resume        bool
+	stateFile string
+	resume    bool
+	// state selects and bounds this stream's partition of a shared
+	// --state-file; see flags.go.
+	state         stateFlags
 	pruneInterval time.Duration
 	pruneKeep     int
 	pruneMaxAge   time.Duration
@@ -113,6 +116,8 @@ type streamFlags struct {
 	haHeartbeat time.Duration
 	// haTTL is how long the lease stays valid without a renewal.
 	haTTL time.Duration
+	// haStandbyPoll is how often a standby asks for the lease.
+	haStandbyPoll time.Duration
 
 	// healthPort is the port the liveness and readiness probes are served
 	// on. Zero leaves them off.
@@ -156,6 +161,7 @@ type streamFlags struct {
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
+	before := flagNames(cmd)
 	cmd.Flags().BoolVarP(&s.follow, "follow", "f", false,
 		"keep streaming as new ledgers close, like tail -f")
 	cmd.Flags().Uint32Var(&s.from, "from", 0,
@@ -252,6 +258,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how often the leader renews the lease")
 	cmd.Flags().DurationVar(&s.haTTL, "ha-ttl", stream.DefaultHATTL,
 		"how long the lease stays valid without a renewal")
+	cmd.Flags().DurationVar(&s.haStandbyPoll, "ha-standby-poll", stream.DefaultHAStandbyPoll,
+		"how often a standby polls for the lease; bounds failover time after the leader exits")
 	cmd.Flags().IntVar(&s.healthPort, "health-port", 0,
 		"serve /healthz, /readyz and /metrics on this port (0 disables the health server)")
 	cmd.Flags().Uint32Var(&s.maxLag, "max-lag", 0,
@@ -278,6 +286,7 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"AMQP routing key (default: the queue name)")
 	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
 	s.sinks.register(cmd)
+	s.registerStateFlags(cmd, before)
 }
 
 // validate checks the stream options before anything is fetched.
@@ -379,6 +388,9 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if err := s.validateState(cmd); err != nil {
 		return err
 	}
+	if err := s.validateStateFlags(cmd); err != nil {
+		return err
+	}
 	if err := s.validateRuntime(); err != nil {
 		return err
 	}
@@ -408,6 +420,9 @@ func (s *streamFlags) validateRuntime() error {
 	}
 	if s.haTTL < 0 {
 		return fmt.Errorf("--ha-ttl must not be negative")
+	}
+	if s.haStandbyPoll < 0 {
+		return fmt.Errorf("--ha-standby-poll must not be negative")
 	}
 	if s.haHeartbeat > 0 && s.haTTL > 0 && s.haTTL < 2*s.haHeartbeat {
 		// A lease that expires before the leader could renew it would be
@@ -1391,10 +1406,23 @@ func runStream(
 			}
 		}
 	} else if sf.stateFile != "" {
-		file, err := stream.OpenStateFile(sf.stateFile)
+		streamID := sf.resolveStreamID(cmd, g.network)
+		file, err := stream.OpenStateFileWithOptions(sf.stateFile, stream.StateFileOptions{
+			StreamID:  streamID,
+			Retention: sf.state.retention,
+		})
 		if err != nil {
 			return err
 		}
+		if !sf.quiet && sf.verbosity > 0 {
+			fmt.Fprintf(stderr, "prism: state file %s, stream %s\n", file.Path(), streamID)
+		}
+		// History is pruned during saves, and also on a timer so a stream
+		// that goes quiet still has its old checkpoints compacted.
+		stopCompaction := file.StartCompaction(ctx, stream.DefaultStateCompactInterval, func(err error) {
+			fmt.Fprintf(stderr, "prism: compacting state file history: %v\n", err)
+		})
+		defer stopCompaction()
 		if sf.from != 0 {
 			saved, loadErr := file.Load()
 			if loadErr != nil {
