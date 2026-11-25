@@ -425,7 +425,7 @@ Default `--page-size`: **200**.
 |---|---|---|---|
 | `--contract` | strings | — | contract ID to watch; repeatable, up to 5 |
 | `--contracts-file` | string | — | read and hot-reload contract IDs from this file (one per line) |
-| `--dedup-window` | int | — | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin) |
+| `--dedup-window` | int | `10000` | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables) |
 | `--exclude-contract` | strings | — | contract ID to exclude; repeatable |
 | `--exclude-topic` | stringArray | — | topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable |
 | `--fanout-dir` | string | — | write each watched contract's events to its own NDJSON file in this directory, in addition to the main output |
@@ -445,7 +445,7 @@ prism events --contract CBGSB... --follow
 prism events --contract CBGSB... --topic 'AAAAAQ==,*' --limit 20
 
 # Client-side predicate over decoded payloads
-prism events --filter-expr 'value.amount > 1000000000 && topics[0].symbol == "transfer"'
+prism events --filter-expr 'value.amount > 1000000000 && contains(topic[0], "transfer")'
 
 # Hot-reloaded watchlist plus a topic regex
 prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*' --follow
@@ -474,7 +474,7 @@ Default `--page-size`: **200**.
 |---|---|---|---|
 | `--contract` | strings | — | contract ID to watch; repeatable, up to 5 |
 | `--contracts-file` | string | — | read and hot-reload contract IDs from this file (one per line) |
-| `--dedup-window` | int | — | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin) |
+| `--dedup-window` | int | `10000` | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables) |
 | `--exclude-contract` | strings | — | contract ID to exclude; repeatable |
 | `--exclude-topic` | stringArray | — | topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable |
 | `--fanout-dir` | string | — | write each watched contract's events to its own NDJSON file in this directory, in addition to the main output |
