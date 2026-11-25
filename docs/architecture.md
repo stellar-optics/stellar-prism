@@ -697,6 +697,10 @@ nothing listening or running. `internal/cli.ProfilerFactory` is the seam: the
 binary supplies the real implementation, while tests use a fake to assert the
 flag wiring and cleanup without opening a socket.
 
+For reading profiles, the `sync.Pool` usage in the hot path and
+`GOGC`/`GOMEMLIMIT` guidance for containers, see
+[docs/performance/tuning_and_profiling.md](performance/tuning_and_profiling.md).
+
 ## Graceful drain (`Tailer.Drain`)
 
 On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives
@@ -840,6 +844,10 @@ Passing more than one source is an error rather than a silently ignored flag:
 an operator who believes the file is encrypted with a passphrase must never
 end up with a file encrypted with something else.
 
+The operator guide, with KMS key setup, the exact AWS and GCP IAM
+permissions, key rotation and the tamper-detection model, is
+[docs/security/kms_and_state_encryption.md](security/kms_and_state_encryption.md).
+
 ## Derived transaction streams
 
 Soroban RPC has no dedicated endpoints for storage mutations or deployments.
@@ -852,8 +860,12 @@ guarantee apply unchanged.
 `StorageChangeSource` decodes `ResultMetaXDR` and emits one record per
 contract-related ledger entry mutation: `contract_data`, `contract_code` or
 `ttl`, with change type `created` / `updated` / `removed` / `restored`.
-Filters (`--contract`, `--change`, `--entry`) are validated up front so a
-typo fails immediately rather than streaming nothing.
+Filters (`--contract`, `--change`, `--entry`, `--key`) are validated up front
+so a typo fails immediately rather than streaming nothing. `--key` matches
+contract data by its storage key (a base64 XDR ScVal; `AAAAFA==` is the
+instance key). The record schema, durability types, state diffing and TTL
+projections are covered in
+[docs/guides/storage_change_streaming.md](guides/storage_change_streaming.md).
 
 ### WASM uploads and deployments (`prism wasm`)
 
@@ -1285,7 +1297,8 @@ On the reference CI machine the raw tailer path is well above the target
 (roughly 1.4M events/s in a normal build, ~370 bytes/event); the dedup path is
 roughly 0.7M events/s at ~423 bytes/event. These numbers are diagnostics, not
 contracts — the contract is the test's 50,000 events/s floor and allocation
-ceiling.
+ceiling. Current baseline tables and a `benchstat` workflow are in
+[docs/benchmarks.md](benchmarks.md).
 
 ## Relationship to stellar-xdr-lens
 

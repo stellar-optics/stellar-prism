@@ -517,6 +517,26 @@ resource fees (see [docs/guides/offline_simulation.md](docs/guides/offline_simul
 prism simulate --tx-envelope AAA... --follow --json
 ```
 
+### `prism storage` - contract storage changes and TTL
+
+Streams contract data, contract code and TTL mutations decoded from
+transaction metadata, with `--key` to follow one storage key (see
+[docs/guides/storage_change_streaming.md](docs/guides/storage_change_streaming.md)):
+
+```sh
+# Admin/config (instance storage) changes of one contract
+prism storage --contract CBGSB... --key AAAAFA== --follow --json
+```
+
+### `prism serve --serve-grpc` - gRPC event streaming
+
+Serves live events as a gRPC `PrismStream` service for Go, Python, Rust or
+Java consumers (see [docs/integration/grpc_streaming.md](docs/integration/grpc_streaming.md)):
+
+```sh
+prism serve --serve-grpc 127.0.0.1:50051 --contract CBGSB...
+```
+
 ### `prism aggregate` - windowed event and throughput analytics
 
 Aggregates Soroban contract events into epoch-aligned tumbling time windows
@@ -527,6 +547,14 @@ ledger throughput and fee analytics (see
 ```sh
 prism aggregate --contract CDLZF... --window 1m --metric count --follow --json
 ```
+
+### Operating at scale
+
+- Encrypting `--state-file` with AWS/GCP KMS:
+  [docs/security/kms_and_state_encryption.md](docs/security/kms_and_state_encryption.md)
+- Profiling with `--pprof-port` and tuning `GOGC`/`GOMEMLIMIT`:
+  [docs/performance/tuning_and_profiling.md](docs/performance/tuning_and_profiling.md)
+  (baselines in [docs/benchmarks.md](docs/benchmarks.md))
 
 ### Migrating from Horizon SSE
 
