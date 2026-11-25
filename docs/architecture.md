@@ -410,12 +410,13 @@ The engine is stateless: compilation happens before the stream starts, and
 `Match` is a pure function of the record. That keeps the evaluator offline-
 first and trivially testable without a network or a process.
 
-Supported context fields are `value`, `topics`, `contract`, `type`, `tx`,
-`ledger`, `txIndex` and `opIndex`. `value` and `topics` are decoded from XDR
-through lens, so `value.amount`, `topics[0].symbol` and nested map fields are
-all reachable. Operators follow Go syntax: arithmetic (`+`, `-`, `*`, `/`, `%`),
-comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean logic (`&&`, `||`, `!`),
-indexing (`topics[0]`) and parentheses.
+Supported context fields are `value`, `topics` (or `topic`), `contract`,
+`type`, `tx`, `ledger`, `txIndex` and `opIndex`. `value` and topics are decoded
+from XDR through lens, so `value.amount`, `topics[0].symbol`, the shorthand
+`topic[0]`, and nested map fields are all reachable. Operators follow Go syntax:
+arithmetic (`+`, `-`, `*`, `/`, `%`), comparison (`==`, `!=`, `<`, `<=`, `>`,
+`>=`), boolean logic (`&&`, `||`, `!`), indexing and parentheses.
+`contains(container, value)` checks for a substring, list item or object key.
 
 The rule engine wraps one or more compiled `stream.ExpressionFilter` predicates.
 Each predicate is matched in order; a record that any rule rejects is dropped,
@@ -450,17 +451,18 @@ so a fanout run terminates with no leaked goroutines and a joined error.
 
 `--dedup-window N` wraps the event sink in `stream.DedupSink`, which
 suppresses a record whose fingerprint was already emitted within the last `N`
-keys. The window is a fixed-size ring (`dedup.go`): the oldest key is evicted
-when a new one arrives, so memory is bounded by count rather than by traffic
-or elapsed time, and a hot contract cannot grow it without bound. A zero
-window disables the wrapper entirely.
+keys. The default is 10,000; a zero window disables the wrapper entirely. The
+window is a fixed-size ring (`dedup.go`): the oldest key is evicted when a new
+one arrives, so memory is bounded by count rather than by traffic or elapsed
+time, and a hot contract cannot grow it without bound.
 
 The fingerprint prefers the server's event ID, because a re-poll after a
 reconnect replays the same ID while two genuinely distinct events can carry
 byte-identical topics and values. Records without an ID fall back to a
 content hash over the event locator and payload. De-duplication lives at the
 sink seam, like pattern filtering, so the cursor still advances across a
-suppressed record and the tailer's delivery guarantee is unchanged.
+suppressed record and the tailer's delivery guarantee is unchanged. An
+intentional rewind clears the cache so replayed records can be delivered again.
 
 For key/hash computation details, `--dedup-window` memory sizing formulas,
 and window selection guidelines, see

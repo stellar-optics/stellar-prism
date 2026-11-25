@@ -8,13 +8,13 @@ import (
 	"strings"
 )
 
-// DefaultDedupWindow is the number of event fingerprints remembered by
-// --dedup-window when a caller asks for deduplication without naming a size.
+// DefaultDedupWindow is the default number of event fingerprints retained by
+// prism events' --dedup-window.
 //
 // One page of events is 200 records, and a re-poll after a reconnect replays
 // at most the last page, so a window significantly larger than a page keeps
 // the whole replay inside memory while staying fixed and small.
-const DefaultDedupWindow = 4096
+const DefaultDedupWindow = 10_000
 
 // Dedup is a fixed-capacity, memory-bounded deduplicator: a ring buffer of
 // recently seen keys backed by a set for O(1) lookups.
@@ -44,9 +44,14 @@ type Dedup struct {
 	seen map[string]struct{}
 	// next is the slot the next insertion overwrites.
 	next int
+	// filled distinguishes unused slots from valid empty keys.
+	filled int
 	// dropped counts duplicate keys refused since construction.
 	dropped int
 }
+
+// EventDedupCache is the event-oriented name for Dedup.
+type EventDedupCache = Dedup
 
 // NewDedup returns a Dedup retaining at most capacity keys.
 //
@@ -64,6 +69,12 @@ func NewDedup(capacity int) *Dedup {
 		ring:     make([]string, capacity),
 		seen:     make(map[string]struct{}, capacity),
 	}
+}
+
+// NewEventDedupCache returns an event deduplication cache retaining at most
+// capacity event IDs.
+func NewEventDedupCache(capacity int) *EventDedupCache {
+	return NewDedup(capacity)
 }
 
 // Cap reports the maximum number of keys the Dedup retains. A disabled Dedup
@@ -104,8 +115,11 @@ func (d *Dedup) Allow(key string) bool {
 	// The slot about to be overwritten holds the oldest key, so evict it
 	// before inserting. This is what keeps the set and the ring in step and
 	// memory bounded.
-	if old := d.ring[d.next]; old != "" {
+	if d.filled == d.capacity {
+		old := d.ring[d.next]
 		delete(d.seen, old)
+	} else {
+		d.filled++
 	}
 	d.ring[d.next] = key
 	d.seen[key] = struct{}{}
@@ -133,6 +147,7 @@ func (d *Dedup) Reset() {
 	}
 	clear(d.ring)
 	d.next = 0
+	d.filled = 0
 }
 
 // EventKey derives the de-duplication fingerprint of an event record.
@@ -242,6 +257,9 @@ func (s *DedupSink) Flush() error { return s.inner.Flush() }
 
 // Dropped reports how many duplicate events this sink has suppressed.
 func (s *DedupSink) Dropped() int { return s.dedup.Dropped() }
+
+// Reset forgets retained fingerprints while preserving the dropped count.
+func (s *DedupSink) Reset() { s.dedup.Reset() }
 
 // String describes the window for diagnostics.
 func (s *DedupSink) String() string {

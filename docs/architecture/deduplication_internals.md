@@ -11,7 +11,7 @@ This guide explains the two-tier deduplication design, how event keys and conten
 Deduplication in `stellar-prism` operates at two complementary layers:
 
 1. **Tailer high-water mark ([`pkg/stream/tail.go`](../../pkg/stream/tail.go))**: Always active. Every `stream.Record` carries a fixed-width, zero-padded `ID` (for Soroban RPC events, `<toid>-<eventIndex>`, e.g., `0017037362169118720-0000000000`). The tailer keeps the highest emitted `lastID` and suppresses any incoming record with `r.ID <= t.lastID` in $O(1)$ memory, counting it under `Stats.Duplicates`.
-2. **Sink-seam ring buffer ([`pkg/stream/dedup.go`](../../pkg/stream/dedup.go))**: Opt-in via `--dedup-window N` on `prism events` (disabled when `0`, or `DefaultDedupWindow = 4096` when enabled at the default window). `stream.DedupSink` wraps the output sink and retains the last `N` seen event keys in a bounded ring buffer backed by an $O(1)$ lookup set.
+2. **Sink-seam ring buffer ([`pkg/stream/dedup.go`](../../pkg/stream/dedup.go))**: Enabled by default with `--dedup-window 10000` on `prism events` (disabled when set to `0`). `stream.DedupSink` wraps the output sink and retains the last `N` seen event keys in a bounded ring buffer backed by an $O(1)$ lookup set.
 
 `DedupSink` sits on the **output seam** (between `Tailer` and downstream sinks, after client-side `--topic-pattern` filtering when configured) rather than inside `Tailer` itself:
 
@@ -133,17 +133,17 @@ Using conservative planning constants ($B_{\text{map}} = 36\text{ B}$):
 - **Content-hash fallback keys** ($S_{\text{alloc}} = 224\text{ B}$):
   $$M_{\text{content}}(N) \approx 276 \cdot N \text{ bytes} \quad (\approx 0.27\text{ KB per entry})$$
 
-*(Note: During initial stream warm-up, transient per-event allocations from `EventKey` string construction also occur; the built-in `BenchmarkDedupSinkFiftyThousandEvents` in `pkg/stream/bench_test.go` measures ~423 bytes/event total transient allocation across 50,000 events with `DefaultDedupWindow = 4096`, which is reclaimed by GC.)*
+*(Note: During initial stream warm-up, transient per-event allocations from `EventKey` string construction also occur; the built-in `BenchmarkDedupSinkFiftyThousandEvents` in `pkg/stream/bench_test.go` measures ~423 bytes/event total transient allocation across 50,000 events with the default cache size, which is reclaimed by GC.)*
 
 ### Table 1: Direct `--dedup-window` Memory Footprint
 
 | `--dedup-window` (`N`) | Ring Array (`16·N`) | Map Index (`~36·N`) | Total RAM (RPC ID Keys, `~100 B/entry`) | Total RAM (Content Hash, `~276 B/entry`) | Operational Role |
 |---|---|---|---|---|---|
-| `0` (default) | `0 B` | `0 B` | `0 B` | `0 B` | Disabled; relies solely on `Tailer.lastID` |
+| `0` | `0 B` | `0 B` | `0 B` | `0 B` | Disabled; relies solely on `Tailer.lastID` |
 | `100` | `1.6 KB` | `3.5 KB` | `~9.8 KB` | `~27.0 KB` | Minimal single-batch replay guard |
 | `1,000` | `15.6 KB` | `35.2 KB` | `~97.7 KB` | `~269.5 KB` | Light contract stream (~5 full RPC pages) |
-| `4,096` (`DefaultDedupWindow`) | `64.0 KB` | `144.0 KB` | `~400.0 KB` | `~1.10 MB` | Recommended general default (~20 RPC pages) |
-| `10,000` | `156.3 KB` | `351.6 KB` | `~976.6 KB` | `~2.63 MB` | Multi-contract or noisy token stream |
+| `4,096` | `64.0 KB` | `144.0 KB` | `~400.0 KB` | `~1.10 MB` | Moderate replay window (~20 RPC pages) |
+| `10,000` (`DefaultDedupWindow`) | `156.3 KB` | `351.6 KB` | `~976.6 KB` | `~2.63 MB` | Default multi-page replay window |
 | `50,000` | `781.3 KB` | `1.72 MB` | `~4.77 MB` | `~13.16 MB` | High-throughput DEX / bridge indexing |
 | `100,000` | `1.53 MB` | `3.43 MB` | `~9.54 MB` | `~26.32 MB` | Multi-hour replay cushion at moderate rate |
 | `1,000,000` | `15.26 MB` | `34.33 MB` | `~95.37 MB` | `~263.21 MB` | Upper practical in-process ceiling |
@@ -190,8 +190,8 @@ As a result, `stellar-prism` does not need a deep "re-org rollback buffer" to un
 
 | Scenario | Recommended `--dedup-window` | Rationale |
 |---|---|---|
-| Single RPC endpoint, standard `--follow` | `0` (disabled) or `4096` | `Tailer.lastID` already prevents in-run page replays; `4096` (`DefaultDedupWindow`, ~400 KB) covers 20× a full 200-event page for ~0.4 MB. |
+| Single RPC endpoint, standard `--follow` | `10,000` (default) | `Tailer.lastID` already prevents ordered in-run page replays; the cache also protects against duplicate IDs across overlapping responses. |
 | Multi-endpoint `--rpc-url` pool failover | `10000`–`50000` | Covers ~100–500 ledgers of moderate traffic (~1–5 MB) across lagging backup RPC nodes during failover. |
 | Active-passive HA (`--ha-lease-file`) | `4096`–`10000` | Note: `Dedup` state is in-memory and starts empty on standby promotion; pair a modest `--dedup-window` with `--state-file` + downstream `id`-keyed upserts. |
 | Custom / hand-built sources without `Record.ID` | `>= 2 × batch_size` (e.g. `4096`) | Activates the `ev:content:...:<sha256>` fallback fingerprint so replayed pages without IDs are still suppressed. |
-| Intentional reprocessing with `--rewind` / `SIGUSR2` | `0` (disabled) | **Important:** `--rewind` resets `Tailer.lastID` so historical records can be re-emitted, but `DedupSink` retains its ring buffer across rewinds. Leave `--dedup-window 0` if rewound records must reach downstream sinks again. |
+| Intentional reprocessing with `--rewind` / `SIGUSR2` | `10,000` (default) | The CLI clears the sink cache when a rewind is applied, so the requested historical records can be delivered again. |

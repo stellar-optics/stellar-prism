@@ -12,6 +12,7 @@ func TestExpressionFilterArithmeticStringsAndNestedFields(t *testing.T) {
 	context := map[string]any{
 		"value":    map[string]any{"amount": int64(150), "asset": map[string]any{"code": "USD"}},
 		"topics":   []any{map[string]any{"symbol": "transfer"}},
+		"topic":    []any{"transfer"},
 		"contract": "C123",
 	}
 	cases := []struct {
@@ -20,6 +21,7 @@ func TestExpressionFilterArithmeticStringsAndNestedFields(t *testing.T) {
 	}{
 		{`value.amount * 2 > 100 && value.asset.code == "USD"`, true},
 		{`topics[0].symbol == "transfer" && contract != "C456"`, true},
+		{`topic[0] == "transfer" && contains(topic[0], "fer")`, true},
 		{`value.amount + 3 < 100`, false},
 	}
 	for _, tc := range cases {
@@ -39,6 +41,45 @@ func TestExpressionFilterArithmeticStringsAndNestedFields(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestExpressionFilterReadsScValTopicsAndValue(t *testing.T) {
+	t.Parallel()
+
+	symbol, err := xdr.NewScVal(xdr.ScValTypeScvSymbol, xdr.ScSymbol("transfer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	topic, err := xdr.MarshalBase64(symbol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := xdr.NewScVal(xdr.ScValTypeScvI128, xdr.Int128Parts{Hi: 0, Lo: xdr.Uint64(150)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := xdr.MarshalBase64(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	filter, err := CompileExpression(`topic[0] == "transfer" && value > 100`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matched, err := filter.Match(Record{
+		Kind: KindEvent,
+		Event: &Event{
+			TopicXDR: []string{topic},
+			ValueXDR: payload,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched {
+		t.Fatal("filter did not match the decoded topic and value")
 	}
 }
 

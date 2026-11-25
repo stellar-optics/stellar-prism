@@ -990,8 +990,8 @@ start the next run where the last one stopped.`,
 		"contract ID to exclude; repeatable")
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
-	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", 0,
-		"drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin)")
+	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", stream.DefaultDedupWindow,
+		"drop re-polled duplicate events, remembering this many recent fingerprints (default 10000; 0 disables)")
 	cmd.Flags().Float64Var(&sf.sampleRate, "sample-rate", 0,
 		"fraction of matching events to emit deterministically (0.0 to 1.0; 0 disables)")
 	cmd.Flags().Float64Var(&sf.maxRate, "max-rate", 0,
@@ -1435,6 +1435,9 @@ func runStream(
 		controller := stream.NewRewindController()
 		opts.Rewind = controller
 		opts.OnRewind = func(target stream.RewindTarget) {
+			if dedupOut != nil {
+				dedupOut.Reset()
+			}
 			if !sf.quiet {
 				fmt.Fprintf(stderr, "prism: rewound %d ledgers back to ledger %d\n",
 					target.Back, target.Ledger)

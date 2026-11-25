@@ -441,8 +441,8 @@ $ prism transactions --status failed --limit 1 --json
 
 Event streams can additionally drop re-polled duplicates with
 `--dedup-window`: a bounded ring remembers the last N event fingerprints and
-suppresses a replay without growing with traffic. It is off by default; `4096`
-covers a page with margin.
+suppresses a replay without growing with traffic. The default window is 10,000
+event IDs; set `--dedup-window 0` to disable the extra cache.
 
 ### `prism tx` — why did this transaction fail?
 Fetches a transaction and renders it through the lens explain path, pairing the
