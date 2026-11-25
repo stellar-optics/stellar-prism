@@ -5,12 +5,23 @@ package prism.v1;
 option go_package = "github.com/stellar-optics/stellar-prism/proto;prismpb";
 
 // PrismStream exposes typed event and ledger subscriptions.
+//
+// Served by `prism serve --serve-grpc ADDR` (pkg/sink/grpc.go). Subscriptions
+// are live-only with a bounded per-client queue. Client integration guide with
+// Go and Python examples: docs/integration/grpc_streaming.md
 service PrismStream {
   rpc StreamEvents(EventRequest) returns (stream EventResponse);
   rpc StreamLedgers(LedgerRequest) returns (stream LedgerResponse);
 }
 
+// EventRequest selects events. An empty contract_id streams every event the
+// server emits; otherwise only events from that exact strkey contract ID.
+// Topic filtering is configured server-side with `prism serve --topic`.
 message EventRequest { string contract_id = 1; }
+// LedgerRequest is reserved for ledger subscriptions; from_ledger is not yet
+// honoured (subscriptions are live-only).
 message LedgerRequest { uint32 from_ledger = 1; }
+// record_json is the record encoded exactly like a `prism events --json --raw`
+// NDJSON line.
 message EventResponse { string id = 1; uint32 ledger = 2; int64 closed_at_unix_ms = 3; bytes record_json = 4; }
 message LedgerResponse { string id = 1; uint32 ledger = 2; int64 closed_at_unix_ms = 3; bytes record_json = 4; }

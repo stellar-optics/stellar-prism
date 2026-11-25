@@ -161,6 +161,7 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 	var servers []*http.Server
 	var listeners []net.Listener
 	var grpcServers []*grpc.Server
+	var grpcSinks []*sink.GRPCSink
 	cleanup := func() {
 		for _, e := range endpoints {
 			if err := e.close(); err != nil {
@@ -176,6 +177,12 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 		}
 		for _, listener := range listeners {
 			_ = listener.Close()
+		}
+		// Closing the sinks ends every active StreamEvents/StreamLedgers
+		// handler; GracefulStop waits for those handlers, so without this a
+		// connected client would keep shutdown waiting indefinitely.
+		for _, s := range grpcSinks {
+			_ = s.Close()
 		}
 		for _, server := range grpcServers {
 			server.GracefulStop()
@@ -210,6 +217,7 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 		prismpb.RegisterPrismStreamServer(server, grpcSink)
 		listeners = append(listeners, listener)
 		grpcServers = append(grpcServers, server)
+		grpcSinks = append(grpcSinks, grpcSink)
 		combined.broadcasts = append(combined.broadcasts, grpcSink)
 		go func() {
 			if err := server.Serve(listener); err != nil {
