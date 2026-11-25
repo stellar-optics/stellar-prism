@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stellar-optics/stellar-prism/pkg/stream"
 	"go.yaml.in/yaml/v3"
+
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // ruleEngine wraps compiled stream.ExpressionFilter predicates behind a small
