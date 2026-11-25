@@ -20,9 +20,10 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
+
 	"github.com/stellar-optics/stellar-prism/pkg/sink"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
-	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 )
 
 // replayFlags holds options specific to the `prism replay` command.
