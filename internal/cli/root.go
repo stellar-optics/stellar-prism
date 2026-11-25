@@ -56,20 +56,36 @@ func newClientWithTransport(urls []string, timeout time.Duration, transport http
 }
 
 // client resolves the configured endpoints and builds the client every
-// command shares. When a wire log is requested the logger is installed as the
-// HTTP transport, so it observes the same requests the SDK sends.
+// command shares. When custom headers or a wire log are requested, the
+// corresponding HTTP transports wrap the SDK's transport so every endpoint in a
+// single client or failover pool sees them.
 func client(g *globalFlags, stderr io.Writer) (rpc.Client, func(), error) {
+	headers, err := rpc.ResolveHeaders(g.headers)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	wire, closeWire, err := g.openWireLog(stderr)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	urls := rpc.ResolveURLs(g.rpcURLs)
+	var transport http.RoundTripper
+	if wire != nil {
+		transport = wire
+	}
+	if len(headers) > 0 {
+		// Wrap the wire logger so it records (and redacts) the custom headers
+		// that actually go out on the wire.
+		transport = rpc.NewHeaderTransport(transport, headers)
+	}
+
 	var c rpc.Client
-	if wire == nil {
+	if transport == nil {
 		c, err = newClient(urls, g.timeout)
 	} else {
-		c, err = newClientWithTransport(urls, g.timeout, wire)
+		c, err = newClientWithTransport(urls, g.timeout, transport)
 	}
 	if err != nil {
 		closeWire()
@@ -182,6 +198,9 @@ type globalFlags struct {
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
 	// Repeating the flag builds a failover pool.
 	rpcURLs []string
+	// headers specifies custom HTTP headers ("Key: Value") attached to every
+	// outgoing RPC request.
+	headers []string
 	// timeout bounds a single RPC call.
 	timeout        time.Duration
 	highlightRegex string
@@ -296,6 +315,8 @@ redacted before anything is written.`,
 				if _, err := CompileHighlighter(g.highlightRegex); err != nil {
 					return fmt.Errorf("invalid --highlight-regex: %w", err)
 				}
+			if _, err := rpc.ParseHeaders(g.headers); err != nil {
+				return err
 			}
 			if err := g.validateWireLog(cmd); err != nil {
 				return err
@@ -320,6 +341,8 @@ redacted before anything is written.`,
 		"load dynamic event alert rules from a YAML file")
 	root.PersistentFlags().StringArrayVar(&g.rpcURLs, "rpc-url", nil,
 		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
+	root.PersistentFlags().StringArrayVarP(&g.headers, "header", "H", nil,
+		`custom HTTP header ("Key: Value") attached to RPC requests; repeat for multiple headers (env $`+rpc.HeadersEnvVar+`)`)
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
 	root.PersistentFlags().StringVar(&g.wireLog, "wire-log", "",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -177,11 +178,17 @@ func (s *EventSource) Fetch(ctx context.Context, cursor string) (Batch, error) {
 		}
 	}
 	groups := splitContractIDs(ids)
-	merged := Batch{Records: []Record{}}
-	seen := make(map[string]struct{})
+	initialCapacity := int(s.query.PageLimit)
+	if s.query.PageLimit > DefaultPageLimit {
+		initialCapacity = DefaultPageLimit
+	}
+	merged := Batch{Records: getRecordBuffer(initialCapacity)}
+	seen := getEventIDSet()
+	defer putEventIDSet(seen)
 	for _, group := range groups {
 		batch, err := s.fetchGroup(ctx, cursor, group)
 		if err != nil {
+			putRecordBuffer(merged.Records)
 			return Batch{}, err
 		}
 		if batch.Latest > merged.Latest {
@@ -207,6 +214,10 @@ func (s *EventSource) Fetch(ctx context.Context, cursor string) (Batch, error) {
 		merged.NextCursor = cursor
 	}
 	return merged, nil
+}
+
+func (s *EventSource) releaseRecords(records []Record) {
+	putRecordBuffer(records)
 }
 
 func splitContractIDs(ids []string) [][]string {
@@ -288,11 +299,18 @@ func eventRecord(e protocol.EventInfo) Record {
 }
 
 func eventIndex(id string) uint32 {
-	c, err := protocol.ParseCursor(id)
+	toid, event, ok := strings.Cut(id, "-")
+	if !ok || strings.Contains(event, "-") {
+		return 0
+	}
+	if _, err := strconv.ParseInt(toid, 10, 64); err != nil {
+		return 0
+	}
+	index, err := strconv.ParseUint(event, 10, 32)
 	if err != nil {
 		return 0
 	}
-	return c.Event
+	return uint32(index)
 }
 
 // filters builds the single server-side filter prism uses.

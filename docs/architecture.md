@@ -456,6 +456,10 @@ content hash over the event locator and payload. De-duplication lives at the
 sink seam, like pattern filtering, so the cursor still advances across a
 suppressed record and the tailer's delivery guarantee is unchanged.
 
+For key/hash computation details, `--dedup-window` memory sizing formulas,
+and window selection guidelines, see
+[docs/architecture/deduplication_internals.md](architecture/deduplication_internals.md).
+
 ### Adaptive polling
 
 `--adaptive` replaces the fixed `--poll` wait with an `AdaptivePoller`
@@ -1265,6 +1269,7 @@ path; the reported `events/op` makes the scale explicit, and the custom
 | `BenchmarkDedupSinkFiftyThousandEvents` | fingerprinting plus the bounded de-duplication ring |
 | `BenchmarkReorderBufferFiftyThousandEvents` | per-ledger sorting and release |
 | `BenchmarkEventKeyFiftyThousandEvents` | the de-duplication key itself |
+| `BenchmarkEventPipelineAllocations` | RPC event mapping, ID de-duplication and pooled page buffers |
 
 The benchmarks use a fixed in-memory source and no wall-clock waits, so they
 make no network calls and produce the same record IDs on every run. `TestStreamingFiftyThousandEvents`

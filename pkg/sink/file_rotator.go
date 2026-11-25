@@ -47,6 +47,9 @@ type RotatorOptions struct {
 // Keeping whole records in one file would require buffering each record,
 // which for a large ledger payload would trade the very memory bound rotation
 // exists to provide.
+//
+// See docs/sinks/file_rotation_and_syslog.md for CLI rotation flags and
+// external logrotate configurations.
 type RotatingWriter struct {
 	path string
 	opts RotatorOptions

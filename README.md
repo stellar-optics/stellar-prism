@@ -511,11 +511,29 @@ prism transactions --detect-conflicts --follow --json
 
 Re-simulates a base64 transaction envelope as the chain head advances and
 reports changes to return values, instructions, memory bytes, and minimum
-resource fees:
+resource fees (see [docs/guides/offline_simulation.md](docs/guides/offline_simulation.md)):
 
 ```sh
 prism simulate --tx-envelope AAA... --follow --json
 ```
+
+### `prism aggregate` - windowed event and throughput analytics
+
+Aggregates Soroban contract events into epoch-aligned tumbling time windows
+(`10s`, `30s`, `1m`, `5m`, `15m`, `1h`) and pairs with `prism fee-stats` for
+ledger throughput and fee analytics (see
+[docs/guides/multi_stream_aggregation.md](docs/guides/multi_stream_aggregation.md)):
+
+```sh
+prism aggregate --contract CDLZF... --window 1m --metric count --follow --json
+```
+
+### Migrating from Horizon SSE
+
+Transitioning an existing Horizon `/ledgers`, `/transactions`, or `/payments`
+indexer to Soroban RPC and `stellar-prism` (including side-by-side examples and
+using the built-in `HorizonSSESource` bridge)? See
+[docs/migration/from_horizon_sse.md](docs/migration/from_horizon_sse.md).
 
 ## What prism guarantees
 
@@ -607,7 +625,8 @@ before v1.0.
 - Optional cursor journal (`--state-file`) with background pruning, and
   `--resume` to continue from it. Still not exactly-once across restarts.
 - Covered twice: by an offline suite with no network, and by an opt-in
-  end-to-end run against a local Quickstart network (`make test-e2e`).
+  end-to-end run against a local Quickstart network (`make test-e2e`; see
+  the [local Quickstart testing guide](docs/development/local_quickstart_testing.md)).
 
 See [docs/roadmap.md](docs/roadmap.md).
 

@@ -3,6 +3,7 @@ package rpc
 import (
 	"net/http"
 	"net/url"
+	"slices"
 	"testing"
 )
 
@@ -114,5 +115,25 @@ func TestProxyKeepsOriginalHost(t *testing.T) {
 	if req.URL.Host != "rpc.example" || req.URL.Scheme != "https" {
 		t.Errorf("Proxy() rewrote the request to %s://%s, want the original target preserved",
 			req.URL.Scheme, req.URL.Host)
+	}
+}
+
+func TestApplyNewClientOptionsMergesHeaders(t *testing.T) {
+	t.Parallel()
+
+	options := applyNewClientOptions(
+		NewClientOption{
+			ProxyURL: "ftp://proxy.example:21",
+			Headers:  http.Header{"X-Api-Key": {"first"}, "X-Keep": {"yes"}},
+		},
+		NewClientOption{
+			Headers: http.Header{"x-api-key": {"second"}},
+		},
+	)
+	if !slices.Equal(options.headers["X-Api-Key"], []string{"second"}) {
+		t.Errorf("X-Api-Key = %v, want [second]", options.headers["X-Api-Key"])
+	}
+	if !slices.Equal(options.headers["X-Keep"], []string{"yes"}) {
+		t.Errorf("X-Keep = %v, want [yes]", options.headers["X-Keep"])
 	}
 }
