@@ -32,6 +32,11 @@ const maxMetadataLine = 1 << 20
 type FileMetadataStore struct {
 	path string
 	mu   sync.Mutex
+	// shared makes every write also hold an exclusive lock on
+	// <path>.lock, so several processes can append to and prune one
+	// journal without a prune's rewrite discarding another process's
+	// appends.
+	shared bool
 }
 
 // NewFileMetadataStore returns a store backed by the file at path.
@@ -55,8 +60,41 @@ func NewFileMetadataStore(path string) (*FileMetadataStore, error) {
 	return &FileMetadataStore{path: path}, nil
 }
 
+// NewSharedFileMetadataStore returns a store like NewFileMetadataStore whose
+// writes are also serialised across processes by an exclusive lock on
+// <path>.lock, for a journal several prism processes write under different
+// stream keys.
+func NewSharedFileMetadataStore(path string) (*FileMetadataStore, error) {
+	s, err := NewFileMetadataStore(path)
+	if err != nil {
+		return nil, err
+	}
+	s.shared = true
+	return s, nil
+}
+
 // Path returns the file the store writes to.
 func (s *FileMetadataStore) Path() string { return s.path }
+
+// withProcessLock runs fn holding the cross-process lock of a shared store.
+// The caller holds mu.
+func (s *FileMetadataStore) withProcessLock(fn func() error) (err error) {
+	if !s.shared {
+		return fn()
+	}
+	lockPath := s.path + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening cursor metadata lock %s: %w", lockPath, err)
+	}
+	defer func() {
+		err = errors.Join(err, unlockFile(f), f.Close())
+	}()
+	if err := lockFile(f, true, true); err != nil {
+		return fmt.Errorf("locking cursor metadata file %s: %w", s.path, err)
+	}
+	return fn()
+}
 
 // Append records one checkpoint.
 //
@@ -79,20 +117,22 @@ func (s *FileMetadataStore) Append(ctx context.Context, meta CursorMetadata) err
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("opening cursor metadata file %s: %w", s.path, err)
-	}
-	if _, err := f.Write(line); err != nil {
-		closeErr := f.Close()
-		return errors.Join(
-			fmt.Errorf("writing cursor metadata to %s: %w", s.path, err),
-			closeErr)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("closing cursor metadata file %s: %w", s.path, err)
-	}
-	return nil
+	return s.withProcessLock(func() error {
+		f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("opening cursor metadata file %s: %w", s.path, err)
+		}
+		if _, err := f.Write(line); err != nil {
+			closeErr := f.Close()
+			return errors.Join(
+				fmt.Errorf("writing cursor metadata to %s: %w", s.path, err),
+				closeErr)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("closing cursor metadata file %s: %w", s.path, err)
+		}
+		return nil
+	})
 }
 
 // Latest returns the most recent checkpoint recorded for key.
@@ -176,6 +216,18 @@ func (s *FileMetadataStore) Prune(ctx context.Context, policy PrunePolicy) (Prun
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var stats PruneStats
+	err := s.withProcessLock(func() error {
+		var err error
+		stats, err = s.pruneLocked(policy)
+		return err
+	})
+	return stats, err
+}
+
+// pruneLocked is Prune with mu (and, for a shared store, the process lock)
+// held.
+func (s *FileMetadataStore) pruneLocked(policy PrunePolicy) (PruneStats, error) {
 	counts, err := s.countRetained(policy)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
