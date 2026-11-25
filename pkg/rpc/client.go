@@ -140,6 +140,11 @@ func New(url string, timeout time.Duration) *SDKClient {
 	return NewWithTransport(url, timeout, nil)
 }
 
+// NewMulti initializes a FailoverRpcClient managing a pool across multiple endpoints.
+func NewMulti(urls []string, timeout time.Duration, opts ...FailoverOption) (*FailoverRpcClient, error) {
+	return NewFailoverRpcClient(urls, timeout, opts...)
+}
+
 // NewWithTransport returns a Client backed by the Stellar SDK that sends every
 // HTTP request through transport.
 //

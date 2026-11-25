@@ -311,6 +311,7 @@ redacted before anything is written.`,
 		"timeout for a single RPC call")
 	root.PersistentFlags().StringVar(&g.wireLog, "wire-log", "",
 		`write a debug NDJSON log of RPC requests and responses to this file, with Authorization and other credential headers redacted ("-" writes to stderr)`)
+	root.PersistentFlags().Lookup("wire-log").NoOptDefVal = "-"
 	root.PersistentFlags().Int64Var(&g.wireLogMaxBody, "wire-log-max-body", 0,
 		"maximum bytes of each body recorded by --wire-log (0 uses 1 MiB, -1 disables body capture)")
 	root.PersistentFlags().IntVar(&g.pprofPort, "pprof-port", 0,

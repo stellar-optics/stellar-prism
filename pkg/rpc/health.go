@@ -74,6 +74,70 @@ type HealthClient interface {
 
 var _ HealthClient = (*SDKClient)(nil)
 
+// HealthStatus represents the health evaluation of an RPC endpoint.
+type HealthStatus struct {
+	Status                string        `json:"status"`
+	LatestLedger          uint32        `json:"latestLedger"`
+	OldestLedger          uint32        `json:"oldestLedger"`
+	LedgerRetentionWindow uint32        `json:"ledgerRetentionWindow"`
+	LedgerLatency         time.Duration `json:"ledgerLatency"`
+	ProbeLatency          time.Duration `json:"probeLatency"`
+	Healthy               bool          `json:"healthy"`
+}
+
+// CheckHealth evaluates the health of the endpoint, verifying that
+// status is healthy and the ledger sequence is progressing.
+func (c *SDKClient) CheckHealth(ctx context.Context, opts ...HealthOption) (*HealthStatus, error) {
+	return CheckHealth(ctx, c, opts...)
+}
+
+// CheckHealth evaluates the health of client, verifying that status == "healthy"
+// and the ledger sequence is progressing within the configured max ledger age.
+func CheckHealth(ctx context.Context, client HealthClient, opts ...HealthOption) (*HealthStatus, error) {
+	checker, err := NewHealthChecker(client, opts...)
+	if err != nil {
+		return nil, err
+	}
+	report := checker.Check(ctx)
+	status := &HealthStatus{
+		Status:                report.Status,
+		LatestLedger:          report.LatestLedger,
+		OldestLedger:          report.OldestLedger,
+		LedgerRetentionWindow: report.LedgerRetentionWindow,
+		LedgerLatency:         report.LedgerLatency,
+		ProbeLatency:          report.ProbeLatency,
+		Healthy:               report.Healthy,
+	}
+	if !report.Healthy {
+		if report.Err != nil {
+			return status, report.Err
+		}
+		return status, ErrUnhealthyStatus
+	}
+	return status, nil
+}
+
+// CheckHealth evaluates health for HealthChecker and returns a HealthStatus.
+func (c *HealthChecker) CheckHealth(ctx context.Context) (*HealthStatus, error) {
+	report := c.Check(ctx)
+	status := &HealthStatus{
+		Status:                report.Status,
+		LatestLedger:          report.LatestLedger,
+		OldestLedger:          report.OldestLedger,
+		LedgerRetentionWindow: report.LedgerRetentionWindow,
+		LedgerLatency:         report.LedgerLatency,
+		ProbeLatency:          report.ProbeLatency,
+		Healthy:               report.Healthy,
+	}
+	if !report.Healthy {
+		if report.Err != nil {
+			return status, report.Err
+		}
+		return status, ErrUnhealthyStatus
+	}
+	return status, nil
+}
+
 // HealthReport is the outcome of one health check.
 //
 // Healthy is true only when the endpoint answered, reported "healthy", and its
