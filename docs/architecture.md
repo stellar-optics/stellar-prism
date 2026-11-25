@@ -456,6 +456,10 @@ content hash over the event locator and payload. De-duplication lives at the
 sink seam, like pattern filtering, so the cursor still advances across a
 suppressed record and the tailer's delivery guarantee is unchanged.
 
+For key/hash computation details, `--dedup-window` memory sizing formulas,
+and window selection guidelines, see
+[docs/architecture/deduplication_internals.md](architecture/deduplication_internals.md).
+
 ### Adaptive polling
 
 `--adaptive` replaces the fixed `--poll` wait with an `AdaptivePoller`

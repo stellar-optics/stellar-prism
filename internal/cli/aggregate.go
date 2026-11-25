@@ -21,6 +21,10 @@ import (
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
+// newAggregateCmd constructs the "prism aggregate" command.
+//
+// See docs/guides/multi_stream_aggregation.md for tumbling vs. sliding
+// window semantics, supported metrics, and throughput analytics pipelines.
 func newAggregateCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		sf          streamFlags

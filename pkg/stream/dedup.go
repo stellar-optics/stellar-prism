@@ -26,6 +26,10 @@ const DefaultDedupWindow = 4096
 // evicted before the new one is inserted, so Dedup never holds more than its
 // capacity.
 //
+// See docs/architecture/deduplication_internals.md for fingerprint and
+// content-hash computation details, memory sizing formulas, and window
+// selection guidelines.
+//
 // Dedup is not safe for concurrent use. It is driven by a single tailer
 // goroutine, and a sink wrapper is emitted from that same goroutine.
 type Dedup struct {
