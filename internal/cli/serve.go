@@ -24,6 +24,9 @@ func newServeCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	cmd.Short = "Broadcast live contract events over SSE or WebSocket"
 	cmd.Long = "Serve live contract events at /events over HTTP SSE or WebSocket. WebSockets also accept /ws."
 	cmd.Example = "  prism serve --ws 127.0.0.1:8081\n  prism serve --sse 127.0.0.1:8080 --contract CBGSB..."
+	var maxRestarts int
+	cmd.Flags().IntVar(&maxRestarts, "max-restarts", 0,
+		"maximum stream restarts after panics (0 means unlimited)")
 	flag := cmd.Flags().Lookup("follow")
 	flag.DefValue = "true"
 	if err := flag.Value.Set("true"); err != nil {
@@ -34,9 +37,89 @@ func newServeCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		if g.serveSSE == "" && g.serveWS == "" && g.serveGRPC == "" {
 			return fmt.Errorf("serve requires --sse, --ws or --serve-grpc")
 		}
-		return run(cmd, args)
+		return superviseServe(cmd.Context(), maxRestarts, stderr, func() error {
+			return run(cmd, args)
+		}, waitServeRestart)
 	}
 	return cmd
+}
+
+const (
+	initialServeRestartDelay = 5 * time.Second
+	maxServeRestartDelay     = 5 * time.Minute
+)
+
+func superviseServe(
+	ctx context.Context,
+	maxRestarts int,
+	stderr io.Writer,
+	run func() error,
+	wait func(context.Context, time.Duration) error,
+) error {
+	if maxRestarts < 0 {
+		return fmt.Errorf("--max-restarts must not be negative")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+
+	restarts := 0
+	for {
+		panicValue, panicked, err := runServeAttempt(run)
+		if !panicked {
+			return err
+		}
+		if maxRestarts > 0 && restarts >= maxRestarts {
+			return fmt.Errorf("serve: restart limit %d reached after panic: %v", maxRestarts, panicValue)
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("serve: interrupted after panic: %v", panicValue)
+		}
+
+		restarts++
+		delay := serveRestartDelay(restarts)
+		fmt.Fprintf(stderr, "prism: recovered panic in serve loop; restarting (%d) after %s: %v\n",
+			restarts, delay, panicValue)
+		if err := wait(ctx, delay); err != nil {
+			return fmt.Errorf("serve: waiting to restart after panic: %w", err)
+		}
+	}
+}
+
+func runServeAttempt(run func() error) (panicValue any, panicked bool, err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			panicValue = value
+			panicked = true
+		}
+	}()
+	err = run()
+	return nil, false, err
+}
+
+func serveRestartDelay(restarts int) time.Duration {
+	delay := initialServeRestartDelay
+	for i := 1; i < restarts && delay < maxServeRestartDelay; i++ {
+		delay *= 2
+		if delay > maxServeRestartDelay {
+			delay = maxServeRestartDelay
+		}
+	}
+	return delay
+}
+
+func waitServeRestart(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type broadcastOutput struct {
