@@ -326,6 +326,7 @@ Accepted by `events`, `serve`, `transactions`, `ledgers`, `operations`,
 | `gap-strategy` | `PRISM_GAP_STRATEGY` | all streaming commands |
 | `ha-heartbeat` | `PRISM_HA_HEARTBEAT` | all streaming commands |
 | `ha-lease-file` | `PRISM_HA_LEASE_FILE` | all streaming commands |
+| `ha-standby-poll` | `PRISM_HA_STANDBY_POLL` | all streaming commands |
 | `ha-ttl` | `PRISM_HA_TTL` | all streaming commands |
 | `health-port` | `PRISM_HEALTH_PORT` | all streaming commands |
 | `heartbeat` | `PRISM_HEARTBEAT` | all streaming commands |
@@ -346,6 +347,7 @@ Accepted by `events`, `serve`, `transactions`, `ledgers`, `operations`,
 | `pg-cursor-key` | `PRISM_PG_CURSOR_KEY` | all streaming commands |
 | `pg-dsn` | `PRISM_PG_DSN` | all streaming commands |
 | `poll` | `PRISM_POLL` | all streaming commands |
+| `prune-after` | `PRISM_PRUNE_AFTER` | all streaming commands |
 | `prune-interval` | `PRISM_PRUNE_INTERVAL` | all streaming commands |
 | `prune-keep` | `PRISM_PRUNE_KEEP` | all streaming commands |
 | `prune-max-age` | `PRISM_PRUNE_MAX_AGE` | all streaming commands |
@@ -386,6 +388,7 @@ Accepted by `events`, `serve`, `transactions`, `ledgers`, `operations`,
 | `state-passphrase-file` | `PRISM_STATE_PASSPHRASE_FILE` | all streaming commands |
 | `stats` | `PRISM_STATS` | all streaming commands |
 | `stats-bar` | `PRISM_STATS_BAR` | all streaming commands |
+| `stream-id` | `PRISM_STREAM_ID` | all streaming commands, `rewind` |
 | `syslog-address` | `PRISM_SYSLOG_ADDRESS` | all streaming commands |
 | `syslog-app` | `PRISM_SYSLOG_APP` | all streaming commands |
 | `syslog-facility` | `PRISM_SYSLOG_FACILITY` | all streaming commands |

@@ -206,6 +206,8 @@ prism ledgers --follow --json --output-file /var/log/prism/ledgers.ndjson \
 | `--prune-interval` | duration | `5m0s` | how often to compact the cursor metadata file in the background (0 compacts once) |
 | `--prune-keep` | int | `100` | keep at most this many cursor metadata entries per stream (0 keeps all) |
 | `--prune-max-age` | duration | — | drop cursor metadata entries older than this (0 keeps entries regardless of age) |
+| `--stream-id` | string | hash of the command, network, arguments and filters | name this stream's partition in --state-file, so several prism processes can share one file |
+| `--prune-after` | string | `7d` | drop --state-file history checkpoints older than this, e.g. `7d` or `36h`; the latest checkpoint and the resume cursor are always kept (0 keeps all) |
 | `--state-passphrase-env` | string | — | encrypt the state file with a passphrase read from this environment variable |
 | `--state-passphrase-file` | string | — | encrypt the state file with a passphrase read from this file |
 | `--state-kms-provider` | string | — | encrypt the state file with a key management service: "aws" or "gcp" |
@@ -222,10 +224,42 @@ prism ledgers --follow --json --output-file /var/log/prism/ledgers.ndjson \
   holds one checkpoint per delivered page, is compacted by the background
   pruner, and is resumed with `--resume`. An explicit `--from` or `--since`
   wins over the recorded cursor.
-- **Single-position file**: any other `--state-file`. It holds only the
-  latest position and is resumed automatically on the next run. Here the
-  saved position wins: `--from` is ignored, with a notice. This is the
-  format [`prism rewind`](#prism-rewind) edits.
+- **Position file**: any other `--state-file`. It holds each stream's
+  latest position plus a bounded checkpoint history, and is resumed
+  automatically on the next run. Here the saved position wins: `--from` is
+  ignored, with a notice. This is the format [`prism rewind`](#prism-rewind)
+  edits.
+
+#### Sharing one state file between processes
+
+A position file is partitioned by **stream ID** (schema version 2): one entry
+per stream, keyed by `--stream-id`. When `--stream-id` is omitted, prism
+derives a stable ID such as `events/3fa2c1d09b7e4a55` from the command, the
+network, the positional arguments and every filter flag. Operational flags —
+output format, sinks, `--from`, `--limit`, `--follow`, the state flags
+themselves — are left out, so a run restarted with a different `--limit` or
+output file still finds its own cursor.
+
+Several prism processes can therefore point at the same file:
+
+```console
+prism events --contract CAMM... --follow --state-file /var/lib/prism/state.json --stream-id events_amm
+prism transactions --follow        --state-file /var/lib/prism/state.json --stream-id tx_main
+```
+
+Every save is a locked read-modify-write: prism takes an exclusive lock on
+`<state-file>.lock`, re-reads the file, replaces only its own partition, and
+atomically renames a fresh copy into place. A stream can never overwrite
+another stream's cursor, even when both save at the same instant. A version 1
+file written by an older prism is adopted by the first stream that opens it
+and upgraded on its next save. If that stream is a different kind (a different
+`source`), the old position is kept under the `default` stream ID.
+
+Each stream's entry carries a `history` of checkpoints, at most one an hour.
+History older than `--prune-after` is pruned during saves (at most every six
+hours) and by a background compactor every six hours, so the file stays small
+under months of continuous operation. Pruning never touches the resume cursor
+and always keeps the newest checkpoint.
 
 ```console
 # Journal: record the position as the stream runs, then continue from it
@@ -243,9 +277,20 @@ PRISM_PG_DSN=postgres://prism@db/prism prism transactions --follow
 | `--ha-lease-file` | string | — | run as an active-passive pair, taking this lease file as the lock; only the leader streams |
 | `--ha-heartbeat` | duration | `5s` | how often the leader renews the lease |
 | `--ha-ttl` | duration | `15s` | how long the lease stays valid without a renewal |
+| `--ha-standby-poll` | duration | `200ms` | how often a standby polls for the lease; bounds failover time after the leader exits |
 | `--health-port` | int | — | serve /healthz, /readyz and /metrics on this port (0 disables the health server) |
 | `--max-lag` | uint32 | — | ledgers the stream may be behind before /readyz reports a failure (0 means no limit) |
 | `--metrics-addr` | string | — | serve Prometheus metrics at /metrics on this address, e.g. 127.0.0.1:9090 |
+
+The lease is a kernel file lock: `flock` on Linux, macOS and the BSDs,
+`fcntl` record locks on Solaris, illumos and AIX, and `LockFileEx` on Windows.
+The kernel releases the lock the moment the leader process exits, crash and
+`kill -9` included. A standby polls for the lock without blocking every
+`--ha-standby-poll`, so it takes over and resumes from the last committed
+cursor within one poll, well under a second by default. A leader that is
+alive but partitioned is fenced by the lease record's epoch once `--ha-ttl`
+lapses. To fail over between hosts, put the lease file on a shared file system
+that supports these locks.
 
 `--health-port` serves `/healthz`, `/readyz` and a `/metrics` endpoint with
 `prism_stream_lag` (ledgers behind the server) and related gauges.
@@ -627,9 +672,14 @@ prism fee-stats [flags]
 Default `--page-size`: **50**. `fee-stats` has
 no flags beyond the shared streaming flags.
 
+The table output prints, per ledger, the base fee, the min/mode/p10/p50/p95
+inclusion fee per operation, capacity usage and surge status. `--json` emits
+the full `inclusionFeeCharged` and `inclusionFeeBid` distributions (`min`,
+`mode`, `p10`, `p50`, `p90`, `p95`, `p99`, `max`) for automated bidders.
+
 ```console
 prism fee-stats --follow
-prism fee-stats --follow --json | jq '{ledger, p90: .inclusionFeeCharged.p90, surge: .surgePricing}'
+prism fee-stats --follow --json | jq '{ledger, p50: .inclusionFeeCharged.p50, p95: .inclusionFeeCharged.p95, surge: .surgePricing}'
 ```
 
 ### prism simulate
@@ -833,17 +883,20 @@ Reposition a single-position state file (see
 [Durable cursors and state](#durable-cursors-and-state)) so the next run
 starts from another ledger. Pass exactly one of `--to-ledger` or `--back`. A
 backup of the previous state is written next to the file and its path is
-printed. For a cursor journal, choose the position on the streaming command
+printed. In a shared state file only the selected stream is rewound. Pass
+`--stream-id` when the file holds more than one stream; the error lists the
+IDs it holds. For a cursor journal, choose the position on the streaming command
 instead, with `--from`, `--since` or `--rewind`.
 
 ```text
-prism rewind --state-file FILE (--to-ledger LEDGER | --back N)
+prism rewind --state-file FILE [--stream-id ID] (--to-ledger LEDGER | --back N)
 ```
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--back` | uint32 | — | number of ledgers to rewind |
 | `--state-file` | string | — | state file to rewind |
+| `--stream-id` | string | — | stream to rewind in a shared state file (optional when the file holds a single stream) |
 | `--to-ledger` | uint32 | — | ledger to replay from |
 
 ```console

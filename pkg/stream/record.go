@@ -259,6 +259,7 @@ type FeeDistribution struct {
 	P10  int64 `json:"p10"`
 	P50  int64 `json:"p50"`
 	P90  int64 `json:"p90"`
+	P95  int64 `json:"p95"`
 	P99  int64 `json:"p99"`
 	Max  int64 `json:"max"`
 }

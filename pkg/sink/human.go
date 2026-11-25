@@ -102,7 +102,7 @@ func (h *Human) emitRecord(r stream.Record) error {
 			return fmt.Errorf("human: write: %w", err)
 		}
 		if d := f.InclusionFeeCharged; d != nil {
-			if _, err := fmt.Fprintf(h.w, "  inclusion fee/op p50/p90/p99 %d/%d/%d", d.P50, d.P90, d.P99); err != nil {
+			if _, err := fmt.Fprintf(h.w, "  inclusion fee/op min/mode/p10/p50/p95 %d/%d/%d/%d/%d", d.Min, d.Mode, d.P10, d.P50, d.P95); err != nil {
 				return fmt.Errorf("human: write: %w", err)
 			}
 		}
