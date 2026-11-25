@@ -1,0 +1,213 @@
+# ABI Inspection and TypeScript Type Generation
+
+Every Soroban contract carries its own interface description. When a contract is built, the Rust SDK embeds a WASM custom section named **`contractspecv0`**: a stream of XDR `ScSpecEntry` values that describe every exported function, user-defined type, and error enum. `prism` reads that section straight from the deployed bytecode on-chain, so you don't need the contract's source code or a published ABI file.
+
+This guide covers:
+
+1. Inspecting a contract's interface (`prism abi inspect`)
+2. Pulling and examining the on-chain WASM (`prism wasm dump`, `prism wasm disasm`)
+3. Generating TypeScript types (`prism generate-types`)
+4. Decoding contract-specific errors in failure streams
+
+---
+
+## How prism finds a contract's WASM
+
+From a contract ID (`C...`), `prism` makes two RPC calls:
+
+1. `getLedgerEntries` on the contract's **instance** entry (`ContractData` with key `ScvLedgerKeyContractInstance`, durability `persistent`). The instance's `executable` holds the WASM hash.
+2. `getLedgerEntries` on the **`ContractCode`** entry for that hash, which returns the raw bytecode.
+
+The bytecode is **verified** by checking that its SHA-256 equals the hash recorded in the instance. If they differ, `prism` stops.
+
+> Stellar Asset Contracts (SACs) have no WASM: their executable is `StellarAsset`, built into the protocol. ⚠ Verify what `prism` prints for a SAC (an error, or the built-in token interface).
+
+---
+
+## 1. `prism abi inspect <contract_id>`
+
+Decodes `contractspecv0` and prints the contract's interface.
+
+```bash
+prism abi inspect CCJZ5DGASBWQXR5MPFCJXMBI333XE5U3FSJTNQU7RIKE3P5GN2K2WYD5
+```
+
+### What gets shown
+
+| Spec entry (`ScSpecEntry`) | Shown as |
+|---|---|
+| `FunctionV0` | Name, inputs (`name: type`), outputs, `doc` string |
+| `UdtStructV0` | Struct name and fields |
+| `UdtUnionV0` | Union name and cases (void or tuple) |
+| `UdtEnumV0` | Integer enum name and values |
+| `UdtErrorEnumV0` | Error enum name, case names, `u32` codes, docs |
+| `EventV0` | Event name, topics, data fields (newer SDKs only) |
+
+Docstrings come from the `///` comments in the contract's Rust source. The SDK copies them into the spec's `doc` fields.
+
+### Human output (illustrative)
+
+```text
+Contract  CCJZ5…WYD5
+WASM hash 7b1f…c09a  (verified)
+
+FUNCTIONS
+  swap(to: Address, buy_a: bool, out: i128, in_max: i128) -> i128
+      Swap tokens; returns the amount paid in.
+  deposit(to: Address, desired_a: i128, min_a: i128, desired_b: i128, min_b: i128) -> (i128, i128)
+  get_rsrvs() -> (i128, i128)
+
+TYPES
+  struct  Pool { reserve_a: i128, reserve_b: i128, fee_bps: u32 }
+
+ERRORS  enum PoolError
+  1  InsufficientLiquidity   Not enough reserves to fill the swap.
+  2  SlippageExceeded
+  3  Unauthorized
+```
+
+### JSON
+
+```bash
+prism abi inspect C... --json | jq '.functions[] | {name, inputs: [.inputs[].type]}'
+```
+
+> ⚠ Verify: the `--json` key names (`functions`, `inputs`, `outputs`, `errors`, `doc`) and whether there are filters such as `--functions-only`.
+
+---
+
+## 2. `prism wasm dump <contract_id>`
+
+Saves the verified on-chain bytecode to disk.
+
+```bash
+prism wasm dump C... -o pool.wasm
+```
+
+- The file is written only after the SHA-256 check passes.
+- ⚠ Verify the output flag name (`-o`/`--out`) and the default filename (e.g. `<wasm_hash>.wasm`).
+
+Useful for reproducibility checks: build the contract from source and compare the hashes.
+
+```bash
+shasum -a 256 pool.wasm target/wasm32v1-none/release/pool.wasm
+```
+
+---
+
+## 3. `prism wasm disasm <contract_id>`
+
+Summarizes the module's structure without decompiling it.
+
+```bash
+prism wasm disasm C...
+```
+
+Typical contents:
+
+| Section | What it tells you |
+|---|---|
+| Exports | Exported function names (should match the spec's functions) |
+| Imports | Soroban host functions the contract calls |
+| Memory | Initial/max linear memory pages (64 KiB each) |
+| Custom sections | `contractspecv0`, `contractmetav0` (SDK/rustc version), `contractenvmetav0` (protocol version) |
+| Size | Total bytecode size, which affects upload fees and footprint |
+
+> ⚠ Verify which of these `disasm` really prints, and whether it also shows instruction-level output. List anything not yet implemented as roadmap.
+
+---
+
+## 4. `prism generate-types <contract_id> --out ./types`
+
+Generates TypeScript from the on-chain spec.
+
+```bash
+prism generate-types C... --out ./types
+```
+
+### Type mapping
+
+| Soroban type | TypeScript |
+|---|---|
+| `bool` | `boolean` |
+| `u32`, `i32` | `number` |
+| `u64`, `i64`, `u128`, `i128`, `u256`, `i256` | `bigint` |
+| `String`, `Symbol` | `string` |
+| `Bytes`, `BytesN<N>` | `Buffer` / `Uint8Array` |
+| `Address` | `string` (`G...` / `C...`) |
+| `Option<T>` | `T \| undefined` |
+| `Vec<T>` | `T[]` |
+| `Map<K, V>` | `Map<K, V>` |
+| `(A, B)` | `[A, B]` |
+| struct | `interface` |
+| union | discriminated union `{ tag: "Case"; values: [...] }` |
+| enum / error enum | TS `enum` or `const` object |
+
+### Example output (illustrative)
+
+```ts
+// types/pool.ts — generated by prism; do not edit
+export interface Pool {
+  reserve_a: bigint;
+  reserve_b: bigint;
+  fee_bps: number;
+}
+
+export enum PoolError {
+  InsufficientLiquidity = 1,
+  SlippageExceeded = 2,
+  Unauthorized = 3,
+}
+
+export interface PoolContract {
+  swap(args: { to: string; buy_a: boolean; out: bigint; in_max: bigint }): Promise<bigint>;
+  get_rsrvs(): Promise<[bigint, bigint]>;
+}
+```
+
+> ⚠ Verify the real file layout, naming, and whether decode helpers (`scValToNative` wrappers, `decodePoolError(code)`) are produced. Copy a real generated file into the guide in place of this sketch.
+
+Re-run generation whenever the contract is upgraded. An upgrade changes the WASM hash, and with it the spec.
+
+---
+
+## 5. Custom error decoding
+
+A contract that fails with `panic_with_error!` or returns `Err(PoolError::SlippageExceeded)` surfaces on-chain as a host error:
+
+```text
+Error(Contract, #2)
+```
+
+Only the `u32` code goes on-chain. `prism`'s ABI resolver loads the contract's `UdtErrorEnumV0` entries and maps the code back to a name and docstring:
+
+```text
+FAILED  tx 9c1e…  contract CCJZ5…WYD5  swap
+        Error(Contract, #2) → PoolError::SlippageExceeded
+```
+
+In JSON:
+
+```json
+{"tx_hash":"9c1e…","contract":"CCJZ5…","function":"swap","error":{"type":"contract","code":2,"name":"SlippageExceeded","enum":"PoolError","doc":""}}
+```
+
+Notes:
+
+- Non-contract errors (`Error(Auth, …)`, `Error(Budget, …)`, `Error(Storage, …)`) are host errors and pass through unchanged.
+- If the failing contract was called by another contract, the error code belongs to the **contract that raised it**. ⚠ Verify that the resolver uses the right contract's spec in cross-contract calls.
+- Specs are cached by WASM hash, so repeated failures don't refetch bytecode. ⚠ Verify.
+
+> ⚠ Verify which stream command shows decoded errors (e.g. `prism tx --follow`, `prism events`) and the exact JSON keys.
+
+### jq recipe: count failures by error name
+
+```bash
+prism <stream-cmd> --json --follow | jq -r 'select(.error.type=="contract") | .error.name' | sort | uniq -c
+```
+
+---
+
+## Roadmap
+
+- (Fill in from the code: e.g. events in generated types, Python/Rust bindings, offline `abi inspect` from a local `.wasm`)
