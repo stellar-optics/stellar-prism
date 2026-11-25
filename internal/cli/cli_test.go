@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -116,14 +117,64 @@ func TestEventsCommandDryRunHasNoOutputSideEffects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if stdout != "" {
-		t.Fatalf("stdout = %q, want no delivered records", stdout)
+	for _, want := range []string{
+		"dry-run readiness:",
+		"[ok] filter syntax",
+		"[ok] rpc health",
+		"[ok] latest ledger",
+		"[ok] sink configuration",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q\n%s", want, stdout)
+		}
 	}
-	if !strings.Contains(stderr, "dry-run: match") {
-		t.Fatalf("stderr = %q, want dry-run diagnostics", stderr)
+	if strings.Contains(stdout, `"kind":"event"`) {
+		t.Fatalf("stdout contains streamed records\n%s", stdout)
+	}
+	if strings.Contains(stderr, "dry-run: match") {
+		t.Fatalf("stderr = %q, want no record diagnostics", stderr)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("output file exists or stat failed: %v", err)
+	}
+}
+
+func TestEventsCommandDryRunFailsOnUnhealthyRPC(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(2200, 1))
+	srv.SetHealthError(errors.New("endpoint down"))
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "events", "--from", "2200", "--dry-run")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a readiness failure")
+	}
+	if !strings.Contains(stdout, "[FAIL] rpc health") {
+		t.Fatalf("stdout = %q, want failed RPC health check", stdout)
+	}
+}
+
+func TestEventsCommandDryRunFailsOnInvalidContract(t *testing.T) {
+	withFake(t, fakerpc.NewServer(fakerpc.MakeEvents(2300, 1)))
+
+	stdout, _, err := run(t, "events", "--from", "2300", "--dry-run", "--contract", "not-a-contract")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a readiness failure")
+	}
+	if !strings.Contains(stdout, "[FAIL] contract addresses") || !strings.Contains(stdout, "invalid contract address") {
+		t.Fatalf("stdout = %q, want failed contract validation", stdout)
+	}
+}
+
+func TestEventsCommandDryRunFailsOnUnreachableSink(t *testing.T) {
+	withFake(t, fakerpc.NewServer(fakerpc.MakeEvents(2400, 1)))
+
+	stdout, _, err := run(t, "events", "--from", "2400", "--dry-run",
+		"--webhook-url", "http://127.0.0.1:1")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a readiness failure")
+	}
+	if !strings.Contains(stdout, "[FAIL] webhook sink") {
+		t.Fatalf("stdout = %q, want failed webhook check", stdout)
 	}
 }
 

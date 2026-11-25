@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,6 +18,7 @@ import (
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // testContractID is a syntactically valid contract strkey.
@@ -679,6 +683,189 @@ func TestContractSpecWriteEmptySections(t *testing.T) {
 	}
 }
 
+func writeSpecFixture(t *testing.T, name string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("writing spec fixture: %v", err)
+	}
+	return path
+}
+
+func localSpecFixture(t *testing.T) string {
+	t.Helper()
+	return writeSpecFixture(t, "contract.wasm", testWasm(t, sampleSpec()...))
+}
+
+func TestLoadContractSpecFromFile(t *testing.T) {
+	t.Run("wasm", func(t *testing.T) {
+		spec, err := loadContractSpec(localSpecFixture(t), "C...")
+		if err != nil {
+			t.Fatalf("loadContractSpec() error = %v", err)
+		}
+		if len(spec.Functions) != 3 || len(spec.Events) != 1 {
+			t.Fatalf("loaded spec has %d functions and %d events", len(spec.Functions), len(spec.Events))
+		}
+	})
+
+	t.Run("json", func(t *testing.T) {
+		data, err := json.Marshal(sampleSpec())
+		if err != nil {
+			t.Fatalf("marshalling spec: %v", err)
+		}
+		spec, err := loadContractSpec(writeSpecFixture(t, "spec.json", data), "C...")
+		if err != nil {
+			t.Fatalf("loadContractSpec() error = %v", err)
+		}
+		if len(spec.Functions) != 3 || len(spec.Events) != 1 {
+			t.Fatalf("loaded spec has %d functions and %d events", len(spec.Functions), len(spec.Events))
+		}
+	})
+}
+
+func TestLoadContractSpecRejectsInvalidFiles(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		if _, err := loadContractSpec(filepath.Join(t.TempDir(), "missing.wasm"), "C..."); err == nil {
+			t.Fatal("loadContractSpec() error = nil, want a missing-file failure")
+		}
+	})
+	t.Run("invalid wasm", func(t *testing.T) {
+		path := writeSpecFixture(t, "broken.wasm", []byte("not wasm"))
+		if _, err := loadContractSpec(path, "C..."); err == nil {
+			t.Fatal("loadContractSpec() error = nil, want a bad-WASM failure")
+		}
+	})
+	t.Run("wasm without spec", func(t *testing.T) {
+		path := writeSpecFixture(t, "plain.wasm", []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00})
+		if _, err := loadContractSpec(path, "C..."); err == nil {
+			t.Fatal("loadContractSpec() error = nil, want a missing-spec failure")
+		}
+	})
+	t.Run("invalid json", func(t *testing.T) {
+		path := writeSpecFixture(t, "broken.json", []byte("{"))
+		if _, err := loadContractSpec(path, "C..."); err == nil {
+			t.Fatal("loadContractSpec() error = nil, want a JSON failure")
+		}
+	})
+	t.Run("empty json", func(t *testing.T) {
+		path := writeSpecFixture(t, "empty.json", []byte("[]"))
+		if _, err := loadContractSpec(path, "C..."); err == nil {
+			t.Fatal("loadContractSpec() error = nil, want an empty-spec failure")
+		}
+	})
+	t.Run("unknown extension", func(t *testing.T) {
+		path := writeSpecFixture(t, "spec.bin", testWasm(t, sampleSpec()...))
+		if _, err := loadContractSpec(path, "C..."); err == nil {
+			t.Fatal("loadContractSpec() error = nil, want an extension failure")
+		}
+	})
+}
+
+func TestABICommandUsesLocalSpecWithoutRPC(t *testing.T) {
+	withFake(t, fakerpc.NewServer(nil))
+	path := localSpecFixture(t)
+
+	stdout, _, err := run(t, "abi", testContractID(t), "--spec", path)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(stdout, "hello(to: Address) -> u32") {
+		t.Fatalf("local spec was not rendered\n%s", stdout)
+	}
+}
+
+func TestABIEncodeCommand(t *testing.T) {
+	withFake(t, fakerpc.NewServer(nil))
+	path := localSpecFixture(t)
+
+	stdout, _, err := run(t, "abi", "encode", testContractID(t), "set_count",
+		"--arg", "count=7", "--spec", path)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(stdout, "count=AAAAAwAAAAc=") {
+		t.Fatalf("encoded output = %q, want base64 ScVal for u32 7", stdout)
+	}
+}
+
+func TestWriteEncodedArgumentsValidatesInputs(t *testing.T) {
+	spec := &contractSpec{}
+	if err := spec.add(sampleSpec()); err != nil {
+		t.Fatalf("building spec: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		function  string
+		arguments []string
+	}{
+		{name: "unknown function", function: "missing", arguments: []string{"count=7"}},
+		{name: "missing value", function: "set_count", arguments: []string{"count="}},
+		{name: "unknown argument", function: "set_count", arguments: []string{"other=7"}},
+		{name: "missing argument", function: "set_count"},
+		{name: "duplicate argument", function: "set_count", arguments: []string{"count=7", "count=8"}},
+		{name: "wrong type", function: "set_count", arguments: []string{"count=abc"}},
+		{name: "out of range", function: "set_count", arguments: []string{"count=4294967296"}},
+		{name: "invalid address", function: "hello", arguments: []string{"to=not-an-address"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := writeEncodedArguments(&buf, spec, tc.function, tc.arguments); err == nil {
+				t.Fatal("writeEncodedArguments() error = nil, want a validation failure")
+			}
+		})
+	}
+}
+
+func TestEncodeScValSupportedTypes(t *testing.T) {
+	addr := testContractID(t)
+	tests := []struct {
+		name string
+		typ  xdr.ScSpecTypeDef
+		raw  string
+		want xdr.ScValType
+	}{
+		{name: "bool", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeBool}, raw: "true", want: xdr.ScValTypeScvBool},
+		{name: "u32", typ: u32Type(), raw: "7", want: xdr.ScValTypeScvU32},
+		{name: "i32", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeI32}, raw: "-7", want: xdr.ScValTypeScvI32},
+		{name: "u64", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeU64}, raw: "7", want: xdr.ScValTypeScvU64},
+		{name: "i64", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeI64}, raw: "-7", want: xdr.ScValTypeScvI64},
+		{name: "u128", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeU128}, raw: "123456789012345678901234567890", want: xdr.ScValTypeScvU128},
+		{name: "i128", typ: i128Type(), raw: "-1000", want: xdr.ScValTypeScvI128},
+		{name: "u256", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeU256}, raw: "123456789012345678901234567890", want: xdr.ScValTypeScvU256},
+		{name: "i256", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeI256}, raw: "-1000", want: xdr.ScValTypeScvI256},
+		{name: "bytes", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeBytes}, raw: "0xdeadbeef", want: xdr.ScValTypeScvBytes},
+		{name: "string", typ: stringType(), raw: "hello", want: xdr.ScValTypeScvString},
+		{name: "symbol", typ: xdr.ScSpecTypeDef{Type: xdr.ScSpecTypeScSpecTypeSymbol}, raw: "hello", want: xdr.ScValTypeScvSymbol},
+		{name: "address", typ: addressType(), raw: addr, want: xdr.ScValTypeScvAddress},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := encodeScVal(tc.typ, tc.raw)
+			if err != nil {
+				t.Fatalf("encodeScVal() error = %v", err)
+			}
+			if value.Type != tc.want {
+				t.Fatalf("ScVal type = %s, want %s", value.Type, tc.want)
+			}
+			if _, err := xdr.MarshalBase64(value); err != nil {
+				t.Fatalf("MarshalBase64() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestEncodeScValRejectsCompoundTypes(t *testing.T) {
+	typ := xdr.ScSpecTypeDef{
+		Type: xdr.ScSpecTypeScSpecTypeVec,
+		Vec:  &xdr.ScSpecTypeVec{ElementType: u32Type()},
+	}
+	if _, err := encodeScVal(typ, "[1,2]"); err == nil {
+		t.Fatal("encodeScVal() error = nil, want an unsupported-type failure")
+	}
+}
+
 func TestWriteUnionCaseRejectsMalformedCases(t *testing.T) {
 	t.Parallel()
 
@@ -706,5 +893,71 @@ func TestWriteUnionCaseRejectsMalformedCases(t *testing.T) {
 				t.Fatal("writeUnionCase() error = nil, want a failure")
 			}
 		})
+	}
+}
+
+type batchSourceStub struct {
+	batch stream.Batch
+}
+
+func (s batchSourceStub) Name() string { return "stub" }
+func (s batchSourceStub) Fetch(context.Context, string) (stream.Batch, error) {
+	return s.batch, nil
+}
+func (batchSourceStub) CursorLedger(string) (uint32, bool) { return 0, false }
+
+func TestSpecDecodeSourceDecodesMatchingEvent(t *testing.T) {
+	contractID := testContractID(t)
+	addr, err := encodeScVal(addressType(), contractID)
+	if err != nil {
+		t.Fatalf("encoding address: %v", err)
+	}
+	name, err := xdr.NewScVal(xdr.ScValTypeScvSymbol, xdr.ScSymbol("Greeted"))
+	if err != nil {
+		t.Fatalf("encoding event name: %v", err)
+	}
+	message, err := encodeScVal(stringType(), "hello")
+	if err != nil {
+		t.Fatalf("encoding message: %v", err)
+	}
+
+	record := stream.Record{
+		ID:    "1",
+		Kind:  stream.KindEvent,
+		Event: &stream.Event{ContractID: contractID, TopicXDR: []string{marshalScVal(name), marshalScVal(addr)}, ValueXDR: marshalScVal(message)},
+	}
+	src := newSpecDecodeSource(batchSourceStub{batch: stream.Batch{Records: []stream.Record{record}}},
+		&contractSpec{Events: []xdr.ScSpecEventV0{*sampleSpec()[7].EventV0}}, contractID)
+
+	batch, err := src.Fetch(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	event := batch.Records[0].Event
+	if event.SpecName != "Greeted" {
+		t.Fatalf("SpecName = %q, want Greeted", event.SpecName)
+	}
+	if len(event.SpecParams) != 2 {
+		t.Fatalf("SpecParams = %d, want 2", len(event.SpecParams))
+	}
+	if event.SpecParams[0].Name != "who" || event.SpecParams[0].Location != "topic" {
+		t.Fatalf("topic param = %+v", event.SpecParams[0])
+	}
+	if event.SpecParams[1].Name != "message" || event.SpecParams[1].XDR != marshalScVal(message) {
+		t.Fatalf("data param = %+v", event.SpecParams[1])
+	}
+}
+
+func TestSpecDecodeSourceIgnoresOtherContracts(t *testing.T) {
+	record := stream.Record{ID: "1", Kind: stream.KindEvent, Event: &stream.Event{ContractID: "other"}}
+	src := newSpecDecodeSource(batchSourceStub{batch: stream.Batch{Records: []stream.Record{record}}},
+		&contractSpec{Events: []xdr.ScSpecEventV0{*sampleSpec()[7].EventV0}}, testContractID(t))
+
+	batch, err := src.Fetch(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if batch.Records[0].Event.SpecName != "" {
+		t.Fatal("event from another contract was decoded with the local spec")
 	}
 }

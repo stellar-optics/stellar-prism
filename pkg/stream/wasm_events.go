@@ -38,6 +38,9 @@ type WASMQuery struct {
 	// change the ledger, but seeing attempted deployments is useful when
 	// debugging.
 	IncludeFailed bool
+	// MaxContractSizeBytes is the network's contract size limit. When set,
+	// uploads are annotated with their share of the budget.
+	MaxContractSizeBytes uint32
 }
 
 // WASMSource streams WASM uploads and contract creations by decoding each
@@ -115,6 +118,9 @@ func (s *WASMSource) Fetch(ctx context.Context, cursor string) (Batch, error) {
 		if err != nil {
 			return Batch{}, fmt.Errorf("wasm source: transaction %s: %w", tx.Hash, err)
 		}
+		for j := range events {
+			annotateWASMSize(events[j].WASMDeployment, s.cfg.MaxContractSizeBytes)
+		}
 		out.Records = append(out.Records, events...)
 	}
 	return out, nil
@@ -188,6 +194,16 @@ func envelopeOperations(envelope *xdr.TransactionEnvelope) ([]xdr.Operation, err
 	default:
 		return nil, fmt.Errorf("unsupported envelope type %d", envelope.Type)
 	}
+}
+
+func annotateWASMSize(event *WASMEvent, limit uint32) {
+	if event == nil || event.WASMSize <= 0 || limit == 0 {
+		return
+	}
+	event.WASMSizeLimitBytes = limit
+	event.WASMSizePercent = float64(event.WASMSize) / float64(limit) * 100
+	event.WASMSizeWarning = event.WASMSizePercent >= 80
+	event.WASMSizeExceeded = event.WASMSizePercent >= 100
 }
 
 func (s *WASMSource) hostFunctionEvent(fn *xdr.HostFunction) (*WASMEvent, bool, error) {

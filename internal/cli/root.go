@@ -188,6 +188,7 @@ func isTerminalWriter(w io.Writer) bool {
 
 // globalFlags holds options shared by every subcommand.
 type globalFlags struct {
+	dryRun           bool
 	serveSSE         string
 	serveWS          string
 	serveGRPC        string
@@ -327,6 +328,8 @@ redacted before anything is written.`,
 
 	root.PersistentFlags().StringVar(&g.color, "color", "auto",
 		`when to colourise output: "auto", "always" or "never"`)
+	root.PersistentFlags().BoolVar(&g.dryRun, "dry-run", false,
+		"validate RPC connectivity, filters and sinks, print a readiness checklist, then exit without streaming")
 	root.PersistentFlags().StringArrayVar(&g.rpcURLs, "rpc-url", nil,
 		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
 	root.PersistentFlags().StringArrayVarP(&g.headers, "header", "H", nil,

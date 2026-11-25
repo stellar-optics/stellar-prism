@@ -144,6 +144,18 @@ type Event struct {
 	// InvocationPath lists the contract IDs from the root invocation to the
 	// contract that emitted this event, when known.
 	InvocationPath []string
+	// SpecName is the contract-spec event name when local spec decoding matched.
+	SpecName string
+	// SpecParams are the named topics and data values decoded from the spec.
+	SpecParams []EventSpecParam
+}
+
+// EventSpecParam is one named parameter of a spec-decoded event.
+type EventSpecParam struct {
+	Name     string
+	Type     string
+	Location string
+	XDR      string
 }
 
 // LedgerClose is ledger close metadata as delivered by RPC.
@@ -273,6 +285,14 @@ type WASMEvent struct {
 	WASMHash string
 	// WASMSize is the byte length of the uploaded code, when available.
 	WASMSize int
+	// WASMSizeLimitBytes is the network's configured maximum contract size.
+	WASMSizeLimitBytes uint32
+	// WASMSizePercent is the percentage of the size budget used by the upload.
+	WASMSizePercent float64
+	// WASMSizeWarning marks uploads approaching the network limit.
+	WASMSizeWarning bool
+	// WASMSizeExceeded marks uploads larger than the network limit.
+	WASMSizeExceeded bool
 	// Executable describes how the contract was created: "wasm", "stellar_asset"
 	// or another future executable type.
 	Executable string

@@ -5,9 +5,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -41,11 +46,66 @@ type contractSpec struct {
 	Events     []xdr.ScSpecEventV0
 }
 
+func loadContractSpec(path, contractID string) (*contractSpec, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("spec path is empty")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading spec file %q: %w", path, err)
+	}
+
+	var entries []xdr.ScSpecEntry
+	switch ext := strings.ToLower(filepath.Ext(path)); ext {
+	case ".wasm":
+		entries, err = parseContractSpec(data)
+		if err != nil {
+			return nil, fmt.Errorf("parsing WASM spec %q: %w", path, err)
+		}
+	case ".json":
+		if err := json.Unmarshal(data, &entries); err != nil {
+			return nil, fmt.Errorf("parsing JSON spec %q: %w", path, err)
+		}
+		if len(entries) == 0 {
+			return nil, fmt.Errorf("spec file %q contains no entries", path)
+		}
+	default:
+		return nil, fmt.Errorf("spec file %q must end in .wasm or .json", path)
+	}
+
+	spec := &contractSpec{ContractID: contractID}
+	if err := spec.add(entries); err != nil {
+		return nil, fmt.Errorf("spec file %q: %w", path, err)
+	}
+	return spec, nil
+}
+
+func specForArgs(ctx context.Context, g *globalFlags, stderr io.Writer, specPath, contractID string) (*contractSpec, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if specPath != "" {
+		spec, err := loadContractSpec(specPath, contractID)
+		return spec, func() {}, err
+	}
+	client, closeClient, err := openClient(g, stderr)
+	if err != nil {
+		return nil, nil, err
+	}
+	spec, err := resolveContractSpec(ctx, client, contractID)
+	if err != nil {
+		closeClient()
+		return nil, nil, err
+	}
+	return spec, closeClient, nil
+}
+
 // newABICmd builds `prism abi <contract-id>`.
 func newABICmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		function  string
 		arguments []string
+		specPath  string
 	)
 
 	cmd := &cobra.Command{
@@ -57,7 +117,8 @@ functions, types and events with human-readable argument names.
 
 The lookup is two RPC calls: the contract instance names the WASM hash, and
 the code entry carries the bytecode. No other network access is made, and
-nothing is cached between runs.
+nothing is cached between runs. --spec replaces the lookup with a local
+WASM or contract spec JSON file.
 
 With --function, only that function is shown. Repeating --arg decodes actual
 base64 ScVal arguments against the function's parameter names and types, so
@@ -68,23 +129,21 @@ hand.`,
 
   # Show one function and decode its arguments
   prism abi CBGSB... --function transfer \
-    --arg AAAAAwAAAAc= --arg AAAAAwAAAAo=`,
+    --arg AAAAAwAAAAc= --arg AAAAAwAAAAo=
+
+  # Read a local build artifact without touching RPC
+  prism abi CBGSB... --spec ./target/wasm32-unknown-unknown/release/c.wasm`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if function == "" && len(arguments) > 0 {
 				return fmt.Errorf("--arg requires --function")
 			}
 
-			client, closeClient, err := openClient(g, stderr)
+			spec, closeSpec, err := specForArgs(cmd.Context(), g, stderr, specPath, args[0])
 			if err != nil {
 				return err
 			}
-			defer closeClient()
-
-			spec, err := resolveContractSpec(cmd.Context(), client, args[0])
-			if err != nil {
-				return err
-			}
+			defer closeSpec()
 
 			color, err := parseColorMode(g.color)
 			if err != nil {
@@ -98,7 +157,277 @@ hand.`,
 		"show only this function and decode any --arg values against it")
 	cmd.Flags().StringArrayVar(&arguments, "arg", nil,
 		"base64 ScVal argument to decode; repeatable and requires --function")
+	cmd.Flags().StringVar(&specPath, "spec", "",
+		"read the contract spec from a local .wasm or .json file instead of RPC")
+	cmd.AddCommand(newABIEncodeCmd(g, stdout, stderr))
 	return cmd
+}
+
+func newABIEncodeCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
+	var (
+		arguments []string
+		specPath  string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "encode <contract-id> <function>",
+		Short: "Encode human-readable arguments as base64 ScVals",
+		Long: `Encode --arg name=value pairs against a function's spec types and print
+base64 ScVals ready to paste into stellar contract invoke or a test harness.
+Arguments may be given in any order, but every input needs exactly one value.
+--spec reads the contract spec from a local .wasm or .json file.`,
+		Example: `  prism abi encode CBGSB... set_count --arg count=7
+  prism abi encode CBGSB... transfer --arg to=CBGSB... --arg amount=1000`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			spec, closeSpec, err := specForArgs(cmd.Context(), g, stderr, specPath, args[0])
+			if err != nil {
+				return err
+			}
+			defer closeSpec()
+			return writeEncodedArguments(stdout, spec, args[1], arguments)
+		},
+	}
+
+	cmd.Flags().StringArrayVar(&arguments, "arg", nil,
+		"argument as name=value; repeatable and checked against the function spec")
+	cmd.Flags().StringVar(&specPath, "spec", "",
+		"read the contract spec from a local .wasm or .json file instead of RPC")
+	return cmd
+}
+
+func writeEncodedArguments(w io.Writer, spec *contractSpec, function string, arguments []string) error {
+	var fn *xdr.ScSpecFunctionV0
+	for i := range spec.Functions {
+		if string(spec.Functions[i].Name) == function {
+			fn = &spec.Functions[i]
+			break
+		}
+	}
+	if fn == nil {
+		names := make([]string, 0, len(spec.Functions))
+		for _, candidate := range spec.Functions {
+			names = append(names, string(candidate.Name))
+		}
+		return fmt.Errorf("function %q not found; available: %s", function, strings.Join(names, ", "))
+	}
+
+	values := make(map[string]string, len(arguments))
+	for _, raw := range arguments {
+		name, value, ok := strings.Cut(raw, "=")
+		if !ok || name == "" {
+			return fmt.Errorf("invalid --arg %q: want name=value", raw)
+		}
+		if _, exists := values[name]; exists {
+			return fmt.Errorf("argument %q specified more than once", name)
+		}
+		values[name] = value
+	}
+	if len(values) != len(fn.Inputs) {
+		return fmt.Errorf("function %s takes %d argument(s), got %d", function, len(fn.Inputs), len(values))
+	}
+
+	encoded := make([]string, len(fn.Inputs))
+	for i, input := range fn.Inputs {
+		value, ok := values[input.Name]
+		if !ok {
+			return fmt.Errorf("missing argument %q for function %s", input.Name, function)
+		}
+		scval, err := encodeScVal(input.Type, value)
+		if err != nil {
+			return fmt.Errorf("argument %s (%s): %w", input.Name, formatSpecType(input.Type), err)
+		}
+		encoded[i], err = xdr.MarshalBase64(scval)
+		if err != nil {
+			return fmt.Errorf("encoding argument %s: %w", input.Name, err)
+		}
+	}
+	for i, input := range fn.Inputs {
+		if _, err := fmt.Fprintf(w, "%s=%s\n", input.Name, encoded[i]); err != nil {
+			return fmt.Errorf("writing argument %s: %w", input.Name, err)
+		}
+	}
+	return nil
+}
+
+func encodeScVal(typ xdr.ScSpecTypeDef, value string) (xdr.ScVal, error) {
+	switch typ.Type {
+	case xdr.ScSpecTypeScSpecTypeBool:
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return xdr.ScVal{}, fmt.Errorf("%q is not a boolean: %w", value, err)
+		}
+		return xdr.NewScVal(xdr.ScValTypeScvBool, parsed)
+	case xdr.ScSpecTypeScSpecTypeU32:
+		return parseUintScVal(value, 32, xdr.ScValTypeScvU32, func(v uint64) any { return xdr.Uint32(v) })
+	case xdr.ScSpecTypeScSpecTypeI32:
+		return parseIntScVal(value, 32, xdr.ScValTypeScvI32, func(v int64) any { return xdr.Int32(v) })
+	case xdr.ScSpecTypeScSpecTypeU64, xdr.ScSpecTypeScSpecTypeTimepoint, xdr.ScSpecTypeScSpecTypeDuration:
+		var scType xdr.ScValType
+		switch typ.Type {
+		case xdr.ScSpecTypeScSpecTypeTimepoint:
+			scType = xdr.ScValTypeScvTimepoint
+		case xdr.ScSpecTypeScSpecTypeDuration:
+			scType = xdr.ScValTypeScvDuration
+		default:
+			scType = xdr.ScValTypeScvU64
+		}
+		return parseUintScVal(value, 64, scType, func(v uint64) any {
+			switch scType {
+			case xdr.ScValTypeScvTimepoint:
+				return xdr.TimePoint(v)
+			case xdr.ScValTypeScvDuration:
+				return xdr.Duration(v)
+			default:
+				return xdr.Uint64(v)
+			}
+		})
+	case xdr.ScSpecTypeScSpecTypeI64:
+		return parseIntScVal(value, 64, xdr.ScValTypeScvI64, func(v int64) any { return xdr.Int64(v) })
+	case xdr.ScSpecTypeScSpecTypeU128:
+		parts, err := integerParts(value, 128, false)
+		if err != nil {
+			return xdr.ScVal{}, err
+		}
+		return xdr.NewScVal(xdr.ScValTypeScvU128, xdr.UInt128Parts{Hi: xdr.Uint64(parts[0]), Lo: xdr.Uint64(parts[1])})
+	case xdr.ScSpecTypeScSpecTypeI128:
+		parts, err := integerParts(value, 128, true)
+		if err != nil {
+			return xdr.ScVal{}, err
+		}
+		return xdr.NewScVal(xdr.ScValTypeScvI128, xdr.Int128Parts{Hi: xdr.Int64(parts[0]), Lo: xdr.Uint64(parts[1])})
+	case xdr.ScSpecTypeScSpecTypeU256:
+		parts, err := integerParts(value, 256, false)
+		if err != nil {
+			return xdr.ScVal{}, err
+		}
+		return xdr.NewScVal(xdr.ScValTypeScvU256, xdr.UInt256Parts{
+			HiHi: xdr.Uint64(parts[0]), HiLo: xdr.Uint64(parts[1]), LoHi: xdr.Uint64(parts[2]), LoLo: xdr.Uint64(parts[3]),
+		})
+	case xdr.ScSpecTypeScSpecTypeI256:
+		parts, err := integerParts(value, 256, true)
+		if err != nil {
+			return xdr.ScVal{}, err
+		}
+		return xdr.NewScVal(xdr.ScValTypeScvI256, xdr.Int256Parts{
+			HiHi: xdr.Int64(parts[0]), HiLo: xdr.Uint64(parts[1]), LoHi: xdr.Uint64(parts[2]), LoLo: xdr.Uint64(parts[3]),
+		})
+	case xdr.ScSpecTypeScSpecTypeBytes:
+		raw, err := hex.DecodeString(strings.TrimPrefix(value, "0x"))
+		if err != nil {
+			return xdr.ScVal{}, fmt.Errorf("%q is not hexadecimal: %w", value, err)
+		}
+		return xdr.NewScVal(xdr.ScValTypeScvBytes, xdr.ScBytes(raw))
+	case xdr.ScSpecTypeScSpecTypeString:
+		return xdr.NewScVal(xdr.ScValTypeScvString, xdr.ScString(value))
+	case xdr.ScSpecTypeScSpecTypeSymbol:
+		return xdr.NewScVal(xdr.ScValTypeScvSymbol, xdr.ScSymbol(value))
+	case xdr.ScSpecTypeScSpecTypeAddress:
+		return encodeAddress(value, false)
+	case xdr.ScSpecTypeScSpecTypeMuxedAddress:
+		return encodeAddress(value, true)
+	default:
+		return xdr.ScVal{}, fmt.Errorf("cannot encode %s from a CLI string", formatSpecType(typ))
+	}
+}
+
+func parseUintScVal(value string, bits int, scType xdr.ScValType, wrap func(uint64) any) (xdr.ScVal, error) {
+	parsed, err := strconv.ParseUint(value, 0, bits)
+	if err != nil {
+		return xdr.ScVal{}, fmt.Errorf("%q is not a uint%d: %w", value, bits, err)
+	}
+	return xdr.NewScVal(scType, wrap(parsed))
+}
+
+func parseIntScVal(value string, bits int, scType xdr.ScValType, wrap func(int64) any) (xdr.ScVal, error) {
+	parsed, err := strconv.ParseInt(value, 0, bits)
+	if err != nil {
+		return xdr.ScVal{}, fmt.Errorf("%q is not an int%d: %w", value, bits, err)
+	}
+	return xdr.NewScVal(scType, wrap(parsed))
+}
+
+func integerParts(value string, bits int, signed bool) ([]uint64, error) {
+	n := new(big.Int)
+	if _, ok := n.SetString(strings.TrimPrefix(value, "0x"), 0); !ok {
+		return nil, fmt.Errorf("%q is not an integer", value)
+	}
+	width := bits / 64
+	if n.Sign() < 0 {
+		if !signed {
+			return nil, fmt.Errorf("%q is negative but the type is unsigned", value)
+		}
+		limit := new(big.Int).Lsh(big.NewInt(1), uint(bits))
+		if n.Cmp(new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), uint(bits-1)))) < 0 {
+			return nil, fmt.Errorf("%q is below the int%d range", value, bits)
+		}
+		n.Add(n, limit)
+	} else {
+		limit := new(big.Int).Lsh(big.NewInt(1), uint(bits))
+		if signed {
+			limit.Rsh(limit, 1)
+		}
+		if n.Cmp(limit) >= 0 {
+			kind := "uint"
+			if signed {
+				kind = "int"
+			}
+			return nil, fmt.Errorf("%q is above the %s%d range", value, kind, bits)
+		}
+	}
+	raw := n.FillBytes(make([]byte, width*8))
+	parts := make([]uint64, width)
+	for i := range parts {
+		parts[i] = binary.BigEndian.Uint64(raw[i*8 : i*8+8])
+	}
+	return parts, nil
+}
+
+func encodeAddress(value string, muxed bool) (xdr.ScVal, error) {
+	if muxed {
+		raw, err := strkey.Decode(strkey.VersionByteMuxedAccount, value)
+		if err != nil {
+			return xdr.ScVal{}, fmt.Errorf("%q is not a muxed account address: %w", value, err)
+		}
+		if len(raw) != 40 {
+			return xdr.ScVal{}, fmt.Errorf("%q decodes to %d bytes, want 40", value, len(raw))
+		}
+		var key xdr.Uint256
+		copy(key[:], raw[:32])
+		return xdr.NewScVal(xdr.ScValTypeScvAddress, xdr.ScAddress{
+			Type: xdr.ScAddressTypeScAddressTypeMuxedAccount,
+			MuxedAccount: &xdr.MuxedEd25519Account{
+				Id:      xdr.Uint64(binary.BigEndian.Uint64(raw[32:])),
+				Ed25519: key,
+			},
+		})
+	}
+
+	version := strkey.VersionByteAccountID
+	if strings.HasPrefix(value, "C") {
+		version = strkey.VersionByteContract
+	}
+	raw, err := strkey.Decode(version, value)
+	if err != nil {
+		return xdr.ScVal{}, fmt.Errorf("%q is not a Stellar address: %w", value, err)
+	}
+	if len(raw) != 32 {
+		return xdr.ScVal{}, fmt.Errorf("%q decodes to %d bytes, want 32", value, len(raw))
+	}
+	if version == strkey.VersionByteContract {
+		var id xdr.ContractId
+		copy(id[:], raw)
+		return xdr.NewScVal(xdr.ScValTypeScvAddress, xdr.ScAddress{
+			Type:       xdr.ScAddressTypeScAddressTypeContract,
+			ContractId: &id,
+		})
+	}
+	var key xdr.Uint256
+	copy(key[:], raw)
+	return xdr.NewScVal(xdr.ScValTypeScvAddress, xdr.ScAddress{
+		Type:      xdr.ScAddressTypeScAddressTypeAccount,
+		AccountId: &xdr.AccountId{Type: xdr.PublicKeyTypePublicKeyTypeEd25519, Ed25519: &key},
+	})
 }
 
 // resolveContractSpec performs the two ledger-entry lookups and parses the
