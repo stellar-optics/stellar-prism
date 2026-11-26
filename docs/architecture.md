@@ -640,8 +640,9 @@ With more than one URL, `internal/cli` builds a `stream.Pool` instead of a
 single `rpc.Client`, so every command gains failover without knowing about it.
 
 - Calls are distributed **round-robin** across healthy endpoints.
-- A retryable failure marks the endpoint unhealthy and puts it in a cooldown
-  (default 30s); the same call is retried on the next endpoint.
+- A retryable failure marks the endpoint unhealthy and applies an exponential
+  cooldown (500ms initial, 30s cap, jittered); the same call is retried on the
+  next endpoint.
 - Permanent errors (`rpc.Permanent`) stop failover immediately — retrying a
   malformed cursor on another backend cannot help.
 - When **every** endpoint is cooling down, the one closest to recovery is
@@ -652,7 +653,9 @@ single `rpc.Client`, so every command gains failover without knowing about it.
   Pool never leaks a goroutine.
 
 Options: `WithHealthInterval` (0 disables the probe), `WithHealthTimeout`,
-`WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
+`WithBackoff`, `WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
+CLI tuning and rate-limit behavior are covered in
+[docs/guides/rpc_pooling_and_failover.md](guides/rpc_pooling_and_failover.md).
 
 ## Debug wire log (`--wire-log`)
 

@@ -231,7 +231,8 @@ func (c ParquetConfig) validate() error {
 }
 
 // Parquet writes records as columnar Parquet part files, encoded by an
-// embedded DuckDB instance.
+// embedded DuckDB instance. See docs/sinks/parquet_and_cloud_storage.md for
+// CLI flags, the union schema, and partitioned analytics recipes.
 //
 // Rows are staged in an in-memory DuckDB table and copied out with
 // `COPY … TO`. Each flush becomes one part file, so memory stays bounded even
