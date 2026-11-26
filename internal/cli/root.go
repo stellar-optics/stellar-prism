@@ -7,10 +7,10 @@
 // Flag names deliberately mirror stellar-xdr-lens where the concept is
 // shared (--json, --color), so the two tools feel like one family.
 //
-// Configuration is resolved through Viper: ~/.config/prism/config.yaml,
-// .prism.yaml in the current directory, environment variables prefixed with
-// PRISM_, and then explicit CLI flags. See config.go for the resolution
-// order and the tests for the acceptance criteria.
+// Every flag can also be supplied by a PRISM_<FLAG> environment variable or
+// a config file (<user config dir>/prism/config.yaml, then .prism.yaml in the
+// current directory). Precedence is CLI flag > environment > config file >
+// default; see config_apply.go and docs/cli/config_options.md.
 package cli
 
 import (
@@ -213,8 +213,8 @@ type globalFlags struct {
 	wireLogMaxBody int64
 
 	// configFile is an explicit path to a prism config file. When empty,
-	// Viper searches ~/.config/prism/config.yaml and then .prism.yaml in the
-	// current directory.
+	// <user config dir>/prism/config.yaml is read and .prism.yaml in the
+	// current directory is merged over it. See applyConfigSources.
 	configFile string
 	// pprofPort enables the runtime profiling server on 127.0.0.1 when it is
 	// greater than zero.
@@ -308,6 +308,11 @@ redacted before anything is written.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Fill unset flags from PRISM_* variables and the config files
+			// first, so everything below validates the resolved values.
+			if err := applyConfigSources(cmd, defaultConfigSources(g.configFile)); err != nil {
+				return err
+			}
 			if _, err := parseColorMode(g.color); err != nil {
 				return err
 			}
@@ -361,7 +366,7 @@ redacted before anything is written.`,
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
 	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
-	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load (default: ~/.config/prism/config.yaml then .prism.yaml in cwd)")
+	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load instead of the defaults (<user config dir>/prism/config.yaml, then .prism.yaml in the current directory); see docs/cli/config_options.md")
 	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
@@ -384,6 +389,7 @@ redacted before anything is written.`,
 		newAuditVerifyCmd(stdout, stderr),
 		newAggregateCmd(g, stdout, stderr),
 		newRewindCmd(stdout),
+		newReplayCmd(g, stdout, stderr),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
 	)

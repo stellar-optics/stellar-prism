@@ -26,6 +26,15 @@ const DefaultHAHeartbeat = 5 * time.Second
 // replaced within seconds.
 const DefaultHATTL = 15 * time.Second
 
+// DefaultHAStandbyPoll is how often a standby asks for the lease when no
+// other interval is configured.
+//
+// The request is a non-blocking lock attempt — a single system call that
+// fails at once while the leader is alive — so polling often costs nothing,
+// and it is what bounds failover: when the leader process dies the kernel
+// drops its lock, and the standby holds the lease within one poll.
+const DefaultHAStandbyPoll = 200 * time.Millisecond
+
 // ErrLeaseHeld is returned when the lease is held by another instance.
 var ErrLeaseHeld = errors.New("lease: held by another instance")
 
@@ -67,6 +76,10 @@ type LeaderElectionOptions struct {
 	// Heartbeat is how often the leader renews the lease. Zero uses
 	// DefaultHAHeartbeat.
 	Heartbeat time.Duration
+	// StandbyPoll is how often a standby asks for the lease. Zero uses
+	// DefaultHAStandbyPoll. It is capped at Heartbeat: a standby never polls
+	// less often than the leader renews.
+	StandbyPoll time.Duration
 	// TTL is how long the lease stays valid without a renewal. Zero uses
 	// DefaultHATTL. A TTL shorter than twice the heartbeat would hand the
 	// lease away while the leader was still working on it, so it is raised.
@@ -139,6 +152,12 @@ func NewLeaderElection(opts LeaderElectionOptions) (*LeaderElection, error) {
 	if opts.TTL <= 0 {
 		opts.TTL = DefaultHATTL
 	}
+	if opts.StandbyPoll <= 0 {
+		opts.StandbyPoll = DefaultHAStandbyPoll
+	}
+	if opts.StandbyPoll > opts.Heartbeat {
+		opts.StandbyPoll = opts.Heartbeat
+	}
 	if opts.TTL < 2*opts.Heartbeat {
 		// A lease that expires before the leader could renew it would be
 		// handed away while the leader was still working on it.
@@ -168,6 +187,9 @@ func defaultHolderID() string {
 
 // Path returns the lease file the election locks.
 func (e *LeaderElection) Path() string { return e.opts.Path }
+
+// StandbyPoll returns how often a standby asks for the lease.
+func (e *LeaderElection) StandbyPoll() time.Duration { return e.opts.StandbyPoll }
 
 // Holder returns the instance identity written into the lease record.
 func (e *LeaderElection) Holder() string { return e.opts.Holder }
@@ -222,9 +244,17 @@ func (e *LeaderElection) Close() error {
 }
 
 // heartbeat renews the lease, or takes it, until the context is cancelled.
+//
+// The leader renews every Heartbeat. A standby runs a non-blocking poll loop
+// at the faster StandbyPoll interval: each pass is one lock attempt that
+// fails immediately while the leader lives, so the standby never blocks on
+// the lock, stays responsive to cancellation, and takes the lease within one
+// poll of the leader's lock being released.
 func (e *LeaderElection) heartbeat(ctx context.Context) {
 	for {
+		wait := e.opts.StandbyPoll
 		if e.IsLeader() {
+			wait = e.opts.Heartbeat
 			renewed, err := e.Renew(ctx)
 			if err != nil {
 				e.reportError(err)
@@ -235,12 +265,17 @@ func (e *LeaderElection) heartbeat(ctx context.Context) {
 				e.reportError(errLeaseFenced)
 			}
 		} else {
-			if _, err := e.Acquire(ctx); err != nil {
+			acquired, err := e.Acquire(ctx)
+			if err != nil {
 				e.reportError(err)
+			}
+			if acquired {
+				// Leading now: the next pass is a renewal.
+				wait = e.opts.Heartbeat
 			}
 		}
 
-		if err := e.clock.Sleep(ctx, e.opts.Heartbeat); err != nil {
+		if err := e.clock.Sleep(ctx, wait); err != nil {
 			return
 		}
 	}
@@ -479,12 +514,17 @@ func (e *LeaderElection) Ensure(ctx context.Context) (bool, error) {
 			// again until it is free.
 			acquired, err := e.Acquire(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					// The caller stopped asking between two polls; that
+					// is the same answer as a wait that was cut short.
+					return false, nil //nolint:nilerr // the wait ended because the caller stopped asking
+				}
 				return false, err
 			}
 			if acquired {
 				return true, nil
 			}
-			if err := e.clock.Sleep(ctx, e.opts.Heartbeat); err != nil {
+			if err := e.clock.Sleep(ctx, e.opts.StandbyPoll); err != nil {
 				return false, nil //nolint:nilerr // the wait ended because the caller stopped asking
 			}
 			continue

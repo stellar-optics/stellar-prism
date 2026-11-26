@@ -72,6 +72,11 @@ obvious next one — it is already a cursor-paginated API of the same shape.
 Implement `stream.Sink`. A file rotator or a webhook poster would each be
 small.
 
+[docs/contributing/authoring_custom_sinks.md](docs/contributing/authoring_custom_sinks.md)
+walks through the whole process: the `Emit`/`Flush`/`Close` contract, how to
+buffer without breaking backpressure or the delivery guarantee, a complete
+and tested Redis Streams sink, and how to wire a new sink into the CLI flags.
+
 ### Improve the fake
 
 `internal/fakerpc` is where new failure modes get simulated. If you can think
