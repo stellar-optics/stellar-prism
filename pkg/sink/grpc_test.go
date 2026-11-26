@@ -1,78 +1,159 @@
-package sink_test
+package sink
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/stellar-optics/stellar-prism/pkg/sink"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 	prismpb "github.com/stellar-optics/stellar-prism/proto"
 )
 
-func TestGRPCSinkStreamsEvents(t *testing.T) {
+// startGRPCSink serves a GRPCSink on a loopback port and returns a client.
+func startGRPCSink(t *testing.T) (*GRPCSink, *grpc.Server, prismpb.PrismStreamClient) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	s := NewGRPCSink()
+	server := grpc.NewServer()
+	prismpb.RegisterPrismStreamServer(server, s)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+
+	conn, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return s, server, prismpb.NewPrismStreamClient(conn)
+}
+
+// waitForSubscribers blocks until n event subscribers are registered, so a
+// test does not emit before the stream handler is listening.
+func waitForSubscribers(t *testing.T, s *GRPCSink, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		got := len(s.events)
+		s.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d subscribers", n)
+}
+
+func grpcTestEvent(id, contract string, ledger uint32) stream.Record {
+	return stream.Record{
+		ID:       id,
+		Sequence: ledger,
+		Time:     time.UnixMilli(1_700_000_000_000).UTC(),
+		Kind:     stream.KindEvent,
+		Event: &stream.Event{
+			Type:       "contract",
+			ContractID: contract,
+			TopicXDR:   []string{"AAAADwAAAAh0cmFuc2Zlcg=="},
+			ValueXDR:   "AAAAAQ==",
+		},
+	}
+}
+
+func TestGRPCSinkStreamsEventsAndFiltersByContract(t *testing.T) {
 	t.Parallel()
 
-	listener := bufconn.Listen(1 << 20)
-	grpcSink := sink.NewGRPCSink()
-	server := grpc.NewServer()
-	prismpb.RegisterPrismStreamServer(server, grpcSink)
-	go func() {
-		_ = server.Serve(listener)
-	}()
-	t.Cleanup(func() {
-		server.Stop()
-		_ = listener.Close()
-		_ = grpcSink.Close()
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	s, _, client := startGRPCSink(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, err := grpc.NewClient("passthrough:///bufnet",
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return listener.DialContext(ctx)
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient() error = %v", err)
-	}
-	defer conn.Close()
 
-	stream, err := prismpb.NewPrismStreamClient(conn).StreamEvents(ctx, &prismpb.EventRequest{})
+	all, err := client.StreamEvents(ctx, &prismpb.EventRequest{})
 	if err != nil {
-		t.Fatalf("StreamEvents() error = %v", err)
+		t.Fatalf("StreamEvents(all): %v", err)
+	}
+	only, err := client.StreamEvents(ctx, &prismpb.EventRequest{ContractId: "CB"})
+	if err != nil {
+		t.Fatalf("StreamEvents(CB): %v", err)
+	}
+	waitForSubscribers(t, s, 2)
+
+	for _, r := range []stream.Record{
+		grpcTestEvent("0000000010-0000000001", "CA", 10),
+		grpcTestEvent("0000000010-0000000002", "CB", 10),
+	} {
+		if err := s.Emit(r); err != nil {
+			t.Fatalf("Emit: %v", err)
+		}
 	}
 
-	record := eventRecord()
-	type result struct {
-		resp *prismpb.EventResponse
-		err  error
+	for _, want := range []string{"0000000010-0000000001", "0000000010-0000000002"} {
+		msg, err := all.Recv()
+		if err != nil {
+			t.Fatalf("all.Recv: %v", err)
+		}
+		if msg.GetId() != want {
+			t.Fatalf("all got id %q, want %q", msg.GetId(), want)
+		}
 	}
-	results := make(chan result, 1)
+
+	msg, err := only.Recv()
+	if err != nil {
+		t.Fatalf("only.Recv: %v", err)
+	}
+	if msg.GetId() != "0000000010-0000000002" || msg.GetLedger() != 10 ||
+		msg.GetClosedAtUnixMs() != 1_700_000_000_000 {
+		t.Fatalf("unexpected filtered message: %+v", msg)
+	}
+	// record_json is the documented `--json --raw` NDJSON line.
+	var rec map[string]any
+	if err := json.Unmarshal(msg.GetRecordJson(), &rec); err != nil {
+		t.Fatalf("record_json is not JSON: %v", err)
+	}
+	if rec["kind"] != "event" || rec["contract"] != "CB" || rec["valueXdr"] != "AAAAAQ==" {
+		t.Fatalf("unexpected record_json: %s", msg.GetRecordJson())
+	}
+}
+
+// TestGRPCSinkCloseEndsActiveStreams guards the serve shutdown path: closing
+// the sink must end every handler so GracefulStop can return while a client
+// is still connected.
+func TestGRPCSinkCloseEndsActiveStreams(t *testing.T) {
+	t.Parallel()
+
+	s, server, client := startGRPCSink(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	events, err := client.StreamEvents(ctx, &prismpb.EventRequest{})
+	if err != nil {
+		t.Fatalf("StreamEvents: %v", err)
+	}
+	waitForSubscribers(t, s, 1)
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := events.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("Recv after Close = %v, want io.EOF", err)
+	}
+
+	stopped := make(chan struct{})
 	go func() {
-		resp, err := stream.Recv()
-		results <- result{resp: resp, err: err}
+		server.GracefulStop()
+		close(stopped)
 	}()
-	for i := 0; i < 100; i++ {
-		if err := grpcSink.Emit(record); err != nil {
-			t.Fatalf("Emit() error = %v", err)
-		}
-		select {
-		case got := <-results:
-			if got.err != nil {
-				t.Fatalf("Recv() error = %v", got.err)
-			}
-			if got.resp.GetId() != record.ID || got.resp.GetLedger() != record.Sequence {
-				t.Fatalf("response = %+v, want id %q ledger %d", got.resp, record.ID, record.Sequence)
-			}
-			return
-		case <-time.After(10 * time.Millisecond):
-		}
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GracefulStop did not return after the sink was closed")
 	}
-	t.Fatal("timed out waiting for a streamed event")
 }
