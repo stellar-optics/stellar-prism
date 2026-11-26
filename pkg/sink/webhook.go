@@ -218,6 +218,29 @@ func (w *Webhook) EmitBatch(records []stream.Record) error {
 	return nil
 }
 
+// EmitJSON sends one JSON payload immediately through the webhook's configured
+// endpoint, signature and retry policy. It is suitable for structured alerts
+// that are not stream records.
+func (w *Webhook) EmitJSON(payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("webhook: encoding JSON payload: %w", err)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return fmt.Errorf("webhook: emit after close")
+	}
+	if w.asyncErr != nil {
+		return w.asyncErr
+	}
+	if err := w.flushLocked(); err != nil {
+		return err
+	}
+	return w.deliverJSON(body)
+}
+
 func (w *Webhook) emitLocked(r stream.Record) error {
 	if w.closed {
 		return fmt.Errorf("webhook: emit after close")
@@ -299,7 +322,17 @@ func (w *Webhook) deliver(batch []stream.Record) error {
 	if err != nil {
 		return err
 	}
+	return w.deliverBody(deliveryID, body, len(batch))
+}
 
+func (w *Webhook) deliverJSON(body []byte) error {
+	w.deliveries++
+	now := w.now().UTC()
+	deliveryID := fmt.Sprintf("%d-%d", now.UnixNano(), w.deliveries)
+	return w.deliverBody(deliveryID, body, 1)
+}
+
+func (w *Webhook) deliverBody(deliveryID string, body []byte, recordCount int) error {
 	var lastErr error
 	for attempt := 0; attempt <= w.opts.MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -315,7 +348,7 @@ func (w *Webhook) deliver(batch []stream.Record) error {
 		}
 	}
 
-	return fmt.Errorf("webhook: delivering %d records to %s: %w", len(batch), w.opts.URL, lastErr)
+	return fmt.Errorf("webhook: delivering payload (%d records) to %s: %w", recordCount, w.opts.URL, lastErr)
 }
 
 func (w *Webhook) payload(batch []stream.Record) ([]byte, string, error) {
