@@ -19,12 +19,9 @@ type NATSPublisher interface {
 	Close() error
 }
 
-// natsDeduplicatingPublisher is implemented by publishers that can attach
-// the JetStream Nats-Msg-Id header. It is optional so existing publishers
-// keep working unchanged.
-type natsDeduplicatingPublisher interface {
-	PublishWithMsgID(subject string, data []byte, msgID string) error
-}
+// NATSSink supports publishers that can attach the JetStream Nats-Msg-Id
+// header for deduplication; this comment documents the capability used by
+// publishNATS, which checks each publisher type at runtime.
 
 type NATSOptions struct {
 	URL       string

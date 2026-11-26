@@ -914,7 +914,7 @@ func (s *contractSpec) decodeEvent(e *stream.Event) *stream.TypedEvent {
 				continue
 			}
 			typed.Fields = append(typed.Fields, stream.TypedField{
-				Name:  string(param.Name),
+				Name:  param.Name,
 				Value: formatScValRaw(e.TopicXDR[topicIndex]),
 			})
 			topicIndex++
@@ -927,15 +927,15 @@ func (s *contractSpec) decodeEvent(e *stream.Event) *stream.TypedEvent {
 		// into a map keyed by parameter name.
 		if dataParams <= 1 {
 			typed.Fields = append(typed.Fields, stream.TypedField{
-				Name:  string(param.Name),
+				Name:  param.Name,
 				Value: formatScValValue(*data),
 			})
 			continue
 		}
 		if data.Type == xdr.ScValTypeScvMap && data.Map != nil {
-			if value := scMapEntryValue(**data.Map, string(param.Name)); value != nil {
+			if value := scMapEntryValue(**data.Map, param.Name); value != nil {
 				typed.Fields = append(typed.Fields, stream.TypedField{
-					Name:  string(param.Name),
+					Name:  param.Name,
 					Value: formatScValValue(*value),
 				})
 			}

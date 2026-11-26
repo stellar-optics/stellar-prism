@@ -35,10 +35,10 @@ func (c *eventStreamServiceClient) Subscribe(ctx context.Context, in *FilterRequ
 		return nil, err
 	}
 	x := &grpc.GenericClientStream[FilterRequest, EventRecord]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
+	if err := x.SendMsg(in); err != nil {
 		return nil, err
 	}
-	if err := x.ClientStream.CloseSend(); err != nil {
+	if err := x.CloseSend(); err != nil {
 		return nil, err
 	}
 	return x, nil
@@ -77,7 +77,10 @@ func _EventStreamService_Subscribe_Handler(srv any, stream grpc.ServerStream) er
 	if err := stream.RecvMsg(in); err != nil {
 		return err
 	}
-	return srv.(EventStreamServiceServer).Subscribe(in, &eventStreamServiceSubscribeServer{stream})
+	if err := srv.(EventStreamServiceServer).Subscribe(in, &eventStreamServiceSubscribeServer{stream}); err != nil {
+		return err
+	}
+	return nil
 }
 
 type eventStreamServiceSubscribeServer struct {
@@ -85,7 +88,7 @@ type eventStreamServiceSubscribeServer struct {
 }
 
 func (s *eventStreamServiceSubscribeServer) Send(m *EventRecord) error {
-	return s.ServerStream.SendMsg(m)
+	return s.SendMsg(m)
 }
 
 var EventStreamService_ServiceDesc = grpc.ServiceDesc{
