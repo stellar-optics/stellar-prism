@@ -110,6 +110,9 @@ type endpoint struct {
 //
 // A background goroutine probes unhealthy endpoints and restores them as they
 // recover. Close stops it and waits, so a Pool never leaks a goroutine.
+//
+// See docs/guides/rpc_pooling_and_failover.md for operator configuration,
+// rate-limit handling, and the limits of the implemented strategies.
 type Pool struct {
 	mu        sync.Mutex
 	endpoints []*endpoint

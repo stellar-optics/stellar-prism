@@ -981,5 +981,6 @@ use the replacement shown.
 | Help text says | Use instead |
 |---|---|
 | `prism --timescale-dsn ...` (root examples) | no TimescaleDB flag is registered; use `--pg-dsn` for cursors, or a Kafka/webhook sink into your database |
-| `prism --parquet-dir ./txs` (root examples) | `--sink-parquet-dir ./txs` |
 | `prism audit --from-line 1 ...` | no such flag; filter the input first, e.g. `tail -n +2 events.ndjson \| prism audit` |
+
+`--parquet-dir` is a real alias for `--sink-parquet-dir`; both are accepted.
