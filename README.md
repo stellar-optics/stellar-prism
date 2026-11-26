@@ -162,3 +162,17 @@ prism trades --pair XLM/USDC --json --follow | jq -c 'select(.sold_asset=="nativ
 - OHLC / candle aggregation
 
 > ⚠ Before merging, remove any roadmap item the code already implements.
+
+---
+
+## 6. Documentation
+
+- [CLI Command Reference](docs/cli/command_reference.md)
+- [Configuration Options](docs/cli/config_options.md)
+- [Architecture Overview](docs/architecture.md)
+- [Event Deduplication Internals](docs/architecture/deduplication_internals.md)
+- [Fee Stats Streaming Guide](docs/guides/fee_stats_streaming.md)
+- [Troubleshooting Streaming Gaps and RPC Lag](docs/troubleshooting/streaming_gaps_and_lag.md)
+- [Performance Tuning and Profiling](docs/performance/tuning_and_profiling.md)
+- [KMS and State File Encryption](docs/security/kms_and_state_encryption.md)
+- [Authoring Custom Sinks](docs/contributing/authoring_custom_sinks.md)
