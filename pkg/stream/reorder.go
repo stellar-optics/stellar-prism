@@ -155,7 +155,11 @@ type recordMinHeap []Record
 func (h recordMinHeap) Len() int           { return len(h) }
 func (h recordMinHeap) Less(i, j int) bool { return recordLess(h[i], h[j]) }
 func (h recordMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *recordMinHeap) Push(x any)        { *h = append(*h, x.(Record)) }
+func (h *recordMinHeap) Push(x any) {
+	if r, ok := x.(Record); ok {
+		*h = append(*h, r)
+	}
+}
 func (h *recordMinHeap) Pop() any {
 	old := *h
 	n := len(old)
@@ -224,16 +228,18 @@ func (b *ResequenceBuffer) Push(records []Record) ([]Record, error) {
 	for b.h.Len() > 0 {
 		top := b.h[0]
 		if top.Sequence < b.nextLedger {
-			r := heap.Pop(&b.h).(Record)
-			delete(b.seen, r.ID)
-			ready = append(ready, r)
+			if r, ok := heap.Pop(&b.h).(Record); ok {
+				delete(b.seen, r.ID)
+				ready = append(ready, r)
+			}
 			continue
 		}
 		if top.Sequence == b.nextLedger {
 			for b.h.Len() > 0 && b.h[0].Sequence == b.nextLedger {
-				r := heap.Pop(&b.h).(Record)
-				delete(b.seen, r.ID)
-				ready = append(ready, r)
+				if r, ok := heap.Pop(&b.h).(Record); ok {
+					delete(b.seen, r.ID)
+					ready = append(ready, r)
+				}
 			}
 			b.nextLedger++
 			continue
@@ -257,9 +263,10 @@ func (b *ResequenceBuffer) Flush() []Record {
 	}
 	ready := make([]Record, 0, b.h.Len())
 	for b.h.Len() > 0 {
-		r := heap.Pop(&b.h).(Record)
-		delete(b.seen, r.ID)
-		ready = append(ready, r)
+		if r, ok := heap.Pop(&b.h).(Record); ok {
+			delete(b.seen, r.ID)
+			ready = append(ready, r)
+		}
 	}
 	return ready
 }
