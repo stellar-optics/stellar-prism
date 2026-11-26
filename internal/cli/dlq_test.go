@@ -85,7 +85,9 @@ func TestDLQCapturesMalformedRecordEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "dead.ndjson")
-	sf := &streamFlags{from: 100, asJSON: true, dlqFile: path, pageSize: 10, backfillWorkers: 1}
+	sf := &streamFlags{from: 100, asJSON: true, dlqFile: path, pageSize: 10, backfillWorkers: 1,
+		sinks: sinkFlags{fanoutOverflow: string(sink.OverflowBlock)},
+	}
 
 	stdout, stderr, err := runStreamWithDLQ(t, sf)
 	if err != nil {
@@ -136,6 +138,7 @@ func TestDLQClosesItsFileWithBatching(t *testing.T) {
 		batch:           true,
 		batchSize:       1,
 		batchTimeout:    0,
+		sinks:           sinkFlags{fanoutOverflow: string(sink.OverflowBlock)},
 	}
 
 	if _, _, err := runStreamWithDLQ(t, sf); err != nil {
@@ -181,6 +184,7 @@ func TestDLQComposesWithTopicPatterns(t *testing.T) {
 				pageSize:        10,
 				backfillWorkers: 1,
 				topicPatterns:   []string{tc.pattern},
+				sinks:           sinkFlags{fanoutOverflow: string(sink.OverflowBlock)},
 			}
 
 			stdout, _, err := runStreamWithDLQ(t, sf)
