@@ -1,6 +1,6 @@
 # DEX Trades and AMM Swaps
 
-`prism trades` streams decentralized-exchange activity from the Stellar network and turns it into one normalized **trade record** per fill. It covers three sources:
+`prism trades` streams decentralized-exchange activity from the Stellar network and normalizes each fill into a single **trade record**. It covers three sources:
 
 | Source | Where it comes from | Amount units |
 |---|---|---|
