@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -571,4 +572,322 @@ func stringsContains(h, n string) bool {
 		}
 	}
 	return false
+}
+
+// --- Adaptive poller: ledger close time estimation ---
+
+// observeCloses feeds the estimator a run of consecutive ledgers closing at
+// the given intervals, each observed promptly, and returns the last close.
+func observeCloses(est *stream.LedgerCloseEstimator, first uint32, at time.Time, intervals ...time.Duration) (uint32, time.Time) {
+	ledger := first
+	est.Observe(ledger, at, at)
+	for _, d := range intervals {
+		ledger++
+		at = at.Add(d)
+		est.Observe(ledger, at, at)
+	}
+	return ledger, at
+}
+
+func repeatDuration(d time.Duration, n int) []time.Duration {
+	out := make([]time.Duration, n)
+	for i := range out {
+		out[i] = d
+	}
+	return out
+}
+
+func approxDuration(got, want, tolerance time.Duration) bool {
+	diff := got - want
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= tolerance
+}
+
+// TestLedgerCloseEstimatorTracksFluctuatingIntervals pins the EMA: it starts
+// from the nominal cadence, converges on a steady interval, and follows a
+// stretch from 5s to 8s within about one ten-ledger window, then recovers.
+func TestLedgerCloseEstimatorTracksFluctuatingIntervals(t *testing.T) {
+	t.Parallel()
+
+	est := stream.NewLedgerCloseEstimator(0, 0, 0)
+	if got := est.Interval(); got != stream.RoughLedgerCloseInterval {
+		t.Fatalf("Interval() before any close = %v, want %v", got, stream.RoughLedgerCloseInterval)
+	}
+
+	start := time.Unix(1_700_000_000, 0).UTC()
+	ledger, at := observeCloses(est, 100, start, repeatDuration(5*time.Second, 20)...)
+	if got := est.Interval(); !approxDuration(got, 5*time.Second, time.Millisecond) {
+		t.Fatalf("Interval() after steady 5s closes = %v, want 5s", got)
+	}
+
+	// Validator delays stretch closes to 8s. After one EMA window the
+	// estimate must have moved most of the way there (1-(9/11)^10 ≈ 87%).
+	ledger, at = observeCloses(est, ledger, at, repeatDuration(8*time.Second, 10)...)
+	if got := est.Interval(); got < 7*time.Second || got > 8*time.Second {
+		t.Fatalf("Interval() after ten 8s closes = %v, want in [7s, 8s]", got)
+	}
+
+	// The network recovers to 4s closes; the estimate follows back down.
+	_, _ = observeCloses(est, ledger, at, repeatDuration(4*time.Second, 20)...)
+	if got := est.Interval(); got < 4*time.Second || got > 4200*time.Millisecond {
+		t.Fatalf("Interval() after twenty 4s closes = %v, want ~4s", got)
+	}
+}
+
+// TestLedgerCloseEstimatorSkippedLedgersAverageOverDelta checks a poll that
+// sees several new ledgers at once divides the elapsed time between them
+// rather than treating it as one long interval.
+func TestLedgerCloseEstimatorSkippedLedgersAverageOverDelta(t *testing.T) {
+	t.Parallel()
+
+	est := stream.NewLedgerCloseEstimator(0, 0, 0)
+	start := time.Unix(1_700_000_000, 0).UTC()
+	est.Observe(10, start, start)
+	est.Observe(13, start.Add(18*time.Second), start.Add(18*time.Second))
+	if got := est.Interval(); got != 6*time.Second {
+		t.Fatalf("Interval() = %v, want 6s (18s over 3 ledgers)", got)
+	}
+}
+
+// TestLedgerCloseEstimatorSleepSubtractsLatency checks the scheduling
+// formula: sleepTime = nextClose - now - estimatedRpcLatency.
+func TestLedgerCloseEstimatorSleepSubtractsLatency(t *testing.T) {
+	t.Parallel()
+
+	est := stream.NewLedgerCloseEstimator(0, 0, 0)
+	est.ObserveLatency(200 * time.Millisecond)
+	start := time.Unix(1_700_000_000, 0).UTC()
+	_, last := observeCloses(est, 1, start, repeatDuration(5*time.Second, 10)...)
+
+	if got, want := est.NextClose(), last.Add(5*time.Second); !approxDuration(got.Sub(want), 0, time.Millisecond) {
+		t.Fatalf("NextClose() = %v, want %v", got, want)
+	}
+	now := last.Add(time.Second)
+	// 5s after the last close, minus the 1s already elapsed and the 200ms
+	// round trip. The self-tuning margin may have crept a little earlier
+	// after ten on-time ledgers, never by more than marginStep (250ms) per
+	// four hits.
+	want := 3800 * time.Millisecond
+	if got := est.Sleep(now); got > want || got < want-time.Second {
+		t.Fatalf("Sleep() = %v, want just under %v", got, want)
+	}
+}
+
+// TestLedgerCloseEstimatorSleepClamps checks both bounds: a stalled network
+// cannot park the stream for longer than 10s, and an overdue ledger is
+// retried no sooner than 500ms, backing off on consecutive empty polls.
+func TestLedgerCloseEstimatorSleepClamps(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_700_000_000, 0).UTC()
+
+	t.Run("long intervals clamp to max", func(t *testing.T) {
+		est := stream.NewLedgerCloseEstimator(0, 0, 0)
+		_, last := observeCloses(est, 1, start, repeatDuration(30*time.Second, 5)...)
+		if got := est.Sleep(last); got != stream.DefaultCloseEstimateMaxSleep {
+			t.Fatalf("Sleep() = %v, want %v", got, stream.DefaultCloseEstimateMaxSleep)
+		}
+	})
+
+	t.Run("overdue ledger clamps to min then backs off", func(t *testing.T) {
+		est := stream.NewLedgerCloseEstimator(0, 0, 0)
+		ledger, last := observeCloses(est, 1, start, repeatDuration(5*time.Second, 10)...)
+		now := last.Add(6 * time.Second) // the next ledger is a second late
+		if got := est.Sleep(now); got != stream.DefaultCloseEstimateMinSleep {
+			t.Fatalf("Sleep() overdue = %v, want %v", got, stream.DefaultCloseEstimateMinSleep)
+		}
+		var prev time.Duration
+		for i := 0; i < 5; i++ {
+			est.Observe(ledger, last, now) // still no new ledger
+			got := est.Sleep(now)
+			if got < stream.DefaultCloseEstimateMinSleep || got > est.Interval() {
+				t.Fatalf("miss %d: Sleep() = %v, want within [%v, %v]", i+1, got, stream.DefaultCloseEstimateMinSleep, est.Interval())
+			}
+			if got < prev {
+				t.Fatalf("miss %d: Sleep() = %v shrank from %v; consecutive misses must back off", i+1, got, prev)
+			}
+			prev = got
+			now = now.Add(got)
+		}
+		if prev <= stream.DefaultCloseEstimateMinSleep {
+			t.Fatalf("Sleep() after repeated misses = %v, want growth beyond %v", prev, stream.DefaultCloseEstimateMinSleep)
+		}
+	})
+
+	t.Run("custom bounds are honoured", func(t *testing.T) {
+		est := stream.NewLedgerCloseEstimator(0, 2*time.Second, 3*time.Second)
+		_, last := observeCloses(est, 1, start, repeatDuration(30*time.Second, 5)...)
+		if got := est.Sleep(last); got != 3*time.Second {
+			t.Fatalf("Sleep() = %v, want 3s", got)
+		}
+		if got := est.Sleep(last.Add(time.Hour)); got < 2*time.Second {
+			t.Fatalf("Sleep() overdue = %v, want at least 2s", got)
+		}
+	})
+}
+
+type pollSimStats struct {
+	polls, empty int
+	// staleness is the mean delay between a ledger becoming available on
+	// the RPC and the poller first seeing it.
+	staleness time.Duration
+}
+
+// simulateLedgerPolling replays two hours of a network whose close interval
+// fluctuates between calm (4-6s) and congested (7-9s) phases against a
+// polling strategy. The RPC serves each ledger 300ms after it closes, reports
+// close times truncated to whole seconds as the real API does, and answers
+// each request in 120ms.
+func simulateLedgerPolling(seed uint64, next func(head uint32, closedAt, observedAt time.Time) time.Duration) pollSimStats {
+	const (
+		ingest  = 300 * time.Millisecond
+		latency = 120 * time.Millisecond
+	)
+	rng := rand.New(rand.NewPCG(seed, seed*7+1)) //nolint:gosec // deterministic test data
+	start := time.Unix(1_700_000_000, 0).UTC()
+	var closes []time.Time
+	for at := start; at.Sub(start) < 2*time.Hour; {
+		lo, hi := 4.0, 6.0
+		if int(at.Sub(start)/(15*time.Minute))%3 == 1 {
+			lo, hi = 7.0, 9.0
+		}
+		at = at.Add(time.Duration((lo + rng.Float64()*(hi-lo)) * float64(time.Second)))
+		closes = append(closes, at)
+	}
+	end := closes[len(closes)-1]
+
+	var (
+		stats      pollSimStats
+		prev       uint32
+		staleTotal time.Duration
+		seen       int
+		available  int // closes[:available] are served at the current time
+	)
+	for now := start; now.Before(end); {
+		served := now.Add(latency / 2)
+		for available < len(closes) && !closes[available].Add(ingest).After(served) {
+			available++
+		}
+		head := uint32(available) //nolint:gosec // bounded by the simulation length
+		var closedAt time.Time
+		if available > 0 {
+			closedAt = closes[available-1].Truncate(time.Second)
+		}
+		observed := now.Add(latency)
+		stats.polls++
+		if head == prev {
+			stats.empty++
+		} else if prev != 0 {
+			for l := prev + 1; l <= head; l++ {
+				staleTotal += observed.Sub(closes[l-1].Add(ingest))
+				seen++
+			}
+		}
+		prev = head
+		now = observed.Add(next(head, closedAt, observed))
+	}
+	if seen > 0 {
+		stats.staleness = staleTotal / time.Duration(seen)
+	}
+	return stats
+}
+
+// TestLedgerCloseEstimatorReducesEmptyPolls is the acceptance check for the
+// EMA scheduler: against the ledger-count poller it replaces, it must cut
+// polls that find no new ledger by more than 40% across fluctuating close
+// intervals, while still seeing each ledger well within one close interval.
+func TestLedgerCloseEstimatorReducesEmptyPolls(t *testing.T) {
+	t.Parallel()
+
+	for _, seed := range []uint64{1, 2, 3} {
+		oldPoller := stream.NewAdaptivePoller(0, 0, 2)
+		var oldPrev uint32
+		baseline := simulateLedgerPolling(seed, func(head uint32, _, _ time.Time) time.Duration {
+			n := 0
+			if oldPrev != 0 && head > oldPrev {
+				n = int(head - oldPrev)
+			}
+			oldPrev = head
+			return oldPoller.Observe(n)
+		})
+
+		est := stream.NewLedgerCloseEstimator(0, 0, 0)
+		ema := simulateLedgerPolling(seed, func(head uint32, closedAt, observedAt time.Time) time.Duration {
+			est.ObserveLatency(120 * time.Millisecond)
+			est.Observe(head, closedAt, observedAt)
+			return est.Sleep(observedAt)
+		})
+
+		reduction := 1 - float64(ema.empty)/float64(baseline.empty)
+		t.Logf("seed %d: baseline %d polls (%d empty, staleness %v); EMA %d polls (%d empty, staleness %v); empty-poll reduction %.1f%%",
+			seed, baseline.polls, baseline.empty, baseline.staleness.Round(time.Millisecond),
+			ema.polls, ema.empty, ema.staleness.Round(time.Millisecond), 100*reduction)
+		if reduction <= 0.40 {
+			t.Errorf("seed %d: empty-poll reduction %.1f%%, want > 40%%", seed, 100*reduction)
+		}
+		if ema.staleness > 2*time.Second {
+			t.Errorf("seed %d: mean staleness %v, want under 2s", seed, ema.staleness)
+		}
+	}
+}
+
+// headSource is a Source whose head advances with the fake clock at a fixed
+// cadence and reports the close time of each ledger, standing in for an
+// idle contract on a live network.
+type headSource struct {
+	clock    *fakeClock
+	start    time.Time
+	interval time.Duration
+	lastHead uint32
+	fetches  int
+	empty    int
+}
+
+func (s *headSource) Name() string { return "head" }
+
+func (s *headSource) CursorLedger(string) (uint32, bool) { return 0, false }
+
+func (s *headSource) Fetch(context.Context, string) (stream.Batch, error) {
+	elapsed := s.clock.Now().Sub(s.start)
+	head := uint32(elapsed/s.interval) + 1 //nolint:gosec // bounded test duration
+	s.fetches++
+	if head == s.lastHead {
+		s.empty++
+	}
+	s.lastHead = head
+	return stream.Batch{
+		Records:         []stream.Record{},
+		NextCursor:      "cursor",
+		Latest:          head,
+		LatestCloseTime: s.start.Add(time.Duration(head-1) * s.interval),
+	}, nil
+}
+
+// TestTailAdaptiveSchedulesPollsAtLedgerCloses runs the real tailer with
+// --adaptive against a head advancing every 6s and checks it settles into
+// roughly one poll per ledger, with every wait inside the 500ms-10s clamp.
+func TestTailAdaptiveSchedulesPollsAtLedgerCloses(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeClock()
+	src := &headSource{clock: clock, start: clock.Now(), interval: 6 * time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clock.maxSleeps = 200
+	clock.onBudget = cancel
+
+	err := stream.NewTailer(src, &collector{}, stream.Options{Follow: true, Adaptive: true, Clock: clock}).Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for i, d := range clock.slept {
+		if d < stream.DefaultCloseEstimateMinSleep || d > stream.DefaultCloseEstimateMaxSleep {
+			t.Fatalf("wait %d = %v, outside [%v, %v]", i, d, stream.DefaultCloseEstimateMinSleep, stream.DefaultCloseEstimateMaxSleep)
+		}
+	}
+	if frac := float64(src.empty) / float64(src.fetches); frac > 0.25 {
+		t.Fatalf("%d of %d polls found no new ledger (%.0f%%), want at most 25%%", src.empty, src.fetches, 100*frac)
+	}
 }

@@ -10,6 +10,10 @@ import (
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
+// newSimulateCmd constructs the "prism simulate" command.
+//
+// See docs/guides/offline_simulation.md for resource budget metrics,
+// preflight vs. on-chain differences, and CI validation recipes.
 func newSimulateCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		sf       streamFlags
