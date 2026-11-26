@@ -313,6 +313,9 @@ func runAggregate(
 	}
 	dsn := sf.pgDSN
 	if dsn == "" {
+		dsn = sf.statePG
+	}
+	if dsn == "" {
 		dsn = os.Getenv(envPGDSN)
 	}
 	store, closeStore, err := openCursorStore(ctx, dsn)

@@ -49,7 +49,8 @@ type streamFlags struct {
 	maxGapRecoveries int
 	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
 	// to the environment default resolved in runStream.
-	pgDSN string
+	pgDSN   string
+	statePG string
 	// pgCursorKey overrides the derived cursor row name.
 	pgCursorKey string
 	// derivedKey is computed by each command from its own query before
@@ -203,6 +204,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"longest wait between retries of a failed RPC call (0 uses the default)")
 	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
 		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
+	cmd.Flags().StringVar(&s.statePG, "state-pg", "",
+		"alias for --pg-dsn: PostgreSQL DSN for a durable cursor")
 	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
 		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
@@ -1423,6 +1426,9 @@ func runStream(
 		key = sf.pgCursorKey
 	}
 	dsn := sf.pgDSN
+	if dsn == "" {
+		dsn = sf.statePG
+	}
 	if dsn == "" {
 		dsn = os.Getenv(envPGDSN)
 	}
