@@ -58,6 +58,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   completion.go       bash/zsh/fish/powershell script generation
   config.go           Viper-based configuration file resolution (~/.config/prism/config.yaml, .prism.yaml)
   config_test.go      unit tests for config resolution
+  config_apply.go     fills unset flags from PRISM_* variables and config files (flag > env > file > default)
   abi_resolve.go      contract WASM lookup and embedded-spec parsing
   state.go            the cursor journal, the pruner, and the resume point
   runtime.go          the health server, the lease and the state key source
@@ -93,8 +94,9 @@ pkg/stream/
   clock.go            Clock and Backoff, both injectable
   topic_pattern.go    client-side topic matching over decoded text
   demux.go            per-contract fan-out, queues + one goroutine each
-  time_window.go      --since → approximate start ledger
-  backoff.go          AdaptivePoller for --adaptive follow waits
+  time_window.go      --since → approximate start ledger; SlidingWindowBuffer for --aggregate
+  watchlist.go        WatchlistFilter: hot-reloaded --watchlist contract set
+  backoff.go          AdaptivePoller, the --adaptive fallback before close times are known
   state_file.go       durable cursor: atomic, file-backed stream position
 pkg/sink/
   ndjson.go           NDJSON, one object per line
@@ -220,6 +222,99 @@ legitimately (an operator re-pointing a key) from a bug, and silently refusing
 to move would hide the operator's intent. Run one tailer per key and the
 question does not arise.
 
+diff --git a/pkg/sink/timescale.go b/pkg/sink/timescale.go
+--- a/pkg/sink/timescale.go
++++ b/pkg/sink/timescale.go
+@@
+-// hypertableSQL partitions by ledger rather than time:
+-func hypertableSQL(table string) string {
++// hypertableSQL partitions the event table by close time.
++func hypertableSQL(table string) string {
+ 	return fmt.Sprintf(
+-		`SELECT create_hypertable('%s', 'ledger', chunk_time_interval => %d, if_not_exists => TRUE)`,
+-		escapeLiteral(table), timescaleChunkInterval)
++		`SELECT create_hypertable('%s', 'closed_at',
++		  chunk_time_interval => INTERVAL '1 day',
++		  if_not_exists => TRUE)`,
++		escapeLiteral(table))
+ }
+diff --git a/internal/cli/sinks.go b/internal/cli/sinks.go
+--- a/internal/cli/sinks.go
++++ b/internal/cli/sinks.go
+@@ -35,6 +35,12 @@
+ 	pubsubTopic      string
+ 	metrics          *sink.Prometheus
+ 	constructedSinks []io.Closer
++
++	timescaleDSN         string
++	timescaleTable       string
++	timescaleBatchSize   int
++	timescaleFlushInterval time.Duration
++	timescaleNoHypertable bool
+ }
+@@
+ func (s *sinkFlags) register(cmd *cobra.Command) {
+ 	flags := cmd.Flags()
++
++	flags.StringVar(&s.timescaleDSN, "timescale-dsn", "",
++		"PostgreSQL/TimescaleDB connection string")
++	flags.StringVar(&s.timescaleTable, "timescale-table", "prism_records",
++		"TimescaleDB destination table")
++	flags.IntVar(&s.timescaleBatchSize, "timescale-batch-size",
++		sink.DefaultTimescaleBatchSize,
++		"records per TimescaleDB COPY batch")
++	flags.DurationVar(&s.timescaleFlushInterval, "timescale-flush-interval",
++		sink.DefaultTimescaleFlushInterval,
++		"maximum wait for a partial TimescaleDB batch")
++	flags.BoolVar(&s.timescaleNoHypertable, "timescale-no-hypertable", false,
++		"write to a plain PostgreSQL table instead of a TimescaleDB hypertable")
+ 
+ 	flags.StringVar(&s.webhookURL, "webhook-url", "",
+ 		"POST batches of records as JSON to this HTTP(S) endpoint")
+@@
+ func (s *sinkFlags) validate(cmd *cobra.Command) error {
++	if s.timescaleTable != "" && s.timescaleDSN == "" {
++		if cmd.Flags().Changed("timescale-table") ||
++			cmd.Flags().Changed("timescale-batch-size") ||
++			cmd.Flags().Changed("timescale-flush-interval") ||
++			cmd.Flags().Changed("timescale-no-hypertable") {
++			return fmt.Errorf("--timescale-dsn is required with TimescaleDB options")
++		}
++	}
++	if s.timescaleBatchSize < 0 {
++		return fmt.Errorf("--timescale-batch-size must not be negative")
++	}
++	if s.timescaleFlushInterval < 0 {
++		return fmt.Errorf("--timescale-flush-interval must not be negative")
++	}
++
+ 	if s.webhookSecret != "" && s.webhookURL == "" {
+ 		return fmt.Errorf("--webhook-secret requires --webhook-url")
+ 	}
+@@
+ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error)) (out stream.Sink, err error) {
+ 	sinks := []stream.Sink{base}
+ 	s.constructedSinks = nil
++
++	if s.timescaleDSN != "" {
++		timescaleSink, timescaleErr := sink.NewTimescale(
++			context.Background(),
++			s.timescaleDSN,
++			sink.TimescaleConfig{
++				Table:         s.timescaleTable,
++				BatchSize:     s.timescaleBatchSize,
++				FlushInterval: s.timescaleFlushInterval,
++				NoHypertable:  s.timescaleNoHypertable,
++			},
++		)
++		if timescaleErr != nil {
++			return nil, timescaleErr
++		}
++		s.constructedSinks = append(s.constructedSinks, timescaleSink)
++		sinks = append(sinks, timescaleSink)
++	}
+*** End Patch
+
 ### Gap detection
 
 Records can be lost exactly one way: falling behind the RPC's retention window
@@ -242,6 +337,11 @@ is still announced: it reaches `Options.OnGap`, the CLI prints it on stderr,
 and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
 how many times a stream may skip ahead. A source without `Rewinder` cannot
 resume and fails exactly as it would under the default policy.
+
+The operator-facing side, covering diagnosing a gap, re-anchoring each kind
+of cursor store, backfilling from a longer-retention provider, and preventing
+lag from turning into a gap, is in
+[docs/troubleshooting/streaming_gaps_and_lag.md](troubleshooting/streaming_gaps_and_lag.md).
 
 ### Durable cursors (`--state-file`)
 
@@ -404,12 +504,13 @@ The engine is stateless: compilation happens before the stream starts, and
 `Match` is a pure function of the record. That keeps the evaluator offline-
 first and trivially testable without a network or a process.
 
-Supported context fields are `value`, `topics`, `contract`, `type`, `tx`,
-`ledger`, `txIndex` and `opIndex`. `value` and `topics` are decoded from XDR
-through lens, so `value.amount`, `topics[0].symbol` and nested map fields are
-all reachable. Operators follow Go syntax: arithmetic (`+`, `-`, `*`, `/`, `%`),
-comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean logic (`&&`, `||`, `!`),
-indexing (`topics[0]`) and parentheses.
+Supported context fields are `value`, `topics` (or `topic`), `contract`,
+`type`, `tx`, `ledger`, `txIndex` and `opIndex`. `value` and topics are decoded
+from XDR through lens, so `value.amount`, `topics[0].symbol`, the shorthand
+`topic[0]`, and nested map fields are all reachable. Operators follow Go syntax:
+arithmetic (`+`, `-`, `*`, `/`, `%`), comparison (`==`, `!=`, `<`, `<=`, `>`,
+`>=`), boolean logic (`&&`, `||`, `!`), indexing and parentheses.
+`contains(container, value)` checks for a substring, list item or object key.
 
 The rule engine wraps one or more compiled `stream.ExpressionFilter` predicates.
 Each predicate is matched in order; a record that any rule rejects is dropped,
@@ -444,30 +545,52 @@ so a fanout run terminates with no leaked goroutines and a joined error.
 
 `--dedup-window N` wraps the event sink in `stream.DedupSink`, which
 suppresses a record whose fingerprint was already emitted within the last `N`
-keys. The window is a fixed-size ring (`dedup.go`): the oldest key is evicted
-when a new one arrives, so memory is bounded by count rather than by traffic
-or elapsed time, and a hot contract cannot grow it without bound. A zero
-window disables the wrapper entirely.
+keys. The default is 10,000; a zero window disables the wrapper entirely. The
+window is a fixed-size ring (`dedup.go`): the oldest key is evicted when a new
+one arrives, so memory is bounded by count rather than by traffic or elapsed
+time, and a hot contract cannot grow it without bound.
 
 The fingerprint prefers the server's event ID, because a re-poll after a
 reconnect replays the same ID while two genuinely distinct events can carry
 byte-identical topics and values. Records without an ID fall back to a
 content hash over the event locator and payload. De-duplication lives at the
 sink seam, like pattern filtering, so the cursor still advances across a
-suppressed record and the tailer's delivery guarantee is unchanged.
+suppressed record and the tailer's delivery guarantee is unchanged. An
+intentional rewind clears the cache so replayed records can be delivered again.
+
+For key/hash computation details, `--dedup-window` memory sizing formulas,
+and window selection guidelines, see
+[docs/architecture/deduplication_internals.md](architecture/deduplication_internals.md).
 
 ### Adaptive polling
 
-`--adaptive` replaces the fixed `--poll` wait with an `AdaptivePoller`
-(backoff.go) whose only signal is how many new ledgers closed during the last
-wait: at least one means the wait matched or beat the ledger cadence, so
-shorten; zero means mostly dead time, so lengthen. With no cadence parameter
-at all that rule converges on oscillating around the real close rate, tracking
-a network it is never told about — and the stretchy bounds (`--min-poll`-less
-defaults 1s..30s) keep the invariant: never faster than Min, never slower
-than Max. Jitter spreads each returned wait over its lower half so several
-prism instances do not poll in phase. The tuner is one number in one
-goroutine, so its tests run deterministically — no wall-clock flakiness.
+`--adaptive` replaces the fixed `--poll` wait with a ledger close estimator
+(`LedgerCloseEstimator` in tail.go). Stellar closes a ledger roughly every
+5s, but validator voting delays and load spikes stretch that to 8s or more
+for runs of ledgers, so the estimator keeps an exponential moving average of
+observed close intervals over the last ~10 ledgers (smoothing factor 2/11)
+and schedules each poll for when the next ledger should first be served:
+
+    sleep = (lastClose + emaInterval + margin) - now - estimatedRpcLatency
+
+clamped to 500ms..10s. `lastClose` is the server-reported
+`latestLedgerCloseTime` (carried on `Batch.LatestCloseTime` from getEvents,
+getLedgers and getTransactions) or, for sources without it, the time the
+advance was observed. `estimatedRpcLatency` is an EMA of fetch round trips.
+`margin` self-tunes for RPC ingestion lag and the one-second granularity of
+close times: it grows on each poll that arrives before its ledger and shrinks
+slowly on polls that find exactly one new ledger. An overdue ledger is retried
+from 500ms, doubling per consecutive empty poll up to one interval. In a
+simulated two hours of fluctuating 4-9s closes this cuts empty polls by about
+95% against the ledger-count poller (see
+`TestLedgerCloseEstimatorReducesEmptyPolls`).
+
+Until the head has advanced once there is no interval to predict from, so the
+`AdaptivePoller` (backoff.go) drives the wait: its only signal is how many new
+ledgers closed during the last wait, shortening when at least one did and
+lengthening on dead time within 1s..30s. It also remains the poller for
+sources that report no head ledger at all. Both run in the tailer's single
+goroutine and are tested deterministically against a fake clock.
 ### Parallel historical backfill
 
 `--backfill-workers N` (with an explicit `--from`) uses `Drainer` instead of
@@ -693,6 +816,10 @@ nothing listening or running. `internal/cli.ProfilerFactory` is the seam: the
 binary supplies the real implementation, while tests use a fake to assert the
 flag wiring and cleanup without opening a socket.
 
+For reading profiles, the `sync.Pool` usage in the hot path and
+`GOGC`/`GOMEMLIMIT` guidance for containers, see
+[docs/performance/tuning_and_profiling.md](performance/tuning_and_profiling.md).
+
 ## Graceful drain (`Tailer.Drain`)
 
 On SIGTERM or Ctrl-C, prism stops scheduling new RPC calls and then gives
@@ -836,6 +963,10 @@ Passing more than one source is an error rather than a silently ignored flag:
 an operator who believes the file is encrypted with a passphrase must never
 end up with a file encrypted with something else.
 
+The operator guide, with KMS key setup, the exact AWS and GCP IAM
+permissions, key rotation and the tamper-detection model, is
+[docs/security/kms_and_state_encryption.md](security/kms_and_state_encryption.md).
+
 ## Derived transaction streams
 
 Soroban RPC has no dedicated endpoints for storage mutations or deployments.
@@ -848,8 +979,12 @@ guarantee apply unchanged.
 `StorageChangeSource` decodes `ResultMetaXDR` and emits one record per
 contract-related ledger entry mutation: `contract_data`, `contract_code` or
 `ttl`, with change type `created` / `updated` / `removed` / `restored`.
-Filters (`--contract`, `--change`, `--entry`) are validated up front so a
-typo fails immediately rather than streaming nothing.
+Filters (`--contract`, `--change`, `--entry`, `--key`) are validated up front
+so a typo fails immediately rather than streaming nothing. `--key` matches
+contract data by its storage key (a base64 XDR ScVal; `AAAAFA==` is the
+instance key). The record schema, durability types, state diffing and TTL
+projections are covered in
+[docs/guides/storage_change_streaming.md](guides/storage_change_streaming.md).
 
 ### WASM uploads and deployments (`prism wasm`)
 
@@ -1265,6 +1400,7 @@ path; the reported `events/op` makes the scale explicit, and the custom
 | `BenchmarkDedupSinkFiftyThousandEvents` | fingerprinting plus the bounded de-duplication ring |
 | `BenchmarkReorderBufferFiftyThousandEvents` | per-ledger sorting and release |
 | `BenchmarkEventKeyFiftyThousandEvents` | the de-duplication key itself |
+| `BenchmarkEventPipelineAllocations` | RPC event mapping, ID de-duplication and pooled page buffers |
 
 The benchmarks use a fixed in-memory source and no wall-clock waits, so they
 make no network calls and produce the same record IDs on every run. `TestStreamingFiftyThousandEvents`
@@ -1280,7 +1416,8 @@ On the reference CI machine the raw tailer path is well above the target
 (roughly 1.4M events/s in a normal build, ~370 bytes/event); the dedup path is
 roughly 0.7M events/s at ~423 bytes/event. These numbers are diagnostics, not
 contracts — the contract is the test's 50,000 events/s floor and allocation
-ceiling.
+ceiling. Current baseline tables and a `benchstat` workflow are in
+[docs/benchmarks.md](benchmarks.md).
 
 ## Relationship to stellar-xdr-lens
 
@@ -1383,6 +1520,12 @@ whatever is buffered there; the CLI closes the sink it built. Decode XDR through
 `lens` rather than reaching for `xdr` directly, so output stays consistent with
 the rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
+
+The tailer persists the cursor as soon as `Emit` returns nil, so a sink that
+buffers must bound its buffer and block when it is full rather than drop or
+queue without limit. The full guide, covering the lifecycle, backpressure and
+concurrency rules, and a complete Redis Streams sink with offline tests, is
+[docs/contributing/authoring_custom_sinks.md](contributing/authoring_custom_sinks.md).
 
 ### Built-in sinks
 

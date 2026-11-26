@@ -92,11 +92,12 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 	}
 
 	batch := Batch{
-		Records:    make([]Record, 0, len(resp.Transactions)),
-		NextCursor: resp.Cursor,
-		Latest:     resp.LatestLedger,
-		Oldest:     resp.OldestLedger,
-		Full:       transactionPageIsFull(resp, s.query.PageLimit),
+		Records:         make([]Record, 0, len(resp.Transactions)),
+		NextCursor:      resp.Cursor,
+		Latest:          resp.LatestLedger,
+		LatestCloseTime: unixCloseTime(resp.LatestLedgerCloseTime),
+		Oldest:          resp.OldestLedger,
+		Full:            transactionPageIsFull(resp, s.query.PageLimit),
 	}
 	for _, tx := range resp.Transactions {
 		record := transactionRecord(tx)

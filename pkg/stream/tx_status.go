@@ -331,9 +331,9 @@ func (s *TransactionFilterSource) Fetch(ctx context.Context, cursor string) (Bat
 	out := Batch{
 		Records:    make([]Record, 0, len(batch.Records)),
 		NextCursor: batch.NextCursor,
-		Latest:     batch.Latest,
-		Oldest:     batch.Oldest,
-		Full:       batch.Full,
+		Latest:     batch.Latest, LatestCloseTime: batch.LatestCloseTime,
+		Oldest: batch.Oldest,
+		Full:   batch.Full,
 	}
 	for _, record := range batch.Records {
 		if record.Transaction == nil {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -120,7 +121,14 @@ func newRewindCmd(stdout io.Writer) *cobra.Command {
 			if err := stream.RewindCursor(path, distance.LedgerCount, distance.Duration); err != nil {
 				return err
 			}
-			state, err := stream.OpenStateFile(path)
+			streamID, err := rewindStreamID(path, streamID)
+			if err != nil {
+				return err
+			}
+			state, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{
+				StreamID:  streamID,
+				Retention: stream.DefaultStateRetention,
+			})
 			if err != nil {
 				return err
 			}
@@ -135,4 +143,40 @@ func newRewindCmd(stdout io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&path, "state-file", "", "state file to rewind")
 	cmd.Flags().StringVar(&by, "by", "", "rewind distance in ledgers or time (for example 1000 or 2h)")
 	return cmd
+}
+
+// rewindStreamID picks the partition to rewind. An explicit --stream-id is
+// used as given. Otherwise a single-stream file needs none, and a shared file
+// holding exactly one stream rewinds that one; a shared file holding several
+// is ambiguous, and the error lists them so the operator can choose.
+func rewindStreamID(path, explicit string) (string, error) {
+	ids, partitioned, err := stream.StateFileStreams(path)
+	if err != nil {
+		return "", err
+	}
+	if explicit != "" {
+		if !partitioned && ids == nil {
+			// A single-stream file: the stream ID selects the file as a
+			// whole once it is upgraded, so accept it.
+			return explicit, nil
+		}
+		for _, id := range ids {
+			if id == explicit {
+				return explicit, nil
+			}
+		}
+		return "", fmt.Errorf("state file %s has no stream %q; it holds: %s", path, explicit, strings.Join(ids, ", "))
+	}
+	if !partitioned {
+		return "", nil
+	}
+	switch len(ids) {
+	case 0:
+		return "", fmt.Errorf("cannot rewind an empty state file")
+	case 1:
+		return ids[0], nil
+	default:
+		return "", fmt.Errorf("state file %s is shared by %d streams; pass --stream-id with one of: %s",
+			path, len(ids), strings.Join(ids, ", "))
+	}
 }

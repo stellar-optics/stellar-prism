@@ -401,9 +401,24 @@ func TestEventsCommandStateFileResumesAcrossRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading state file: %v", err)
 	}
-	var st stream.State
-	if err := json.Unmarshal(data, &st); err != nil {
+	// The CLI keys every stream by its stream ID, so the file is a shared
+	// (partitioned) document holding this one stream.
+	var doc struct {
+		Version int                     `json:"version"`
+		Streams map[string]stream.State `json:"streams"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
 		t.Fatalf("state file is not valid JSON: %v\n%s", err, data)
+	}
+	if doc.Version != stream.PartitionedStateVersion || len(doc.Streams) != 1 {
+		t.Fatalf("state file = %s, want one stream in a version %d document", data, stream.PartitionedStateVersion)
+	}
+	var st stream.State
+	for id, entry := range doc.Streams {
+		if !strings.HasPrefix(id, "events/") {
+			t.Errorf("derived stream ID = %q, want it to start with the command name", id)
+		}
+		st = entry
 	}
 	last := events[len(events)-1]
 	if st.Version != stream.StateVersion || st.Source != "events" ||
@@ -904,20 +919,10 @@ func TestEventsCommandShutsDownCleanlyOnSignal(t *testing.T) {
 		t.Fatalf("reading the state file: %v", err)
 	}
 	var found bool
-	for _, line := range nonEmptyLines(string(data)) {
-		var meta struct {
-			Cursor string `json:"cursor"`
-			Ledger uint32 `json:"ledger"`
-		}
-		if err := json.Unmarshal([]byte(line), &meta); err != nil {
-			t.Errorf("the state file holds an unreadable entry: %v\n%s", err, line)
-			continue
-		}
-		if meta.Cursor != "" {
-			found = true
-			if meta.Ledger != 1002 {
-				t.Errorf("the committed cursor is at ledger %d, want 1002", meta.Ledger)
-			}
+	for _, e := range committedCursors(t, data) {
+		found = true
+		if e.Ledger != 1002 {
+			t.Errorf("the committed cursor is at ledger %d, want 1002", e.Ledger)
 		}
 	}
 	if !found {
