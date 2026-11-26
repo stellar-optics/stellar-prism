@@ -222,6 +222,99 @@ legitimately (an operator re-pointing a key) from a bug, and silently refusing
 to move would hide the operator's intent. Run one tailer per key and the
 question does not arise.
 
+diff --git a/pkg/sink/timescale.go b/pkg/sink/timescale.go
+--- a/pkg/sink/timescale.go
++++ b/pkg/sink/timescale.go
+@@
+-// hypertableSQL partitions by ledger rather than time:
+-func hypertableSQL(table string) string {
++// hypertableSQL partitions the event table by close time.
++func hypertableSQL(table string) string {
+ 	return fmt.Sprintf(
+-		`SELECT create_hypertable('%s', 'ledger', chunk_time_interval => %d, if_not_exists => TRUE)`,
+-		escapeLiteral(table), timescaleChunkInterval)
++		`SELECT create_hypertable('%s', 'closed_at',
++		  chunk_time_interval => INTERVAL '1 day',
++		  if_not_exists => TRUE)`,
++		escapeLiteral(table))
+ }
+diff --git a/internal/cli/sinks.go b/internal/cli/sinks.go
+--- a/internal/cli/sinks.go
++++ b/internal/cli/sinks.go
+@@ -35,6 +35,12 @@
+ 	pubsubTopic      string
+ 	metrics          *sink.Prometheus
+ 	constructedSinks []io.Closer
++
++	timescaleDSN         string
++	timescaleTable       string
++	timescaleBatchSize   int
++	timescaleFlushInterval time.Duration
++	timescaleNoHypertable bool
+ }
+@@
+ func (s *sinkFlags) register(cmd *cobra.Command) {
+ 	flags := cmd.Flags()
++
++	flags.StringVar(&s.timescaleDSN, "timescale-dsn", "",
++		"PostgreSQL/TimescaleDB connection string")
++	flags.StringVar(&s.timescaleTable, "timescale-table", "prism_records",
++		"TimescaleDB destination table")
++	flags.IntVar(&s.timescaleBatchSize, "timescale-batch-size",
++		sink.DefaultTimescaleBatchSize,
++		"records per TimescaleDB COPY batch")
++	flags.DurationVar(&s.timescaleFlushInterval, "timescale-flush-interval",
++		sink.DefaultTimescaleFlushInterval,
++		"maximum wait for a partial TimescaleDB batch")
++	flags.BoolVar(&s.timescaleNoHypertable, "timescale-no-hypertable", false,
++		"write to a plain PostgreSQL table instead of a TimescaleDB hypertable")
+ 
+ 	flags.StringVar(&s.webhookURL, "webhook-url", "",
+ 		"POST batches of records as JSON to this HTTP(S) endpoint")
+@@
+ func (s *sinkFlags) validate(cmd *cobra.Command) error {
++	if s.timescaleTable != "" && s.timescaleDSN == "" {
++		if cmd.Flags().Changed("timescale-table") ||
++			cmd.Flags().Changed("timescale-batch-size") ||
++			cmd.Flags().Changed("timescale-flush-interval") ||
++			cmd.Flags().Changed("timescale-no-hypertable") {
++			return fmt.Errorf("--timescale-dsn is required with TimescaleDB options")
++		}
++	}
++	if s.timescaleBatchSize < 0 {
++		return fmt.Errorf("--timescale-batch-size must not be negative")
++	}
++	if s.timescaleFlushInterval < 0 {
++		return fmt.Errorf("--timescale-flush-interval must not be negative")
++	}
++
+ 	if s.webhookSecret != "" && s.webhookURL == "" {
+ 		return fmt.Errorf("--webhook-secret requires --webhook-url")
+ 	}
+@@
+ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error)) (out stream.Sink, err error) {
+ 	sinks := []stream.Sink{base}
+ 	s.constructedSinks = nil
++
++	if s.timescaleDSN != "" {
++		timescaleSink, timescaleErr := sink.NewTimescale(
++			context.Background(),
++			s.timescaleDSN,
++			sink.TimescaleConfig{
++				Table:         s.timescaleTable,
++				BatchSize:     s.timescaleBatchSize,
++				FlushInterval: s.timescaleFlushInterval,
++				NoHypertable:  s.timescaleNoHypertable,
++			},
++		)
++		if timescaleErr != nil {
++			return nil, timescaleErr
++		}
++		s.constructedSinks = append(s.constructedSinks, timescaleSink)
++		sinks = append(sinks, timescaleSink)
++	}
+*** End Patch
+
 ### Gap detection
 
 Records can be lost exactly one way: falling behind the RPC's retention window
