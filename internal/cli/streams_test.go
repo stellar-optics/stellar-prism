@@ -77,6 +77,46 @@ func cliStorageMeta(t *testing.T) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
+func cliStorageUpdateMeta(t *testing.T) string {
+	t.Helper()
+
+	makeEntry := func(value uint32) xdr.LedgerEntry {
+		key := xdr.Uint32(1)
+		val := xdr.Uint32(value)
+		return xdr.LedgerEntry{
+			LastModifiedLedgerSeq: 9000,
+			Data: xdr.LedgerEntryData{
+				Type: xdr.LedgerEntryTypeContractData,
+				ContractData: &xdr.ContractDataEntry{
+					Contract:   cliContractAddress(),
+					Key:        xdr.ScVal{Type: xdr.ScValTypeScvU32, U32: &key},
+					Durability: xdr.ContractDataDurabilityPersistent,
+					Val:        xdr.ScVal{Type: xdr.ScValTypeScvU32, U32: &val},
+				},
+			},
+		}
+	}
+	before, after := makeEntry(7), makeEntry(9)
+	meta := xdr.TransactionMeta{
+		V: 4,
+		V4: &xdr.TransactionMetaV4{
+			TxChangesBefore: xdr.LedgerEntryChanges{{
+				Type:  xdr.LedgerEntryChangeTypeLedgerEntryState,
+				State: &before,
+			}},
+			Operations: []xdr.OperationMetaV2{{Changes: xdr.LedgerEntryChanges{{
+				Type:    xdr.LedgerEntryChangeTypeLedgerEntryUpdated,
+				Updated: &after,
+			}}}},
+		},
+	}
+	b, err := meta.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshalling meta: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
 func cliUploadEnvelope(t *testing.T, wasm []byte) string {
 	t.Helper()
 
@@ -159,6 +199,26 @@ func TestStorageCommandNDJSON(t *testing.T) {
 	}
 	if rec.Key.Type == "" {
 		t.Error("key was not decoded through lens")
+	}
+}
+
+func TestDiffCommandStreamsContractStateDiff(t *testing.T) {
+	contractID, err := cliContractAddress().String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	withFake(t, fakerpc.NewTransactionServer([]protocol.TransactionInfo{
+		cliTransaction(9000, "diff", protocol.TransactionStatusSuccess, "", cliStorageUpdateMeta(t)),
+	}))
+
+	stdout, _, err := run(t, "diff", "--contract", contractID, "--from", "9000", "--follow", "--limit", "1", "--json")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(stdout, `"kind":"storage_change"`) ||
+		!strings.Contains(stdout, `"structuralDiff"`) ||
+		!strings.Contains(stdout, "Val") {
+		t.Fatalf("contract diff output lacks path-level storage changes:\n%s", stdout)
 	}
 }
 

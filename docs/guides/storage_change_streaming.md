@@ -191,6 +191,18 @@ different keys keep separate cursors in the same file, just as different
 
 ## State diffing
 
+For an in-process, path-level diff of one contract's successive storage
+entries, use the `diff` command. It uses transaction metadata to capture the
+previous entry value and `stellar-xdr-lens` to render the structural change:
+
+```sh
+prism diff --contract CBGSB... --from 123456 --follow --json
+```
+
+Updated entries include `structuralDiff`; creates and removals are marked
+explicitly. The state cache is in memory, so a restart begins a new diff
+stream.
+
 A storage stream is a changelog. To turn it into before/after diffs, keep a map
 from storage key to last-seen value and compare each record against it. The
 `keyXdr` field (or `key` when decoded) is a stable map key for every entry type.

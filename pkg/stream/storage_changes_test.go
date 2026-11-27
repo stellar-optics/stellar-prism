@@ -239,6 +239,52 @@ func TestStorageChangeSourceExtractsContractEntries(t *testing.T) {
 	}
 }
 
+func TestContractStateDiffSourceRendersUpdatedEntryPaths(t *testing.T) {
+	t.Parallel()
+
+	addr := testContractAddress(3)
+	before := testContractDataEntry(addr, 1)
+	after := testContractDataEntry(addr, 1)
+	after.Data.ContractData.Val = testU32(999)
+	meta := xdr.TransactionMeta{
+		V: 4,
+		V4: &xdr.TransactionMetaV4{
+			TxChangesBefore: xdr.LedgerEntryChanges{stateChange(t, before)},
+			Operations: []xdr.OperationMetaV2{{
+				Changes: xdr.LedgerEntryChanges{updatedChange(t, after)},
+			}},
+		},
+	}
+	contractID, err := addr.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := fakerpc.NewTransactionServer([]protocol.TransactionInfo{
+		testTransaction(123, 0, "diff-test", encodeMeta(t, meta)),
+	})
+	src, err := stream.NewContractStateDiffSource(srv, stream.StorageChangeQuery{
+		StartLedger: 123,
+		ContractIDs: []string{contractID},
+	})
+	if err != nil {
+		t.Fatalf("NewContractStateDiffSource() error = %v", err)
+	}
+	batch, err := src.Fetch(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if len(batch.Records) != 1 {
+		t.Fatalf("got %d diff records, want 1", len(batch.Records))
+	}
+	change := batch.Records[0].StorageChange
+	if change == nil || change.PreviousEntryXDR == "" {
+		t.Fatalf("diff record = %+v, want the prior entry state", batch.Records[0])
+	}
+	if change.StructuralDiff == "" || !strings.Contains(change.StructuralDiff, "Val") {
+		t.Fatalf("structural diff = %q, want a path-level value change", change.StructuralDiff)
+	}
+}
+
 func TestStorageChangeSourceFilters(t *testing.T) {
 	t.Parallel()
 

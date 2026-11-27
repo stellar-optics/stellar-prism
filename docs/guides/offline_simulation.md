@@ -8,7 +8,8 @@ For CLI implementation details, see [`internal/cli/simulate.go`](../../internal/
 
 ## The `prism simulate` Command
 
-`prism simulate` takes a base64-encoded `TransactionEnvelope` via `--tx-envelope` (no positional arguments):
+`prism simulate` takes a base64-encoded `TransactionEnvelope` via `--tx-envelope`
+or its `--envelope` alias (no positional arguments):
 
 ```sh
 # Run a single preflight simulation against the configured RPC endpoint
@@ -33,11 +34,12 @@ prism simulate \
 | Flag | Purpose |
 |---|---|
 | `--tx-envelope <base64>` | **Required.** Base64-encoded `TransactionEnvelope` XDR to simulate. |
+| `--envelope <base64>` | Alias for `--tx-envelope`. |
 | `--limit <N>` | Stop after emitting `N` simulation records (use `--limit 1` for one-shot CI checks). |
 | `--follow` | Keep polling `getLatestLedger` and re-simulate once per newly closed ledger. |
 | `--from <ledger>` | Wait until the RPC head reaches `<ledger>` before running the first simulation. |
-| `--json` | Emit one NDJSON object per simulation record, decoding `returnValue` via `stellar-xdr-lens`. |
-| `--raw` | Keep `returnValueXdr` as base64 XDR in `--json` output without decoding. |
+| `--json` | Emit one NDJSON object per simulation record, decoding XDR values via `stellar-xdr-lens`. |
+| `--raw` | Keep XDR values as base64 in `--json` output without decoding. |
 | `--compact` | Omit the decoded `return` `ScVal` tree in human-readable terminal output. |
 | `--rpc-url <url>` | Override `SOROBAN_RPC_URL` (repeatable for failover pools). |
 | `--network <name>` | Expected network passphrase check (`testnet`, `mainnet`, `futurenet`, `standalone`). |
@@ -46,7 +48,13 @@ prism simulate \
 
 ### Resource Budget Metrics and Output Schema
 
-On each newly observed ledger head, `SimulationSource` calls `simulateTransaction` and unmarshals `TransactionDataXDR` (`xdr.SorobanTransactionData`) into resource budget counters alongside `minResourceFee` and the first host function's `returnValue`.
+On each newly observed ledger head, `SimulationSource` calls
+`simulateTransaction` and unmarshals `TransactionDataXDR`
+(`xdr.SorobanTransactionData`) into instruction and byte budgets plus separate
+read-only/read-write footprint entries. The output also includes the return
+value, authorization entries, diagnostic events, minimum resource fee, and the
+RPC's exact `error` text when simulation fails. Malformed transaction data is
+reported as an error rather than silently dropping the resource details.
 
 #### Human-Readable Output
 

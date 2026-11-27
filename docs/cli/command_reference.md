@@ -701,8 +701,10 @@ prism fee-stats --follow --json | jq '{ledger, p50: .inclusionFeeCharged.p50, p9
 ### prism simulate
 
 Simulate a base64 `TransactionEnvelope` at each new ledger head and report
-changes to its return value, instructions, memory footprint and minimum
-resource fee. See [offline simulation](../guides/offline_simulation.md).
+changes to its return value, instructions, disk and write resources, ledger
+footprint, authorization requirements, diagnostic events and minimum resource
+fee. RPC simulation errors are included verbatim. See
+[offline simulation](../guides/offline_simulation.md).
 
 ```text
 prism simulate --tx-envelope BASE64 [flags]
@@ -713,10 +715,11 @@ Default `--page-size`: **1**.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--tx-envelope` | string | — | base64 TransactionEnvelope to simulate |
+| `--envelope` | string | — | alias for `--tx-envelope` |
 
 ```console
 prism simulate --tx-envelope AAAA... --follow
-prism simulate --tx-envelope AAAA... --json --limit 1
+prism simulate --envelope AAAA... --json --limit 1
 ```
 
 ### prism aggregate
@@ -773,7 +776,7 @@ prism tx 3389e9f0a1b2c3... --fail-on-error   # exit 2 when the transaction faile
 ### prism diff
 
 Diff two transactions' envelopes, results and metadata as a structural,
-colourised diff.
+colourised diff, or follow path-level changes to one contract's storage.
 
 ```text
 prism diff <txHash1> <txHash2> [flags]
@@ -783,11 +786,15 @@ prism diff <txHash1> <txHash2> [flags]
 |---|---|---|---|
 | `--envelope-only` | bool | — | Compare only the transaction envelopes |
 | `--meta-only` | bool | — | Compare only the transaction metadata |
+| `--contract` | string | — | stream structural diffs for this contract's storage entries |
+| `--follow` | bool | — | continue polling for new contract storage changes |
+| `--from` | uint32 | — | first ledger to inspect in contract mode |
 
 ```console
 prism diff TXHASH1 TXHASH2
 prism diff TXHASH1 TXHASH2 --envelope-only
 prism diff TXHASH1 TXHASH2 --meta-only
+prism diff --contract CDLZ... --follow --json
 ```
 
 ### prism abi

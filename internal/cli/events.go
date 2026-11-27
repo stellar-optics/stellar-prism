@@ -967,6 +967,13 @@ start the next run where the last one stopped.`,
 				// takes effect on the very next record.
 				filters = append(filters, watchlist)
 			}
+			if len(sf.excludeTopics) > 0 || len(sf.excludeContracts) > 0 {
+				blacklist, err := stream.NewBlacklistFilter(sf.excludeTopics, sf.excludeContracts)
+				if err != nil {
+					return err
+				}
+				filters = append(filters, blacklist)
+			}
 			if len(filters) > 0 {
 				sf.filter = filters
 			}
@@ -977,7 +984,9 @@ start the next run where the last one stopped.`,
 			}
 			defer closeClient()
 
-			sf.stateKey = eventsStateKey(contractIDs, topics, eventTypes)
+			sf.stateKey = eventsStateKey(contractIDs, topics, eventTypes,
+				filterPart("exclude-contract", sf.excludeContracts),
+				filterPart("exclude-topic", sf.excludeTopics))
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				query := stream.EventQuery{
@@ -997,12 +1006,6 @@ start the next run where the last one stopped.`,
 				}
 				if sf.sampleRate > 0 || sf.maxRate > 0 {
 					src = stream.NewSampleFilter(src, sf.sampleRate, sf.maxRate)
-				}
-				if len(sf.excludeTopics) > 0 || len(sf.excludeContracts) > 0 {
-					src, err = stream.NewExcludeFilter(src, sf.excludeTopics, sf.excludeContracts)
-					if err != nil {
-						return nil, err
-					}
 				}
 				return src, nil
 			}

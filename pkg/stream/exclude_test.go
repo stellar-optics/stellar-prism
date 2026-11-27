@@ -3,6 +3,8 @@ package stream
 import (
 	"context"
 	"testing"
+
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 func TestExcludeFilter(t *testing.T) {
@@ -60,12 +62,83 @@ func TestExcludeFilter(t *testing.T) {
 }
 
 func TestExcludeFilterSymbol(t *testing.T) {
-	// This test would need proper XDR encoding for the symbol "transfer"
-	// For now, test the pattern parsing logic
-	_, err := NewExcludeFilter(&mockSource{name: "mock"}, []string{"transfer"}, nil)
+	symbol, err := xdr.NewScVal(xdr.ScValTypeScvSymbol, xdr.ScSymbol("transfer"))
 	if err != nil {
-		// May fail if "transfer" is not valid base64 ScVal
-		// That's expected - the pattern parsing handles both
-		return
+		t.Fatal(err)
+	}
+	encoded, err := xdr.MarshalBase64(symbol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &mockSource{records: []Record{
+		{ID: "excluded", Kind: KindEvent, Event: &Event{TopicXDR: []string{encoded}}},
+		{ID: "kept", Kind: KindEvent, Event: &Event{TopicXDR: []string{"AAAAAQ=="}}},
+	}, name: "mock"}
+	filter, err := NewExcludeFilter(source, []string{"transfer"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := filter.Fetch(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Records) != 1 || batch.Records[0].ID != "kept" {
+		t.Fatalf("records = %+v, want only the non-matching topic", batch.Records)
+	}
+	if filter.Excluded() != 1 {
+		t.Fatalf("excluded = %d, want 1", filter.Excluded())
+	}
+}
+
+func TestBlacklistFilterComposesAfterWhitelist(t *testing.T) {
+	symbol, err := xdr.NewScVal(xdr.ScValTypeScvSymbol, xdr.ScSymbol("transfer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := xdr.MarshalBase64(symbol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	whitelist, err := CompileExpression(`contract == "CAAA"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blacklist, err := NewBlacklistFilter([]string{"transfer"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filters := FilterSet{whitelist, blacklist}
+
+	tests := []struct {
+		name string
+		rec  Record
+		want bool
+	}{
+		{
+			name: "whitelisted but blacklisted",
+			rec:  Record{Kind: KindEvent, Event: &Event{ContractID: "CAAA", TopicXDR: []string{encoded}}},
+			want: false,
+		},
+		{
+			name: "not whitelisted",
+			rec:  Record{Kind: KindEvent, Event: &Event{ContractID: "CBBB", TopicXDR: []string{encoded}}},
+			want: false,
+		},
+		{
+			name: "whitelisted and not blacklisted",
+			rec:  Record{Kind: KindEvent, Event: &Event{ContractID: "CAAA", TopicXDR: []string{"AAAAAQ=="}}},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := filters.Match(tt.rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Errorf("Match() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
