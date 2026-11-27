@@ -1,6 +1,7 @@
 package sink
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -27,12 +28,30 @@ func NewFanout(sinks ...stream.Sink) *Fanout {
 
 // Emit implements stream.Sink.
 func (f *Fanout) Emit(r stream.Record) error {
+	return f.EmitContext(context.Background(), r)
+}
+
+// EmitContext implements stream.ContextSink, so each destination's sink_write
+// span becomes a child of the stream's poll_page span.
+func (f *Fanout) EmitContext(ctx context.Context, r stream.Record) error {
 	for i, s := range f.sinks {
-		if err := s.Emit(r); err != nil {
+		if err := emitOneSink(ctx, s, i, r); err != nil {
 			return fmt.Errorf("fanout: sink %d: %w", i, err)
 		}
 	}
 	return nil
+}
+
+// emitOneSink dispatches one record to one destination inside a sink_write
+// span, recording the destination's error on the span when it fails.
+func emitOneSink(ctx context.Context, s stream.Sink, index int, r stream.Record) error {
+	_, span := startSinkWrite(ctx, r, index, s)
+	defer span.End()
+	err := s.Emit(r)
+	if err != nil {
+		stream.RecordSpanError(span, err)
+	}
+	return err
 }
 
 // EmitBatch implements stream.BatchSink, forwarding the whole batch to sinks
@@ -40,13 +59,20 @@ func (f *Fanout) Emit(r stream.Record) error {
 func (f *Fanout) EmitBatch(records []stream.Record) error {
 	for i, s := range f.sinks {
 		if batch, ok := s.(stream.BatchSink); ok {
-			if err := batch.EmitBatch(records); err != nil {
+			// A batch has no single record identity, so one span covers the
+			// whole dispatch to this destination.
+			_, span := startSinkBatchWrite(context.Background(), records, i, s)
+			err := batch.EmitBatch(records)
+			if err != nil {
+				stream.RecordSpanError(span, err)
+				span.End()
 				return fmt.Errorf("fanout: sink %d: %w", i, err)
 			}
+			span.End()
 			continue
 		}
 		for _, r := range records {
-			if err := s.Emit(r); err != nil {
+			if err := emitOneSink(context.Background(), s, i, r); err != nil {
 				return fmt.Errorf("fanout: sink %d: emitting record %s: %w", i, r.ID, err)
 			}
 		}

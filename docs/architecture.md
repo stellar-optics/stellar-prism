@@ -222,99 +222,6 @@ legitimately (an operator re-pointing a key) from a bug, and silently refusing
 to move would hide the operator's intent. Run one tailer per key and the
 question does not arise.
 
-diff --git a/pkg/sink/timescale.go b/pkg/sink/timescale.go
---- a/pkg/sink/timescale.go
-+++ b/pkg/sink/timescale.go
-@@
--// hypertableSQL partitions by ledger rather than time:
--func hypertableSQL(table string) string {
-+// hypertableSQL partitions the event table by close time.
-+func hypertableSQL(table string) string {
- 	return fmt.Sprintf(
--		`SELECT create_hypertable('%s', 'ledger', chunk_time_interval => %d, if_not_exists => TRUE)`,
--		escapeLiteral(table), timescaleChunkInterval)
-+		`SELECT create_hypertable('%s', 'closed_at',
-+		  chunk_time_interval => INTERVAL '1 day',
-+		  if_not_exists => TRUE)`,
-+		escapeLiteral(table))
- }
-diff --git a/internal/cli/sinks.go b/internal/cli/sinks.go
---- a/internal/cli/sinks.go
-+++ b/internal/cli/sinks.go
-@@ -35,6 +35,12 @@
- 	pubsubTopic      string
- 	metrics          *sink.Prometheus
- 	constructedSinks []io.Closer
-+
-+	timescaleDSN         string
-+	timescaleTable       string
-+	timescaleBatchSize   int
-+	timescaleFlushInterval time.Duration
-+	timescaleNoHypertable bool
- }
-@@
- func (s *sinkFlags) register(cmd *cobra.Command) {
- 	flags := cmd.Flags()
-+
-+	flags.StringVar(&s.timescaleDSN, "timescale-dsn", "",
-+		"PostgreSQL/TimescaleDB connection string")
-+	flags.StringVar(&s.timescaleTable, "timescale-table", "prism_records",
-+		"TimescaleDB destination table")
-+	flags.IntVar(&s.timescaleBatchSize, "timescale-batch-size",
-+		sink.DefaultTimescaleBatchSize,
-+		"records per TimescaleDB COPY batch")
-+	flags.DurationVar(&s.timescaleFlushInterval, "timescale-flush-interval",
-+		sink.DefaultTimescaleFlushInterval,
-+		"maximum wait for a partial TimescaleDB batch")
-+	flags.BoolVar(&s.timescaleNoHypertable, "timescale-no-hypertable", false,
-+		"write to a plain PostgreSQL table instead of a TimescaleDB hypertable")
- 
- 	flags.StringVar(&s.webhookURL, "webhook-url", "",
- 		"POST batches of records as JSON to this HTTP(S) endpoint")
-@@
- func (s *sinkFlags) validate(cmd *cobra.Command) error {
-+	if s.timescaleTable != "" && s.timescaleDSN == "" {
-+		if cmd.Flags().Changed("timescale-table") ||
-+			cmd.Flags().Changed("timescale-batch-size") ||
-+			cmd.Flags().Changed("timescale-flush-interval") ||
-+			cmd.Flags().Changed("timescale-no-hypertable") {
-+			return fmt.Errorf("--timescale-dsn is required with TimescaleDB options")
-+		}
-+	}
-+	if s.timescaleBatchSize < 0 {
-+		return fmt.Errorf("--timescale-batch-size must not be negative")
-+	}
-+	if s.timescaleFlushInterval < 0 {
-+		return fmt.Errorf("--timescale-flush-interval must not be negative")
-+	}
-+
- 	if s.webhookSecret != "" && s.webhookURL == "" {
- 		return fmt.Errorf("--webhook-secret requires --webhook-url")
- 	}
-@@
- func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error)) (out stream.Sink, err error) {
- 	sinks := []stream.Sink{base}
- 	s.constructedSinks = nil
-+
-+	if s.timescaleDSN != "" {
-+		timescaleSink, timescaleErr := sink.NewTimescale(
-+			context.Background(),
-+			s.timescaleDSN,
-+			sink.TimescaleConfig{
-+				Table:         s.timescaleTable,
-+				BatchSize:     s.timescaleBatchSize,
-+				FlushInterval: s.timescaleFlushInterval,
-+				NoHypertable:  s.timescaleNoHypertable,
-+			},
-+		)
-+		if timescaleErr != nil {
-+			return nil, timescaleErr
-+		}
-+		s.constructedSinks = append(s.constructedSinks, timescaleSink)
-+		sinks = append(sinks, timescaleSink)
-+	}
-*** End Patch
-
 ### Gap detection
 
 Records can be lost exactly one way: falling behind the RPC's retention window
@@ -591,6 +498,7 @@ ledgers closed during the last wait, shortening when at least one did and
 lengthening on dead time within 1s..30s. It also remains the poller for
 sources that report no head ledger at all. Both run in the tailer's single
 goroutine and are tested deterministically against a fake clock.
+
 ### Parallel historical backfill
 
 `--backfill-workers N` (with an explicit `--from`) uses `Drainer` instead of
@@ -617,7 +525,8 @@ or returned as a `*GapError` under the default policy.
 The first non-cancellation error cancels every sibling; `Wait` blocks until
 all workers have returned and then cancels the shared context. A caller
 cancellation is a clean stop, not an error. `Drainer.Run` waits for every
-worker on every path, including sink failure and limit exhaustion, soa terminated backfill cannot leak goroutines or leave a worker writing to a
+worker on every path, including sink failure and limit exhaustion, so
+a terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
 
 The rewind watcher in `internal/cli/rewind.go` is the only other goroutine the
@@ -822,6 +731,42 @@ flag wiring and cleanup without opening a socket.
 For reading profiles, the `sync.Pool` usage in the hot path and
 `GOGC`/`GOMEMLIMIT` guidance for containers, see
 [docs/performance/tuning_and_profiling.md](performance/tuning_and_profiling.md).
+
+## Distributed tracing (`--otel-endpoint`)
+
+`--otel-endpoint` exports OpenTelemetry traces over OTLP/HTTP, so a run can be
+followed through the polling loop, the filtering pipeline and each sink:
+
+```sh
+prism events --contract CBGSB... --follow \
+  --otel-endpoint http://localhost:4318/v1/traces \
+  --otel-sample-rate 1
+```
+
+The endpoint may be a full URL — Jaeger, Datadog, Honeycomb and other backends
+accept OTLP directly — or a bare `host:port`, which is treated as plaintext
+HTTP for a local collector. `--otel-sample-rate` keeps a fraction of traces
+between 0 and 1 and defaults to 1. An empty endpoint, the default, disables
+tracing: nothing is collected and no exporter is started.
+
+A trace mirrors the work the stream does:
+
+| Span | Parent | What it measures |
+| --- | --- | --- |
+| `poll_page` | the run | one RPC fetch and its response parsing |
+| `filter_event` | `poll_page` | topic and contract matching for one record |
+| `sink_write` | `poll_page` | one external sink write; a fanout emits one per destination |
+
+Spans carry the ledger sequence, the contract ID, the event type and the
+transaction hash, so a trace can be selected by the contract or transaction an
+operator cares about. A failed fetch or sink write is recorded as an exception
+with `Error` span status, which is what makes an intermittent destination
+diagnosable after the fact rather than only while it is failing.
+
+`pkg/stream/telemetry.go` owns provider setup and the record attributes;
+`internal/cli/telemetry.go` owns the flag lifecycle. The provider is flushed
+and shut down on the way out with a five-second bound, so an unreachable
+collector cannot hold a finished command open.
 
 ## Graceful drain (`Tailer.Drain`)
 
