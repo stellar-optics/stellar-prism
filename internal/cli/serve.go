@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/stellar-optics/stellar-prism/pkg/sink"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
@@ -23,10 +25,14 @@ func newServeCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	cmd.Use = "serve"
 	cmd.Short = "Broadcast live contract events over SSE or WebSocket"
 	cmd.Long = "Serve live contract events at /events over HTTP SSE or WebSocket. WebSockets also accept /ws."
-	cmd.Example = "  prism serve --ws 127.0.0.1:8081\n  prism serve --sse 127.0.0.1:8080 --contract CBGSB..."
+	cmd.Example = "  prism serve --ws 127.0.0.1:8081\n  prism serve --sse 127.0.0.1:8080 --contract CBGSB...\n  prism serve --sse 127.0.0.1:8443 --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem --tls-auto-reload"
 	var maxRestarts int
 	cmd.Flags().IntVar(&maxRestarts, "max-restarts", 0,
 		"maximum stream restarts after panics (0 means unlimited)")
+
+	cmd.Flags().StringVar(&g.tlsCert, "tls-cert", "", "path to TLS certificate file (PEM)")
+	cmd.Flags().StringVar(&g.tlsKey, "tls-key", "", "path to TLS private key file (PEM)")
+	cmd.Flags().BoolVar(&g.tlsAutoReload, "tls-auto-reload", false, "dynamically reload TLS certificate on file change")
 	flag := cmd.Flags().Lookup("follow")
 	flag.DefValue = "true"
 	if err := flag.Value.Set("true"); err != nil {
@@ -188,6 +194,28 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 			server.GracefulStop()
 		}
 	}
+
+	var tlsCfg *tls.Config
+	if g.tlsCert != "" || g.tlsKey != "" {
+		if g.tlsCert == "" || g.tlsKey == "" {
+			cleanup()
+			return nil, nil, fmt.Errorf("both --tls-cert and --tls-key must be provided for TLS")
+		}
+		reloader, err := sink.NewDynamicTLSReloader(g.tlsCert, g.tlsKey, g.tlsAutoReload, func(format string, args ...any) {
+			fmt.Fprintf(stderr, format+"\n", args...)
+		})
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("tls setup: %w", err)
+		}
+		tlsCfg = reloader.TLSConfig()
+		prevCleanup := cleanup
+		cleanup = func() {
+			_ = reloader.Close()
+			prevCleanup()
+		}
+	}
+
 	combined := &broadcastOutput{next: out}
 	for _, e := range endpoints {
 		listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", e.address)
@@ -195,11 +223,24 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 			cleanup()
 			return nil, nil, fmt.Errorf("broadcast listen %s: %w", e.address, err)
 		}
-		server := &http.Server{Handler: e.handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+		if tlsCfg != nil {
+			listener = tls.NewListener(listener, tlsCfg)
+		}
+		server := &http.Server{
+			Handler:           e.handler,
+			TLSConfig:         tlsCfg,
+			ReadHeaderTimeout: 5 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    16 << 10,
+		}
 		listeners = append(listeners, listener)
 		servers = append(servers, server)
 		combined.broadcasts = append(combined.broadcasts, e.output)
-		fmt.Fprintf(stderr, "prism: broadcast listening at %s/events\n", listener.Addr())
+		proto := "http"
+		if tlsCfg != nil {
+			proto = "https"
+		}
+		fmt.Fprintf(stderr, "prism: broadcast listening at %s://%s/events\n", proto, listener.Addr())
 		go func() {
 			if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				cancel(fmt.Errorf("broadcast server: %w", err))
@@ -213,7 +254,11 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 			return nil, nil, fmt.Errorf("grpc listen %s: %w", g.serveGRPC, err)
 		}
 		grpcSink := sink.NewGRPCSink()
-		server := grpc.NewServer()
+		var grpcOpts []grpc.ServerOption
+		if tlsCfg != nil {
+			grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+		}
+		server := grpc.NewServer(grpcOpts...)
 		prismpb.RegisterPrismStreamServer(server, grpcSink)
 		prismpb.RegisterEventStreamServiceServer(server, grpcSink)
 		listeners = append(listeners, listener)
