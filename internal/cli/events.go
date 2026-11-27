@@ -104,6 +104,7 @@ type streamFlags struct {
 	stateKMSProvider string
 	// stateKMSKeyID identifies the key in the key management service.
 	stateKMSKeyID string
+	kmsKeyID      string
 	// stateKMSRegion is the region of the AWS key.
 	stateKMSRegion string
 	// stateKMSTokenEnv names the environment variable holding the token
@@ -258,6 +259,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		`encrypt the state file with a key management service: "aws" or "gcp"`)
 	cmd.Flags().StringVar(&s.stateKMSKeyID, "state-kms-key-id", "",
 		"the key to use in the key management service (an ARN for AWS, a resource name for GCP)")
+	cmd.Flags().StringVar(&s.kmsKeyID, "kms-key-id", "",
+		"alias for --state-kms-key-id: the key to use in the key management service")
 	cmd.Flags().StringVar(&s.stateKMSRegion, "state-kms-region", "",
 		"region of the AWS key (default us-east-1, else $AWS_REGION)")
 	cmd.Flags().StringVar(&s.stateKMSTokenEnv, "state-kms-token-env", gcsTokenEnvVar,
@@ -507,11 +510,17 @@ func (s *streamFlags) validateStateEncryption(cmd *cobra.Command) error {
 	if s.statePassphraseFile != "" {
 		sources++
 	}
+	if s.stateKMSKeyID == "" {
+		s.stateKMSKeyID = s.kmsKeyID
+	}
 	if s.stateKMSProvider != "" {
 		sources++
 	}
 	if sources > 1 {
 		return fmt.Errorf("only one of --state-passphrase-env, --state-passphrase-file and --state-kms-provider may be given")
+	}
+	if s.stateKMSKeyID == "" {
+		s.stateKMSKeyID = s.kmsKeyID
 	}
 	if s.stateKMSProvider != "" {
 		provider := strings.ToLower(s.stateKMSProvider)
