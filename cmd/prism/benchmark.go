@@ -41,8 +41,7 @@ func newBenchmarkProfiler(cpuPath, heapPath string) (cli.BenchmarkProfiler, erro
 		return nil, fmt.Errorf("creating CPU profile %s: %w", cpuPath, err)
 	}
 	if err := pprof.StartCPUProfile(file); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("starting the CPU profile: %w", err)
+		return nil, errors.Join(fmt.Errorf("starting the CPU profile: %w", err), file.Close())
 	}
 	p.cpu = file
 	return p, nil

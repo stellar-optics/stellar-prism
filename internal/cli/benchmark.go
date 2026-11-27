@@ -154,7 +154,7 @@ is how a deployment's CPU and memory limits are sized against real throughput.`,
 			if err != nil {
 				return errors.Join(err, finishBenchmarkProfiler(profiler))
 			}
-			defer closeBenchmarkSinks(&opts.sinks)
+			defer closeBenchmarkSinks(&opts.sinks, stderr)
 
 			// Ctrl-C ends the run and still prints what it measured, which is
 			// what an operator lowering --duration wants.
@@ -220,9 +220,11 @@ func (*benchmarkSink) Flush() error { return nil }
 
 // closeBenchmarkSinks releases the sinks the flags opened. The fanout holds the
 // same values, so closing here also stops whatever they were writing to.
-func closeBenchmarkSinks(s *sinkFlags) {
+func closeBenchmarkSinks(s *sinkFlags, stderr io.Writer) {
 	for i := len(s.constructedSinks) - 1; i >= 0; i-- {
-		_ = s.constructedSinks[i].Close()
+		if err := s.constructedSinks[i].Close(); err != nil {
+			fmt.Fprintf(stderr, "prism: closing benchmark sink: %v\n", err)
+		}
 	}
 }
 
@@ -376,12 +378,16 @@ func loadBenchmarkFixtures(dir string) ([]stream.Record, error) {
 
 // readBenchmarkFixture decodes one fixture file as NDJSON, a JSON array or a
 // single JSON record, in that order.
-func readBenchmarkFixture(path string) ([]stream.Record, error) {
+func readBenchmarkFixture(path string) (records []stream.Record, err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		if cerr := file.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == ".ndjson" || ext == ".jsonl" {
