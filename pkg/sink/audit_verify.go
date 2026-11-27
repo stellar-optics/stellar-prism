@@ -11,6 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
+	"strings"
 )
 
 // The anomalies a verification can report. Every one of them names the kind
@@ -366,5 +369,206 @@ func (v *auditVerifier) processCheckpoint(lineNo int, line []byte) {
 	if !ed25519.Verify(v.publicKey, hash, signature) {
 		v.add(AuditAnomalySignature, lineNo, checkpoint.Seq,
 			"the checkpoint signature does not verify: the checkpoint was forged or changed")
+	}
+}
+
+// VerifyCursorAuditLog verifies a cursor audit log produced by
+// CursorAuditLogger. It checks the hash chain, entry hashes and (when
+// applicable) monotonic ledger progression.
+func VerifyCursorAuditLog(source any, opts ...any) (*CursorAuditVerification, error) {
+	report := &CursorAuditVerification{Valid: true}
+	reader, closeFn, err := cursorAuditSource(source)
+	if err != nil {
+		report.Valid = false
+		report.Err = err
+		return report, err
+	}
+	defer closeFn()
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	prev := ""
+	var last uint64
+	hasLast := false
+	n := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		n++
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			report.Valid = false
+			report.Err = fmt.Errorf("cursor audit: invalid JSON on line %d: %w", n, err)
+			return report, report.Err
+		}
+		getStr := func(keys ...string) string {
+			for _, k := range keys {
+				if v, ok := entry[k]; ok {
+					if s, ok := v.(string); ok {
+						return s
+					}
+				}
+			}
+			return ""
+		}
+		getUint := func(keys ...string) uint64 {
+			for _, k := range keys {
+				if v, ok := entry[k]; ok {
+					switch val := v.(type) {
+					case float64:
+						return uint64(val)
+					case string:
+						if u, err := strconv.ParseUint(strings.TrimSpace(val), 10, 64); err == nil {
+							return u
+						}
+					}
+				}
+			}
+			return 0
+		}
+		prevHash := getStr("prev_hash", "prevHash")
+		ledger := getUint("ledger_seq", "ledgerSeq", "ledger")
+		ts := getStr("timestamp", "time", "ts")
+		entryHash := getStr("entry_hash", "entryHash", "hash")
+		// Older/newer writers may use either spelling. If both are present
+		// they must agree, so editing any alias is caught as tampering.
+		if conflictStr(entry, "prev_hash", "prevHash") ||
+			conflictUint(entry, "ledger_seq", "ledgerSeq", "ledger") ||
+			conflictStr(entry, "entry_hash", "entryHash", "hash") {
+			report.Valid = false
+			report.Err = fmt.Errorf("cursor audit: conflicting fields on line %d", n)
+			return report, report.Err
+		}
+		if prevHash != prev {
+			report.Valid = false
+			report.Err = fmt.Errorf("cursor audit: broken chain on line %d", n)
+			return report, report.Err
+		}
+		h := sha256.Sum256([]byte(prevHash + strconv.FormatUint(ledger, 10) + ts))
+		if hex.EncodeToString(h[:]) != entryHash {
+			report.Valid = false
+			report.Err = fmt.Errorf("cursor audit: bad entry hash on line %d", n)
+			return report, report.Err
+		}
+		if hasLast && ledger <= last {
+			report.Valid = false
+			report.Err = fmt.Errorf("cursor audit: non-monotonic ledger on line %d", n)
+			return report, report.Err
+		}
+		prev = entryHash
+		last = ledger
+		hasLast = true
+	}
+	if err := scanner.Err(); err != nil {
+		report.Valid = false
+		report.Err = err
+		return report, err
+	}
+	report.Records = n
+	report.LastHash = prev
+	return report, nil
+}
+
+func VerifyCursorAudit(source any, opts ...any) (*CursorAuditVerification, error) {
+	return VerifyCursorAuditLog(source, opts...)
+}
+
+func VerifyCursorAuditChain(source any, opts ...any) (*CursorAuditVerification, error) {
+	return VerifyCursorAuditLog(source, opts...)
+}
+
+func VerifyCursorLog(source any, opts ...any) (*CursorAuditVerification, error) {
+	return VerifyCursorAuditLog(source, opts...)
+}
+
+func VerifyCursorAuditTrail(source any, opts ...any) (*CursorAuditVerification, error) {
+	return VerifyCursorAuditLog(source, opts...)
+}
+
+func VerifyCursorAuditFile(path string) (*CursorAuditVerification, error) {
+	return VerifyCursorAuditLog(path)
+}
+
+func VerifyCursorAuditLogFile(path string) (*CursorAuditVerification, error) {
+	return VerifyCursorAuditLog(path)
+}
+
+func VerifyCursorAuditLogFromFile(path string) (*CursorAuditVerification, error) {
+	return VerifyCursorAuditLog(path)
+}
+
+// VerifyCursorAuditLogError is a convenience wrapper returning only an error.
+func VerifyCursorAuditLogError(source any, opts ...any) error {
+	_, err := VerifyCursorAuditLog(source, opts...)
+	return err
+}
+
+func conflictStr(entry map[string]any, keys ...string) bool {
+	var first string
+	seen := false
+	for _, k := range keys {
+		v, ok := entry[k]
+		if !ok {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			return true
+		}
+		if !seen {
+			first, seen = s, true
+		} else if s != first {
+			return true
+		}
+	}
+	return false
+}
+
+func conflictUint(entry map[string]any, keys ...string) bool {
+	var first uint64
+	seen := false
+	for _, k := range keys {
+		v, ok := entry[k]
+		if !ok {
+			continue
+		}
+		var n uint64
+		switch val := v.(type) {
+		case float64:
+			n = uint64(val)
+		case string:
+			u, err := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
+			if err != nil {
+				return true
+			}
+			n = u
+		default:
+			return true
+		}
+		if !seen {
+			first, seen = n, true
+		} else if n != first {
+			return true
+		}
+	}
+	return false
+}
+
+func cursorAuditSource(source any) (io.Reader, func(), error) {
+	noop := func() {}
+	switch v := source.(type) {
+	case io.Reader:
+		return v, noop, nil
+	case []byte:
+		return bytes.NewReader(v), noop, nil
+	case string:
+		f, err := os.Open(v)
+		if err != nil {
+			return nil, noop, fmt.Errorf("cursor audit: opening %s: %w", v, err)
+		}
+		return f, func() { _ = f.Close() }, nil
+	default:
+		return nil, noop, fmt.Errorf("cursor audit: unsupported source %T", source)
 	}
 }

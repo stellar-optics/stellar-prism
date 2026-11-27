@@ -215,6 +215,7 @@ func startBroadcasts(ctx context.Context, g *globalFlags, out stream.Sink, stder
 		grpcSink := sink.NewGRPCSink()
 		server := grpc.NewServer()
 		prismpb.RegisterPrismStreamServer(server, grpcSink)
+		prismpb.RegisterEventStreamServiceServer(server, grpcSink)
 		listeners = append(listeners, listener)
 		grpcServers = append(grpcServers, server)
 		grpcSinks = append(grpcSinks, grpcSink)
