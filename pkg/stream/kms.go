@@ -29,6 +29,10 @@ import (
 // The interface is deliberately tiny. The implementations speak the
 // provider's HTTP API directly, which keeps prism free of a cloud SDK for
 // the sake of one key.
+//
+// Operator guide: docs/security/kms_and_state_encryption.md describes the
+// envelope scheme, the exact AWS and GCP IAM permissions these calls need,
+// and how tampering with an encrypted state file is detected.
 type KMSClient interface {
 	// Name identifies the provider in the state file header.
 	Name() string

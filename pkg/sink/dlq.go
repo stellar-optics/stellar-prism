@@ -84,6 +84,9 @@ type DLQStats struct {
 // A DLQ owns its wrapped sink if that sink implements io.Closer, and closes it
 // from Close. It starts no goroutines, so there is nothing to leak and nothing
 // to join on termination.
+//
+// See docs/operations/dead_letter_queue.md for CLI configuration, the on-disk
+// format, and replay procedures.
 type DLQ struct {
 	primary stream.Sink
 	writer  *bufio.Writer

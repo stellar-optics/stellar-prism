@@ -44,6 +44,22 @@ func TestDedupEvictsOldestKeyAtCapacity(t *testing.T) {
 	}
 }
 
+func TestDedupCapacityIncludesEmptyKeys(t *testing.T) {
+	t.Parallel()
+
+	dedup := stream.NewDedup(1)
+	if !dedup.Allow("") || !dedup.Allow("next") {
+		t.Fatal("Allow() refused a key after the previous key was evicted")
+	}
+	if got := dedup.Len(); got != 1 {
+		t.Errorf("Len() = %d, want the cache capacity of 1", got)
+	}
+	if dedup.Contains("") || !dedup.Contains("next") {
+		t.Errorf("retained keys = empty:%v next:%v, want only next",
+			dedup.Contains(""), dedup.Contains("next"))
+	}
+}
+
 func TestDedupDisabledAlwaysAllows(t *testing.T) {
 	t.Parallel()
 
@@ -73,6 +89,25 @@ func TestDedupResetClearsWindow(t *testing.T) {
 	}
 	if !dedup.Allow("a") {
 		t.Error("Allow(a) = false after Reset(), want true")
+	}
+}
+
+func TestEventDedupCacheDefaultWindowAndReset(t *testing.T) {
+	t.Parallel()
+
+	cache := stream.NewEventDedupCache(stream.DefaultDedupWindow)
+	if cache.Cap() != 10_000 {
+		t.Fatalf("Cap() = %d, want the default 10000-entry window", cache.Cap())
+	}
+	if !cache.Allow("event-1") || cache.Allow("event-1") {
+		t.Fatal("event cache did not suppress a retained event ID")
+	}
+	cache.Reset()
+	if !cache.Allow("event-1") {
+		t.Fatal("event cache did not allow an event after reset")
+	}
+	if cache.Dropped() != 1 {
+		t.Errorf("Dropped() = %d, want the historical duplicate count preserved", cache.Dropped())
 	}
 }
 

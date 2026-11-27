@@ -22,11 +22,13 @@ import (
 // written incrementally; Flush closes the current row group without retaining
 // stream data in memory.
 type ParquetSink struct {
-	dir    string
-	mu     sync.Mutex
-	day    string
-	file   *os.File
-	writer *parquet.GenericWriter[parquetSinkRow]
+	dir          string
+	mu           sync.Mutex
+	day          string
+	file         *os.File
+	writer       *parquet.GenericWriter[parquetSinkRow]
+	compression  string
+	rowGroupSize int64
 }
 
 type parquetSinkRow struct {
@@ -37,11 +39,29 @@ type parquetSinkRow struct {
 	Payload string `parquet:"payload"`
 }
 
-func NewParquetSink(dir string) (*ParquetSink, error) {
+type ParquetSinkOption func(*ParquetSink)
+
+func WithParquetSinkCompression(codec string) ParquetSinkOption {
+	return func(s *ParquetSink) { s.compression = codec }
+}
+
+func WithParquetSinkRowGroupSize(size int64) ParquetSinkOption {
+	return func(s *ParquetSink) { s.rowGroupSize = size }
+}
+
+func NewParquetSink(dir string, opts ...ParquetSinkOption) (*ParquetSink, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("parquet: directory is required")
 	}
-	return &ParquetSink{dir: dir}, nil
+	s := &ParquetSink{
+		dir:          dir,
+		compression:  DefaultParquetCompression,
+		rowGroupSize: DefaultParquetRowGroupSize,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 func (s *ParquetSink) Emit(r stream.Record) error {
@@ -64,7 +84,21 @@ func (s *ParquetSink) Emit(r stream.Record) error {
 			return err
 		}
 		s.file = f
-		s.writer = parquet.NewGenericWriter[parquetSinkRow](f)
+		var writerOpts []parquet.WriterOption
+		switch strings.ToLower(s.compression) {
+		case "snappy":
+			writerOpts = append(writerOpts, parquet.Compression(&parquet.Snappy))
+		case "zstd":
+			writerOpts = append(writerOpts, parquet.Compression(&parquet.Zstd))
+		case "gzip":
+			writerOpts = append(writerOpts, parquet.Compression(&parquet.Gzip))
+		case "uncompressed":
+			writerOpts = append(writerOpts, parquet.Compression(&parquet.Uncompressed))
+		}
+		if s.rowGroupSize > 0 {
+			writerOpts = append(writerOpts, parquet.WriteBufferSize(int(s.rowGroupSize)))
+		}
+		s.writer = parquet.NewGenericWriter[parquetSinkRow](f, writerOpts...)
 		s.day = day
 	}
 	b, err := MarshalRecord(r, false)
@@ -114,7 +148,9 @@ const (
 	// DefaultParquetPrefix is the part file name prefix.
 	DefaultParquetPrefix = "part"
 	// DefaultParquetCompression is the Parquet compression codec.
-	DefaultParquetCompression = "zstd"
+	DefaultParquetCompression = "snappy"
+	// DefaultParquetRowGroupSize is the row group size in bytes (128MB).
+	DefaultParquetRowGroupSize int64 = 128 * 1024 * 1024
 )
 
 // ErrParquetClosed is returned by Emit once the sink has been closed.
@@ -147,6 +183,8 @@ type ParquetConfig struct {
 	FlushTimeout time.Duration
 	// Compression is the Parquet codec: zstd, snappy, gzip or uncompressed.
 	Compression string
+	// RowGroupSize controls the row group buffer size before writing columnar chunks.
+	RowGroupSize int64
 }
 
 func (c ParquetConfig) withDefaults() ParquetConfig {
@@ -165,6 +203,9 @@ func (c ParquetConfig) withDefaults() ParquetConfig {
 	if c.Compression == "" {
 		c.Compression = DefaultParquetCompression
 	}
+	if c.RowGroupSize <= 0 {
+		c.RowGroupSize = DefaultParquetRowGroupSize
+	}
 	return c
 }
 
@@ -178,6 +219,9 @@ func (c ParquetConfig) validate() error {
 	if c.BatchSize < 0 {
 		return fmt.Errorf("parquet: batch size must not be negative, got %d", c.BatchSize)
 	}
+	if c.RowGroupSize < 0 {
+		return fmt.Errorf("parquet: row group size must not be negative, got %d", c.RowGroupSize)
+	}
 	if !parquetCompressions[strings.ToLower(c.Compression)] {
 		return fmt.Errorf(
 			"parquet: unknown compression %q; expected one of zstd, snappy, gzip, uncompressed",
@@ -187,7 +231,8 @@ func (c ParquetConfig) validate() error {
 }
 
 // Parquet writes records as columnar Parquet part files, encoded by an
-// embedded DuckDB instance.
+// embedded DuckDB instance. See docs/sinks/parquet_and_cloud_storage.md for
+// CLI flags, the union schema, and partitioned analytics recipes.
 //
 // Rows are staged in an in-memory DuckDB table and copied out with
 // `COPY … TO`. Each flush becomes one part file, so memory stays bounded even
@@ -250,6 +295,10 @@ func NewParquet(ctx context.Context, cfg ParquetConfig) (*Parquet, error) {
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("parquet: opening duckdb: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "SET preserve_insertion_order=false"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("parquet: configuring duckdb: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, createParquetTableSQL); err != nil {
 		_ = db.Close()
@@ -387,7 +436,7 @@ func (t *Parquet) flushLocked(ctx context.Context) error {
 	defer cancel()
 
 	tmp := path + ".tmp"
-	if _, err := t.db.ExecContext(ctx, copyParquetSQL(tmp, t.cfg.Compression)); err != nil {
+	if _, err := t.db.ExecContext(ctx, copyParquetSQL(tmp, t.cfg.Compression, t.cfg.RowGroupSize)); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("parquet: writing %s: %w", path, err)
 	}
@@ -474,7 +523,12 @@ const insertParquetRowSQL = `INSERT INTO prism_records VALUES (?,?,?,?,?,?,?,?,?
 
 // copyParquetSQL renders the COPY that turns the staging table into one part
 // file, ordered by id so output is deterministic.
-func copyParquetSQL(path, compression string) string {
+func copyParquetSQL(path, compression string, rowGroupSize int64) string {
+	if rowGroupSize > 0 {
+		return fmt.Sprintf(
+			`COPY (SELECT * FROM prism_records ORDER BY id) TO '%s' (FORMAT PARQUET, COMPRESSION %s, ROW_GROUP_SIZE_BYTES %d)`,
+			escapeLiteral(path), compression, rowGroupSize)
+	}
 	return fmt.Sprintf(
 		`COPY (SELECT * FROM prism_records ORDER BY id) TO '%s' (FORMAT PARQUET, COMPRESSION %s)`,
 		escapeLiteral(path), compression)

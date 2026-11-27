@@ -13,7 +13,9 @@ import (
 
 const defaultGCSEndpoint = "https://storage.googleapis.com"
 
-// GCSOptions configures a GCSStore.
+// GCSOptions configures a GCSStore. See
+// docs/sinks/parquet_and_cloud_storage.md for CLI flags, credentials, and
+// object key layout.
 type GCSOptions struct {
 	// Endpoint is the storage host, for example
 	// https://storage.googleapis.com. A fake server may be used in tests.

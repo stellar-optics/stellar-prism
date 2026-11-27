@@ -193,6 +193,14 @@ func TestCSVOutputEndToEnd(t *testing.T) {
 	if !strings.Contains(lines[1], ",11150,") || !strings.Contains(lines[2], ",11151,") {
 		t.Errorf("rows do not carry the expected ledgers: %q", stdout)
 	}
+
+	stdout, _, err = run(t, "events", "--from", "11150", "--format", "csv")
+	if err != nil {
+		t.Fatalf("Execute() with default CSV columns: %v", err)
+	}
+	if !strings.HasPrefix(stdout, "timestamp,ledger,tx_hash,contract_id,topics,value\n") {
+		t.Errorf("default CSV header = %q", strings.SplitN(stdout, "\n", 2)[0])
+	}
 }
 
 func TestDelimitedOutputFlagValidation(t *testing.T) {
