@@ -72,13 +72,16 @@ func TestWebhookSinkEndToEnd(t *testing.T) {
 	total := 0
 	for i, body := range bodies {
 		var envelope struct {
-			Delivery string            `json:"delivery"`
-			Records  []json.RawMessage `json:"records"`
+			BatchID string            `json:"batch_id"`
+			Events  []json.RawMessage `json:"events"`
 		}
 		if err := json.Unmarshal(body, &envelope); err != nil {
 			t.Fatalf("webhook body is not JSON: %v\n%s", err, body)
 		}
-		total += len(envelope.Records)
+		total += len(envelope.Events)
+		if envelope.BatchID == "" || headers[i].Get("X-Prism-Batch-ID") != envelope.BatchID {
+			t.Errorf("request %d did not carry its batch ID", i)
+		}
 
 		timestamp := headers[i].Get("X-Prism-Timestamp")
 		mac := hmac.New(sha256.New, []byte("s3cret"))

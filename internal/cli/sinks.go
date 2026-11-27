@@ -37,6 +37,7 @@ type sinkFlags struct {
 	webhookSecret       string
 	webhookBatch        int
 	webhookTimeout      time.Duration
+	webhookConcurrency  int
 	webhookMaxRetry     int
 	cloudURL            string
 	cloudProvider       string
@@ -98,10 +99,19 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 		"POST batches of records as JSON to this HTTP(S) endpoint")
 	flags.StringVar(&s.webhookSecret, "webhook-secret", "",
 		"HMAC-SHA256 secret for X-Prism-Signature (default $"+webhookSecretEnvVar+")")
-	flags.IntVar(&s.webhookBatch, "webhook-batch-size", 100,
+	flags.IntVar(&s.webhookBatch, "webhook-batch-size", 50,
 		"records per webhook POST")
-	flags.DurationVar(&s.webhookTimeout, "webhook-timeout", time.Second,
-		"POST a partial webhook batch after this long (0 means only the batch size triggers)")
+	flags.DurationVar(&s.webhookTimeout, "webhook-batch-timeout", 250*time.Millisecond,
+		"POST a partial webhook batch after this long")
+	flags.IntVar(&s.webhookConcurrency, "webhook-concurrency", 4,
+		"concurrent webhook delivery workers")
+	// Kept as a deprecated alias so existing command lines retain their
+	// behaviour while the batching option has a precise name.
+	flags.DurationVar(&s.webhookTimeout, "webhook-timeout", 250*time.Millisecond,
+		"deprecated alias for --webhook-batch-timeout")
+	if err := flags.MarkDeprecated("webhook-timeout", "use --webhook-batch-timeout instead"); err != nil {
+		panic(err)
+	}
 	flags.IntVar(&s.webhookMaxRetry, "webhook-max-retries", 3,
 		"retry a failed webhook delivery this many times (-1 disables retries)")
 
@@ -206,7 +216,10 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 		return fmt.Errorf("--webhook-batch-size must not be negative")
 	}
 	if s.webhookTimeout < 0 {
-		return fmt.Errorf("--webhook-timeout must not be negative")
+		return fmt.Errorf("--webhook-batch-timeout must not be negative")
+	}
+	if s.webhookConcurrency < 1 {
+		return fmt.Errorf("--webhook-concurrency must be greater than zero")
 	}
 	if s.webhookMaxRetry < -1 {
 		return fmt.Errorf("--webhook-max-retries must be -1 or greater")
@@ -390,15 +403,15 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 		if secret == "" {
 			secret = os.Getenv(webhookSecretEnvVar)
 		}
-		hook, hookErr := sink.NewWebhook(sink.WebhookOptions{
-			URL:        s.webhookURL,
-			Secret:     []byte(secret),
-			BatchSize:  s.webhookBatch,
-			MaxDelay:   s.webhookTimeout,
-			MaxRetries: s.webhookMaxRetry,
-			Jitter:     0.2,
-			Decode:     decode,
-			OnError:    observeError,
+		hook, hookErr := sink.NewWebhookBatch(sink.WebhookBatchOptions{
+			URL:          s.webhookURL,
+			Secret:       []byte(secret),
+			BatchSize:    s.webhookBatch,
+			BatchTimeout: s.webhookTimeout,
+			Concurrency:  s.webhookConcurrency,
+			MaxRetries:   s.webhookMaxRetry,
+			Decode:       decode,
+			OnError:      observeError,
 		})
 		if hookErr != nil {
 			return nil, hookErr
