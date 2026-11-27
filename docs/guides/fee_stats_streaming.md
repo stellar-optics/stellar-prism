@@ -26,7 +26,7 @@ The derivation lives in
 ```console
 # Follow the fee market, human-readable
 $ prism fee-stats --follow
-2026-11-25T14:35:13Z  ledger 3966812  base fee 100 stroops  base reserve 5000000 stroops  fee pool 1873456123456  coins 1054439020873472865  avg fee 10/50 8412.60/2210.30  tx 212  Soroban resource/bid 4183271/6950110  inclusion fee/op p50/p90/p99 1200/1200/1350  capacity 100%  surge yes (capacity+fee)
+2026-11-25T14:35:13Z  ledger 3966812  base fee 100 stroops  base reserve 5000000 stroops  fee pool 1873456123456  coins 1054439020873472865  avg fee 10/50 8412.60/2210.30  tx 212  Soroban resource/bid 4183271/6950110  inclusion fee/op min/mode/p10/p50/p95 1200/1200/1200/1200/1350  capacity 100%  surge yes (capacity+fee)
 
 # NDJSON for programs
 $ prism fee-stats --follow --json
@@ -88,8 +88,8 @@ One record per ledger, with `--json`:
   "classicOperations": 1000,
   "maxTxSetSize": 1000,
   "capacityUsage": 1,
-  "inclusionFeeCharged": { "min": 1200, "mode": 1200, "p10": 1200, "p50": 1200, "p90": 1200, "p99": 1350, "max": 1350 },
-  "inclusionFeeBid":     { "min": 1200, "mode": 2000, "p10": 1500, "p50": 2000, "p90": 10000, "p99": 50000, "max": 100000 },
+  "inclusionFeeCharged": { "min": 1200, "mode": 1200, "p10": 1200, "p50": 1200, "p90": 1200, "p95": 1350, "p99": 1350, "max": 1350 },
+  "inclusionFeeBid":     { "min": 1200, "mode": 2000, "p10": 1500, "p50": 2000, "p90": 10000, "p95": 20000, "p99": 50000, "max": 100000 },
   "surgePricing": true,
   "surgeReason": "capacity+fee"
 }
@@ -117,7 +117,7 @@ All amounts are in stroops.
 | `inclusionFeeBid` | distribution | Per-operation maximum inclusion fee each transaction offered |
 | `.min` | int64 | Lowest value |
 | `.mode` | int64 | Most frequent value; on a tie, the lowest of the tied values |
-| `.p10`, `.p50`, `.p90`, `.p99` | int64 | Nearest-rank percentiles; `p50` is the median |
+| `.p10`, `.p50`, `.p90`, `.p95`, `.p99` | int64 | Nearest-rank percentiles; `p50` is the median, `p95` the usual high-confidence bid |
 | `.max` | int64 | Highest value. `inclusionFeeBid.max` is the highest bid in the ledger |
 
 Both distributions are omitted for a ledger with no transactions.
@@ -190,12 +190,13 @@ builds the two distributions as follows.
    p10  rank ⌈0.6⌉ = 1  → 100
    p50  rank ⌈3.0⌉ = 3  → 100
    p90  rank ⌈5.4⌉ = 6  → 1000
+   p95  rank ⌈5.7⌉ = 6  → 1000
    p99  rank ⌈5.94⌉ = 6 → 1000
    mode                 → 100  (three times)
    ```
 
    With few transactions, the upper percentiles collapse onto `max`. Treat
-   p90 and p99 as meaningful only when `transactions` is reasonably large,
+   p90, p95 and p99 as meaningful only when `transactions` is reasonably large,
    or aggregate over several ledgers (see the [recipes](#recommended-fee-recipes)).
 
 ### Reading the two distributions together

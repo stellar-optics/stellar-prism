@@ -232,7 +232,8 @@ provides, so tuning is purely deployment configuration.
 prism's live heap is small and stable (pooled page buffers, the reorder
 buffer for the current ledger, an optional dedup ring, and sink buffers),
 typically **tens of MB**. Most of what it allocates is short-lived garbage from
-decoding. That profile suits a **memory-limit-driven GC**: let the heap grow
+decoding. Event streams also retain a bounded 10,000-key dedup ring by default.
+That profile suits a **memory-limit-driven GC**: let the heap grow
 toward a known ceiling and collect only when needed.
 
 ### Recommendations
@@ -242,7 +243,7 @@ toward a known ceiling and collect only when needed.
 | **Container with a memory limit (recommended)** | ~80–90% of the container limit | `100` (default) | Headroom covers non-heap memory (goroutine stacks, TLS buffers, cgo in DuckDB/Parquet sinks) |
 | Container, maximise throughput | ~85% of limit | `off` | GC runs only near the limit. Lowest GC CPU, but the heap always sits near the cap. Use only with a hard container limit and monitoring |
 | Bare VM / shared host | unset or a generous cap | `100`–`200` | Raising `GOGC` trades RAM for less GC CPU |
-| Tiny sidecar (≤128 MiB) | ~100 MiB | `50`–`100` | Keep pressure on. Prefer `--raw` and no dedup |
+| Tiny sidecar (≤128 MiB) | ~100 MiB | `50`–`100` | Keep pressure on. Prefer `--raw` and `--dedup-window 0` |
 
 Example for a 512 MiB container:
 
@@ -315,8 +316,8 @@ high, raise `GOMEMLIMIT` or `GOGC`. If the container gets OOM-killed, lower
       close rate.
 - [ ] **`--batch --batch-size --batch-timeout`** for sinks that benefit from
       fewer, larger writes.
-- [ ] **`--dedup-window`** only if your RPC re-serves events across polls.
-      Size it to 1–2 pages.
+- [ ] **`--dedup-window`** is 10,000 by default. Set it to `0` to disable the
+      extra cache, or size it to the replay overlap you need.
 - [ ] **Multiple `--rpc-url`s** for failover, so a slow endpoint doesn't stall
       the stream.
 - [ ] **`GOMEMLIMIT` ≈ 85% of the container limit**. Leave `GOGC` at default

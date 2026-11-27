@@ -377,6 +377,7 @@ redacted before anything is written.`,
 		newAuditVerifyCmd(stdout, stderr),
 		newAggregateCmd(g, stdout, stderr),
 		newRewindCmd(stdout),
+		newReplayCmd(g, stdout, stderr),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
 	)

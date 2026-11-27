@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"os/signal"
@@ -334,20 +333,10 @@ func TestEventsCommandHeartbeatStillRecordsTheCursor(t *testing.T) {
 		t.Fatalf("reading the state file: %v", err)
 	}
 	var found bool
-	for _, line := range nonEmptyLines(string(data)) {
-		var meta struct {
-			Cursor string `json:"cursor"`
-			Ledger uint32 `json:"ledger"`
-		}
-		if err := json.Unmarshal([]byte(line), &meta); err != nil {
-			t.Errorf("the state file holds an unreadable entry: %v\n%s", err, line)
-			continue
-		}
-		if meta.Cursor != "" {
-			found = true
-			if meta.Ledger != 1002 {
-				t.Errorf("the committed cursor is at ledger %d, want 1002", meta.Ledger)
-			}
+	for _, e := range committedCursors(t, data) {
+		found = true
+		if e.Ledger != 1002 {
+			t.Errorf("the committed cursor is at ledger %d, want 1002", e.Ledger)
 		}
 	}
 	if !found {

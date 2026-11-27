@@ -58,7 +58,7 @@ func (s *FeeStatsSource) Fetch(ctx context.Context, cursor string) (Batch, error
 	if err != nil {
 		return Batch{}, err
 	}
-	out := Batch{Records: make([]Record, 0, len(b.Records)), NextCursor: b.NextCursor, Latest: b.Latest, Oldest: b.Oldest, Full: b.Full}
+	out := Batch{Records: make([]Record, 0, len(b.Records)), NextCursor: b.NextCursor, Latest: b.Latest, LatestCloseTime: b.LatestCloseTime, Oldest: b.Oldest, Full: b.Full}
 	for _, ledger := range b.Records {
 		if ledger.Close == nil || ledger.Close.HeaderXDR == "" {
 			continue
@@ -289,6 +289,7 @@ func feeDistribution(values []int64) *FeeDistribution {
 		P10:  nearestRank(sorted, 10),
 		P50:  nearestRank(sorted, 50),
 		P90:  nearestRank(sorted, 90),
+		P95:  nearestRank(sorted, 95),
 		P99:  nearestRank(sorted, 99),
 		Max:  sorted[len(sorted)-1],
 	}

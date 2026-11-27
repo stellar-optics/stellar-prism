@@ -209,9 +209,9 @@ func (s *StorageChangeSource) Fetch(ctx context.Context, cursor string) (Batch, 
 	out := Batch{
 		Records:    make([]Record, 0, len(batch.Records)),
 		NextCursor: batch.NextCursor,
-		Latest:     batch.Latest,
-		Oldest:     batch.Oldest,
-		Full:       batch.Full,
+		Latest:     batch.Latest, LatestCloseTime: batch.LatestCloseTime,
+		Oldest: batch.Oldest,
+		Full:   batch.Full,
 	}
 	for i := range batch.Records {
 		tx := batch.Records[i].Transaction

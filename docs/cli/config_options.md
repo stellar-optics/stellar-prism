@@ -149,7 +149,7 @@ heartbeat: 1m                     # stderr line after a minute of silence
 events:
   follow: true
   json: true
-  contract:                       # up to 5; use contracts-file for more
+  contract:                       # up to 5; use watchlist for more
     - CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
   # Filtering rules
   topic:                          # server-side, base64 ScVals with * and **
@@ -326,6 +326,7 @@ Accepted by `events`, `serve`, `transactions`, `ledgers`, `operations`,
 | `gap-strategy` | `PRISM_GAP_STRATEGY` | all streaming commands |
 | `ha-heartbeat` | `PRISM_HA_HEARTBEAT` | all streaming commands |
 | `ha-lease-file` | `PRISM_HA_LEASE_FILE` | all streaming commands |
+| `ha-standby-poll` | `PRISM_HA_STANDBY_POLL` | all streaming commands |
 | `ha-ttl` | `PRISM_HA_TTL` | all streaming commands |
 | `health-port` | `PRISM_HEALTH_PORT` | all streaming commands |
 | `heartbeat` | `PRISM_HEARTBEAT` | all streaming commands |
@@ -346,6 +347,7 @@ Accepted by `events`, `serve`, `transactions`, `ledgers`, `operations`,
 | `pg-cursor-key` | `PRISM_PG_CURSOR_KEY` | all streaming commands |
 | `pg-dsn` | `PRISM_PG_DSN` | all streaming commands |
 | `poll` | `PRISM_POLL` | all streaming commands |
+| `prune-after` | `PRISM_PRUNE_AFTER` | all streaming commands |
 | `prune-interval` | `PRISM_PRUNE_INTERVAL` | all streaming commands |
 | `prune-keep` | `PRISM_PRUNE_KEEP` | all streaming commands |
 | `prune-max-age` | `PRISM_PRUNE_MAX_AGE` | all streaming commands |
@@ -386,6 +388,7 @@ Accepted by `events`, `serve`, `transactions`, `ledgers`, `operations`,
 | `state-passphrase-file` | `PRISM_STATE_PASSPHRASE_FILE` | all streaming commands |
 | `stats` | `PRISM_STATS` | all streaming commands |
 | `stats-bar` | `PRISM_STATS_BAR` | all streaming commands |
+| `stream-id` | `PRISM_STREAM_ID` | all streaming commands, `rewind` |
 | `syslog-address` | `PRISM_SYSLOG_ADDRESS` | all streaming commands |
 | `syslog-app` | `PRISM_SYSLOG_APP` | all streaming commands |
 | `syslog-facility` | `PRISM_SYSLOG_FACILITY` | all streaming commands |
@@ -408,8 +411,10 @@ Put these in the matching command section.
 | `back` | `PRISM_BACK` | `rewind` |
 | `change` | `PRISM_CHANGE` | `storage` |
 | `consensus` | `PRISM_CONSENSUS` | `ledgers` |
+| `aggregate` | `PRISM_AGGREGATE` | `events`, `serve` |
+| `aggregate-interval` | `PRISM_AGGREGATE_INTERVAL` | `events`, `serve` |
 | `contract` | `PRISM_CONTRACT` | `aggregate`, `events`, `generate-types`, `serve`, `storage` |
-| `contracts-file` | `PRISM_CONTRACTS_FILE` | `events`, `serve` |
+| `contracts-file` | `PRISM_CONTRACTS_FILE` | `events`, `serve` (alias for `watchlist`) |
 | `dedup-window` | `PRISM_DEDUP_WINDOW` | `events`, `serve` |
 | `detect-conflicts` | `PRISM_DETECT_CONFLICTS` | `transactions` |
 | `entry` | `PRISM_ENTRY` | `storage` |
@@ -451,7 +456,8 @@ Put these in the matching command section.
 | `type` | `PRISM_TYPE` | `aggregate`, `events`, `operations`, `serve` |
 | `verbose` | `PRISM_VERBOSE` | `tx` |
 | `watch` | `PRISM_WATCH` | `contracts` |
-| `window` | `PRISM_WINDOW` | `aggregate` |
+| `watchlist` | `PRISM_WATCHLIST` | `events`, `serve` |
+| `window` | `PRISM_WINDOW` | `aggregate`, `events`, `serve` |
 
 ## Validation and troubleshooting
 

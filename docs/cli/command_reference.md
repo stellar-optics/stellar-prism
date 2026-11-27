@@ -126,7 +126,7 @@ section lists only the flags that are specific to it, plus its default
 | `--limit`, `-n` | int | — | stop after this many records (0 means unlimited) |
 | `--page-size` | uint | `200` | how many records to request per RPC call |
 | `--poll` | duration | `5s` | how long to wait between polls once caught up |
-| `--adaptive` | bool | — | tune the wait between polls from how many new ledgers close each interval (with --follow) |
+| `--adaptive` | bool | — | schedule each poll for the predicted next ledger close, from a moving average of recent close intervals (with --follow) |
 | `--heartbeat` | duration | — | print a line on stderr after this long waiting in silence (with --follow; 0 disables) |
 | `--backfill-workers` | int | `1` | fetch historical pages concurrently with this many workers when --from is set (1 means sequential) |
 | `--drain-timeout` | duration | `15s` | how long a shutdown may take to flush records and commit the final cursor |
@@ -206,6 +206,8 @@ prism ledgers --follow --json --output-file /var/log/prism/ledgers.ndjson \
 | `--prune-interval` | duration | `5m0s` | how often to compact the cursor metadata file in the background (0 compacts once) |
 | `--prune-keep` | int | `100` | keep at most this many cursor metadata entries per stream (0 keeps all) |
 | `--prune-max-age` | duration | — | drop cursor metadata entries older than this (0 keeps entries regardless of age) |
+| `--stream-id` | string | hash of the command, network, arguments and filters | name this stream's partition in --state-file, so several prism processes can share one file |
+| `--prune-after` | string | `7d` | drop --state-file history checkpoints older than this, e.g. `7d` or `36h`; the latest checkpoint and the resume cursor are always kept (0 keeps all) |
 | `--state-passphrase-env` | string | — | encrypt the state file with a passphrase read from this environment variable |
 | `--state-passphrase-file` | string | — | encrypt the state file with a passphrase read from this file |
 | `--state-kms-provider` | string | — | encrypt the state file with a key management service: "aws" or "gcp" |
@@ -222,10 +224,42 @@ prism ledgers --follow --json --output-file /var/log/prism/ledgers.ndjson \
   holds one checkpoint per delivered page, is compacted by the background
   pruner, and is resumed with `--resume`. An explicit `--from` or `--since`
   wins over the recorded cursor.
-- **Single-position file**: any other `--state-file`. It holds only the
-  latest position and is resumed automatically on the next run. Here the
-  saved position wins: `--from` is ignored, with a notice. This is the
-  format [`prism rewind`](#prism-rewind) edits.
+- **Position file**: any other `--state-file`. It holds each stream's
+  latest position plus a bounded checkpoint history, and is resumed
+  automatically on the next run. Here the saved position wins: `--from` is
+  ignored, with a notice. This is the format [`prism rewind`](#prism-rewind)
+  edits.
+
+#### Sharing one state file between processes
+
+A position file is partitioned by **stream ID** (schema version 2): one entry
+per stream, keyed by `--stream-id`. When `--stream-id` is omitted, prism
+derives a stable ID such as `events/3fa2c1d09b7e4a55` from the command, the
+network, the positional arguments and every filter flag. Operational flags —
+output format, sinks, `--from`, `--limit`, `--follow`, the state flags
+themselves — are left out, so a run restarted with a different `--limit` or
+output file still finds its own cursor.
+
+Several prism processes can therefore point at the same file:
+
+```console
+prism events --contract CAMM... --follow --state-file /var/lib/prism/state.json --stream-id events_amm
+prism transactions --follow        --state-file /var/lib/prism/state.json --stream-id tx_main
+```
+
+Every save is a locked read-modify-write: prism takes an exclusive lock on
+`<state-file>.lock`, re-reads the file, replaces only its own partition, and
+atomically renames a fresh copy into place. A stream can never overwrite
+another stream's cursor, even when both save at the same instant. A version 1
+file written by an older prism is adopted by the first stream that opens it
+and upgraded on its next save. If that stream is a different kind (a different
+`source`), the old position is kept under the `default` stream ID.
+
+Each stream's entry carries a `history` of checkpoints, at most one an hour.
+History older than `--prune-after` is pruned during saves (at most every six
+hours) and by a background compactor every six hours, so the file stays small
+under months of continuous operation. Pruning never touches the resume cursor
+and always keeps the newest checkpoint.
 
 ```console
 # Journal: record the position as the stream runs, then continue from it
@@ -243,9 +277,20 @@ PRISM_PG_DSN=postgres://prism@db/prism prism transactions --follow
 | `--ha-lease-file` | string | — | run as an active-passive pair, taking this lease file as the lock; only the leader streams |
 | `--ha-heartbeat` | duration | `5s` | how often the leader renews the lease |
 | `--ha-ttl` | duration | `15s` | how long the lease stays valid without a renewal |
+| `--ha-standby-poll` | duration | `200ms` | how often a standby polls for the lease; bounds failover time after the leader exits |
 | `--health-port` | int | — | serve /healthz, /readyz and /metrics on this port (0 disables the health server) |
 | `--max-lag` | uint32 | — | ledgers the stream may be behind before /readyz reports a failure (0 means no limit) |
 | `--metrics-addr` | string | — | serve Prometheus metrics at /metrics on this address, e.g. 127.0.0.1:9090 |
+
+The lease is a kernel file lock: `flock` on Linux, macOS and the BSDs,
+`fcntl` record locks on Solaris, illumos and AIX, and `LockFileEx` on Windows.
+The kernel releases the lock the moment the leader process exits, crash and
+`kill -9` included. A standby polls for the lock without blocking every
+`--ha-standby-poll`, so it takes over and resumes from the last committed
+cursor within one poll, well under a second by default. A leader that is
+alive but partitioned is fenced by the lease record's epoch once `--ha-ttl`
+lapses. To fail over between hosts, put the lease file on a shared file system
+that supports these locks.
 
 `--health-port` serves `/healthz`, `/readyz` and a `/metrics` endpoint with
 `prism_stream_lag` (ledgers behind the server) and related gauges.
@@ -371,16 +416,27 @@ Topic filters (`--topic`) are evaluated by the RPC server and use its wildcard
 syntax: `*` matches exactly one segment and `**` matches zero or more and must
 come last. `--topic-pattern`, `--topic-regex`, `--filter-expr`,
 `--exclude-*`, `--sample-rate` and `--max-rate` are applied client-side after
-decoding. `--contracts-file` hot-reloads a watchlist; addresses beyond the
-RPC's limit of five are queried in coordinated groups.
+decoding. `--watchlist` (alias `--contracts-file`) reads contract IDs from a
+file and hot-reloads it while streaming: additions and removals take effect on
+the next poll of a running `--follow` stream, each reload is logged to stderr,
+and an invalid edit is reported while the previous set stays active.
+Addresses beyond the RPC's limit of five are queried in coordinated groups.
+
+`--aggregate` replaces per-event output with rolling throughput over a sliding
+`--window` (default `1m`), printed every `--aggregate-interval` (default
+`10s`) and once more on exit: event count, events per second, and unique
+senders (the first address-typed topic after the event name, which is `from`
+for SEP-41 transfers). `--json` prints each summary as an NDJSON object.
 
 Default `--page-size`: **200**.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--contract` | strings | — | contract ID to watch; repeatable, up to 5 |
-| `--contracts-file` | string | — | read and hot-reload contract IDs from this file (one per line) |
-| `--dedup-window` | int | — | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin) |
+| `--aggregate` | bool | `false` | print rolling throughput (event count, events/sec, unique senders) over a sliding --window instead of each event |
+| `--aggregate-interval` | duration | `10s` | how often --aggregate prints a window summary |
+| `--contracts-file` | string | — | alias for --watchlist |
+| `--dedup-window` | int | `10000` | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables) |
 | `--exclude-contract` | strings | — | contract ID to exclude; repeatable |
 | `--exclude-topic` | stringArray | — | topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable |
 | `--fanout-dir` | string | — | write each watched contract's events to its own NDJSON file in this directory, in addition to the main output |
@@ -391,6 +447,8 @@ Default `--page-size`: **200**.
 | `--topic-pattern` | stringArray | — | client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5 |
 | `--topic-regex` | stringArray | — | client-side topic rule as segment-index:regexp; repeatable and all rules must match |
 | `--type` | strings | — | event type to include: contract, system or diagnostic (default: all) |
+| `--watchlist` | string | — | read contract IDs from this file (one per line, # comments allowed) and hot-reload it while streaming; lifts the 5-contract limit |
+| `--window` | duration | `1m` | sliding window length for --aggregate (e.g. 30s, 1m, 5m) |
 
 ```console
 # Follow one contract
@@ -400,10 +458,13 @@ prism events --contract CBGSB... --follow
 prism events --contract CBGSB... --topic 'AAAAAQ==,*' --limit 20
 
 # Client-side predicate over decoded payloads
-prism events --filter-expr 'value.amount > 1000000000 && topics[0].symbol == "transfer"'
+prism events --filter-expr 'value.amount > 1000000000 && contains(topic[0], "transfer")'
 
 # Hot-reloaded watchlist plus a topic regex
-prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*' --follow
+prism events --watchlist /etc/prism/watchlist.txt --topic-regex '0:^transfer.*' --follow
+
+# Rolling throughput over the last minute, printed every 10s
+prism events --watchlist /etc/prism/watchlist.txt --follow --aggregate --window 1m
 
 # Glob-style topic patterns over decoded topics
 prism events --contract CBGSB... --topic-pattern 'transfer,*,**' --follow
@@ -429,7 +490,7 @@ Default `--page-size`: **200**.
 |---|---|---|---|
 | `--contract` | strings | — | contract ID to watch; repeatable, up to 5 |
 | `--contracts-file` | string | — | read and hot-reload contract IDs from this file (one per line) |
-| `--dedup-window` | int | — | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin) |
+| `--dedup-window` | int | `10000` | drop re-polled duplicate events, remembering this many recent fingerprints (0 disables) |
 | `--exclude-contract` | strings | — | contract ID to exclude; repeatable |
 | `--exclude-topic` | stringArray | — | topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable |
 | `--fanout-dir` | string | — | write each watched contract's events to its own NDJSON file in this directory, in addition to the main output |
@@ -627,9 +688,14 @@ prism fee-stats [flags]
 Default `--page-size`: **50**. `fee-stats` has
 no flags beyond the shared streaming flags.
 
+The table output prints, per ledger, the base fee, the min/mode/p10/p50/p95
+inclusion fee per operation, capacity usage and surge status. `--json` emits
+the full `inclusionFeeCharged` and `inclusionFeeBid` distributions (`min`,
+`mode`, `p10`, `p50`, `p90`, `p95`, `p99`, `max`) for automated bidders.
+
 ```console
 prism fee-stats --follow
-prism fee-stats --follow --json | jq '{ledger, p90: .inclusionFeeCharged.p90, surge: .surgePricing}'
+prism fee-stats --follow --json | jq '{ledger, p50: .inclusionFeeCharged.p50, p95: .inclusionFeeCharged.p95, surge: .surgePricing}'
 ```
 
 ### prism simulate
@@ -833,17 +899,20 @@ Reposition a single-position state file (see
 [Durable cursors and state](#durable-cursors-and-state)) so the next run
 starts from another ledger. Pass exactly one of `--to-ledger` or `--back`. A
 backup of the previous state is written next to the file and its path is
-printed. For a cursor journal, choose the position on the streaming command
+printed. In a shared state file only the selected stream is rewound. Pass
+`--stream-id` when the file holds more than one stream; the error lists the
+IDs it holds. For a cursor journal, choose the position on the streaming command
 instead, with `--from`, `--since` or `--rewind`.
 
 ```text
-prism rewind --state-file FILE (--to-ledger LEDGER | --back N)
+prism rewind --state-file FILE [--stream-id ID] (--to-ledger LEDGER | --back N)
 ```
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--back` | uint32 | — | number of ledgers to rewind |
 | `--state-file` | string | — | state file to rewind |
+| `--stream-id` | string | — | stream to rewind in a shared state file (optional when the file holds a single stream) |
 | `--to-ledger` | uint32 | — | ledger to replay from |
 
 ```console
@@ -912,5 +981,6 @@ use the replacement shown.
 | Help text says | Use instead |
 |---|---|
 | `prism --timescale-dsn ...` (root examples) | no TimescaleDB flag is registered; use `--pg-dsn` for cursors, or a Kafka/webhook sink into your database |
-| `prism --parquet-dir ./txs` (root examples) | `--sink-parquet-dir ./txs` |
 | `prism audit --from-line 1 ...` | no such flag; filter the input first, e.g. `tail -n +2 events.ndjson \| prism audit` |
+
+`--parquet-dir` is a real alias for `--sink-parquet-dir`; both are accepted.

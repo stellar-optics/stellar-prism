@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -19,7 +20,11 @@ import (
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 
 	prismrpc "github.com/stellar-optics/stellar-prism/pkg/rpc"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
+
+// DefaultSpecCacheDir is the default directory where parsed contract specs are persisted.
+const DefaultSpecCacheDir = "~/.cache/prism/specs"
 
 // contractSpecSection is the WASM custom section that Soroban contracts embed
 // their ScSpecEntry stream in.
@@ -44,8 +49,10 @@ type contractSpec struct {
 // newABICmd builds `prism abi <contract-id>`.
 func newABICmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
-		function  string
-		arguments []string
+		function     string
+		arguments    []string
+		specCacheDir string
+		specCacheTTL time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -55,9 +62,8 @@ func newABICmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 Soroban spec embedded in its contractspecv0 custom section, and render
 functions, types and events with human-readable argument names.
 
-The lookup is two RPC calls: the contract instance names the WASM hash, and
-the code entry carries the bytecode. No other network access is made, and
-nothing is cached between runs.
+Specs are cached in memory and on disk under --spec-cache-dir with configurable TTL
+to avoid redundant RPC requests when watching or re-resolving contracts.
 
 With --function, only that function is shown. Repeating --arg decodes actual
 base64 ScVal arguments against the function's parameter names and types, so
@@ -81,7 +87,25 @@ hand.`,
 			}
 			defer closeClient()
 
-			spec, err := resolveContractSpec(cmd.Context(), client, args[0])
+			var cache *stream.ABICache
+			if specCacheDir != "" {
+				var err error
+				cache, err = stream.NewABICache(stream.ABICacheOptions{
+					Dir: specCacheDir,
+					TTL: specCacheTTL,
+				})
+				if err != nil {
+					// Fallback to in-memory cache if disk directory cannot be created
+					cache, err = stream.NewABICache(stream.ABICacheOptions{
+						TTL: specCacheTTL,
+					})
+					if err != nil {
+						return fmt.Errorf("creating in-memory spec cache: %w", err)
+					}
+				}
+			}
+
+			spec, err := resolveContractSpecWithCache(cmd.Context(), client, args[0], cache)
 			if err != nil {
 				return err
 			}
@@ -98,12 +122,23 @@ hand.`,
 		"show only this function and decode any --arg values against it")
 	cmd.Flags().StringArrayVar(&arguments, "arg", nil,
 		"base64 ScVal argument to decode; repeatable and requires --function")
+	cmd.Flags().StringVar(&specCacheDir, "spec-cache-dir", DefaultSpecCacheDir,
+		"directory to cache parsed contract specs on disk (empty disables disk cache)")
+	cmd.Flags().DurationVar(&specCacheTTL, "spec-cache-ttl", stream.DefaultABICacheTTL,
+		"TTL for cached contract specs (default: 24h)")
 	return cmd
 }
 
 // resolveContractSpec performs the two ledger-entry lookups and parses the
-// embedded spec. It is the only networked path in this file.
+// embedded spec.
 func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID string) (*contractSpec, error) {
+	return resolveContractSpecWithCache(ctx, client, contractID, nil)
+}
+
+// resolveContractSpecWithCache resolves the contract spec, checking and updating
+// cache if non-nil. When the contract wasm hash is cached, the second RPC call
+// for contract bytecode is skipped.
+func resolveContractSpecWithCache(ctx context.Context, client prismrpc.Client, contractID string, cache *stream.ABICache) (*contractSpec, error) {
 	entries, ok := client.(prismrpc.LedgerEntriesClient)
 	if !ok {
 		return nil, fmt.Errorf("RPC client does not support getLedgerEntries, which is required to resolve a contract ABI")
@@ -126,6 +161,22 @@ func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID
 		return nil, err
 	}
 
+	if cache != nil {
+		if cached, ok := cache.Get(contractID); ok {
+			expectedHash := hex.EncodeToString(hash[:])
+			if cached.WasmHash == expectedHash {
+				// Cache hit! Skip the second RPC call for WASM code.
+				spec := &contractSpec{ContractID: contractID, WasmHash: hash}
+				if err := spec.add(cached.Entries()); err == nil {
+					return spec, nil
+				}
+			} else {
+				// Code hash changed on-chain, invalidate stale entry.
+				cache.Invalidate(contractID)
+			}
+		}
+	}
+
 	codeKey := xdr.LedgerKey{
 		Type:         xdr.LedgerEntryTypeContractCode,
 		ContractCode: &xdr.LedgerKeyContractCode{Hash: hash},
@@ -141,6 +192,10 @@ func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID
 	specEntries, err := parseContractSpec(codeEntry.Data.ContractCode.Code)
 	if err != nil {
 		return nil, fmt.Errorf("contract %s: %w", contractID, err)
+	}
+
+	if cache != nil {
+		cache.Put(contractID, hash, specEntries)
 	}
 
 	spec := &contractSpec{ContractID: contractID, WasmHash: hash}

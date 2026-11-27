@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -104,6 +105,7 @@ func (w *rewindWatcher) Close() {
 // newRewindCmd safely repositions a simple state-file cursor for replay.
 func newRewindCmd(stdout io.Writer) *cobra.Command {
 	var path string
+	var streamID string
 	var ledger uint32
 	var back uint32
 	cmd := &cobra.Command{
@@ -117,7 +119,14 @@ func newRewindCmd(stdout io.Writer) *cobra.Command {
 			if (ledger == 0) == (back == 0) {
 				return fmt.Errorf("pass exactly one of --to-ledger or --back")
 			}
-			state, err := stream.OpenStateFile(path)
+			streamID, err := rewindStreamID(path, streamID)
+			if err != nil {
+				return err
+			}
+			state, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{
+				StreamID:  streamID,
+				Retention: stream.DefaultStateRetention,
+			})
 			if err != nil {
 				return err
 			}
@@ -135,12 +144,54 @@ func newRewindCmd(stdout io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if streamID != "" {
+				_, err = fmt.Fprintf(stdout, "rewound stream %s to ledger %d; backup: %s\n", streamID, ledger, backup)
+				return err
+			}
 			_, err = fmt.Fprintf(stdout, "rewound state to ledger %d; backup: %s\n", ledger, backup)
 			return err
 		},
 	}
 	cmd.Flags().StringVar(&path, "state-file", "", "state file to rewind")
+	cmd.Flags().StringVar(&streamID, "stream-id", "",
+		"stream to rewind in a shared state file (optional when the file holds a single stream)")
 	cmd.Flags().Uint32Var(&ledger, "to-ledger", 0, "ledger to replay from")
 	cmd.Flags().Uint32Var(&back, "back", 0, "number of ledgers to rewind")
 	return cmd
+}
+
+// rewindStreamID picks the partition to rewind. An explicit --stream-id is
+// used as given. Otherwise a single-stream file needs none, and a shared file
+// holding exactly one stream rewinds that one; a shared file holding several
+// is ambiguous, and the error lists them so the operator can choose.
+func rewindStreamID(path, explicit string) (string, error) {
+	ids, partitioned, err := stream.StateFileStreams(path)
+	if err != nil {
+		return "", err
+	}
+	if explicit != "" {
+		if !partitioned && ids == nil {
+			// A single-stream file: the stream ID selects the file as a
+			// whole once it is upgraded, so accept it.
+			return explicit, nil
+		}
+		for _, id := range ids {
+			if id == explicit {
+				return explicit, nil
+			}
+		}
+		return "", fmt.Errorf("state file %s has no stream %q; it holds: %s", path, explicit, strings.Join(ids, ", "))
+	}
+	if !partitioned {
+		return "", nil
+	}
+	switch len(ids) {
+	case 0:
+		return "", fmt.Errorf("cannot rewind an empty state file")
+	case 1:
+		return ids[0], nil
+	default:
+		return "", fmt.Errorf("state file %s is shared by %d streams; pass --stream-id with one of: %s",
+			path, len(ids), strings.Join(ids, ", "))
+	}
 }

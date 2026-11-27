@@ -193,6 +193,7 @@ func (s *EventSource) Fetch(ctx context.Context, cursor string) (Batch, error) {
 		}
 		if batch.Latest > merged.Latest {
 			merged.Latest = batch.Latest
+			merged.LatestCloseTime = batch.LatestCloseTime
 		}
 		if merged.Oldest == 0 || (batch.Oldest > 0 && batch.Oldest < merged.Oldest) {
 			merged.Oldest = batch.Oldest
@@ -260,11 +261,12 @@ func (s *EventSource) fetchGroup(ctx context.Context, cursor string, contractIDs
 	}
 
 	batch := Batch{
-		Records:    make([]Record, 0, len(resp.Events)),
-		NextCursor: resp.Cursor,
-		Latest:     resp.LatestLedger,
-		Oldest:     resp.OldestLedger,
-		Full:       uint(len(resp.Events)) >= s.query.PageLimit,
+		Records:         make([]Record, 0, len(resp.Events)),
+		NextCursor:      resp.Cursor,
+		Latest:          resp.LatestLedger,
+		LatestCloseTime: unixCloseTime(resp.LatestLedgerCloseTime),
+		Oldest:          resp.OldestLedger,
+		Full:            uint(len(resp.Events)) >= s.query.PageLimit,
 	}
 	for _, e := range resp.Events {
 		batch.Records = append(batch.Records, eventRecord(e))

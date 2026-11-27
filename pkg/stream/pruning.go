@@ -304,3 +304,54 @@ func (p *Pruner) runPass(ctx context.Context) {
 		}
 	}
 }
+
+// PruneStateHistory removes the checkpoints in state's history recorded
+// longer ago than retention, measured from now, and reports how many it
+// removed. See PruneStateHistoryAt.
+func PruneStateHistory(state *State, retention time.Duration) int {
+	return PruneStateHistoryAt(state, retention, time.Now())
+}
+
+// PruneStateHistoryAt removes the checkpoints in state's history recorded
+// before now-retention and reports how many it removed.
+//
+// Two things are never removed, whatever their age:
+//
+//   - the active resume cursor. That is the State's own Ledger, PagingToken
+//     and LastID, which this function does not touch: history is an audit
+//     trail, and pruning it can never move where the next run resumes;
+//   - the most recent checkpoint, so a stream that has been idle for longer
+//     than the retention window still carries a record of where it was.
+//
+// A nil state or a non-positive retention removes nothing. The surviving
+// checkpoints keep their order.
+func PruneStateHistoryAt(state *State, retention time.Duration, now time.Time) int {
+	if state == nil || retention <= 0 || len(state.History) == 0 {
+		return 0
+	}
+	cutoff := now.Add(-retention)
+
+	// The newest checkpoint is found by time rather than position, so a
+	// history whose entries were written out of order still keeps the one
+	// that really is the latest.
+	newest := 0
+	for i, cp := range state.History {
+		if !cp.RecordedAt.Before(state.History[newest].RecordedAt) {
+			newest = i
+		}
+	}
+
+	kept := state.History[:0]
+	removed := 0
+	for i, cp := range state.History {
+		if i == newest || !cp.RecordedAt.Before(cutoff) {
+			kept = append(kept, cp)
+			continue
+		}
+		removed++
+	}
+	// Clear the tail so the dropped checkpoints can be collected.
+	clear(state.History[len(kept):])
+	state.History = kept
+	return removed
+}

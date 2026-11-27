@@ -51,7 +51,7 @@ func (s *ContractLifecycleSource) Fetch(ctx context.Context, cursor string) (Bat
 	if err != nil {
 		return Batch{}, err
 	}
-	out := Batch{Records: []Record{}, NextCursor: b.NextCursor, Latest: b.Latest, Oldest: b.Oldest, Full: b.Full}
+	out := Batch{Records: []Record{}, NextCursor: b.NextCursor, Latest: b.Latest, LatestCloseTime: b.LatestCloseTime, Oldest: b.Oldest, Full: b.Full}
 	for _, record := range b.Records {
 		tx := record.Transaction
 		if tx == nil {
