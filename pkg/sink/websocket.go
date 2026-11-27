@@ -16,6 +16,9 @@ import (
 // that feed. Contract and topic subscriptions are ORed within a category and
 // ANDed across categories. Topics match an exact base64 XDR topic segment.
 // Same-origin browser requests are required by the standard upgrader.
+//
+// See docs/tutorials/web_streaming_sse_websocket.md for the subscription
+// protocol and browser examples.
 type WebSocket struct {
 	hub         *broadcastHub
 	mu          sync.Mutex

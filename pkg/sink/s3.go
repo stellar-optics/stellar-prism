@@ -20,7 +20,9 @@ const (
 	defaultUploadTimeout = 30 * time.Second
 )
 
-// S3Options configures an S3Store.
+// S3Options configures an S3Store. See
+// docs/sinks/parquet_and_cloud_storage.md for CLI flags, credentials, and
+// object key layout.
 type S3Options struct {
 	// Endpoint is the service URL, for example
 	// https://s3.us-east-1.amazonaws.com or a MinIO gateway.

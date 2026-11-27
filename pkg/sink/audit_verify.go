@@ -114,6 +114,9 @@ type AuditVerifyOptions struct {
 // The returned report names every problem it found, so a modified, deleted
 // or inserted line is reported with the line it is on. A nil error means the
 // log could be read; the report says whether it verified.
+//
+// See docs/compliance/audit_logging_and_aml.md for CLI verification workflows
+// and anomaly remediation guidance.
 func VerifyAuditLog(r io.Reader, opts AuditVerifyOptions) (*AuditVerification, error) {
 	if r == nil {
 		return nil, fmt.Errorf("audit: reader is required")

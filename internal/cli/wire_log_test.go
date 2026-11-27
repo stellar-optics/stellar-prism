@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 )
 
 // wireCapture records what the RPC server actually received, so the test can
@@ -245,5 +247,124 @@ func TestWireLogOpenFailureIsReported(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "wire log") {
 		t.Errorf("error = %q, want it to name the wire log", err)
+	}
+}
+
+func TestHeaderFlagAppearsInHelp(t *testing.T) {
+	stdout, _, err := run(t, "events", "--help")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, want := range []string{"--header", "-H", rpc.HeadersEnvVar} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("help does not mention %s\n%s", want, stdout)
+		}
+	}
+}
+
+func TestHeaderFlagRejectsMalformedHeaderWithoutNetwork(t *testing.T) {
+	_, _, err := run(t, "events", "--from", "9000", "--header", "malformed",
+		"--rpc-url", "http://127.0.0.1:1")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want header validation failure")
+	}
+	if !strings.Contains(err.Error(), "invalid header") {
+		t.Errorf("error = %q, want invalid header message", err)
+	}
+}
+
+func TestEventsCommandCustomHeadersAndWireLogRedaction(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		seenHeaders http.Header
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read failed", http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		seenHeaders = r.Header.Clone()
+		mu.Unlock()
+
+		var request struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &request); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request.ID,
+			"result": map[string]any{
+				"events":                []any{},
+				"cursor":                "",
+				"latestLedger":          9000,
+				"oldestLedger":          9000,
+				"latestLedgerCloseTime": "1700000000",
+				"oldestLedgerCloseTime": "1700000000",
+			},
+		}); err != nil {
+			t.Errorf("server writing response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv(rpc.HeadersEnvVar, "X-API-Key: env-secret, X-Env-Only: from-env")
+
+	path := filepath.Join(t.TempDir(), "wire.ndjson")
+	_, stderr, err := run(t, "events", "--from", "9000", "--json",
+		"--insecure-skip-network-check",
+		"--rpc-url", srv.URL,
+		"--header", "X-API-Key: cli-secret",
+		"-H", "Authorization: Bearer tok-123",
+		"--wire-log", path)
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstderr:\n%s", err, stderr)
+	}
+
+	mu.Lock()
+	gotAPIKey := seenHeaders.Get("X-Api-Key")
+	gotEnvOnly := seenHeaders.Get("X-Env-Only")
+	gotAuth := seenHeaders.Get("Authorization")
+	mu.Unlock()
+
+	if gotAPIKey != "cli-secret" {
+		t.Errorf("server saw X-Api-Key = %q, want %q", gotAPIKey, "cli-secret")
+	}
+	if gotEnvOnly != "from-env" {
+		t.Errorf("server saw X-Env-Only = %q, want %q", gotEnvOnly, "from-env")
+	}
+	if gotAuth != "Bearer tok-123" {
+		t.Errorf("server saw Authorization = %q, want %q", gotAuth, "Bearer tok-123")
+	}
+
+	entries := readWireLog(t, path)
+	if len(entries) != 2 {
+		t.Fatalf("got %d wire log entries, want 2", len(entries))
+	}
+	reqEntry := entries[0]
+	if got := reqEntry.Headers["X-Api-Key"]; len(got) != 1 || got[0] != "[REDACTED]" {
+		t.Errorf("logged X-Api-Key = %v, want [REDACTED]", got)
+	}
+	if got := reqEntry.Headers["Authorization"]; len(got) != 1 || got[0] != "[REDACTED]" {
+		t.Errorf("logged Authorization = %v, want [REDACTED]", got)
+	}
+	if got := reqEntry.Headers["X-Env-Only"]; len(got) != 1 || got[0] != "from-env" {
+		t.Errorf("logged X-Env-Only = %v, want [from-env]", got)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading wire log: %v", err)
+	}
+	for _, secret := range []string{"cli-secret", "env-secret", "tok-123"} {
+		if strings.Contains(string(raw), secret) {
+			t.Errorf("wire log leaked %q\n%s", secret, raw)
+		}
 	}
 }

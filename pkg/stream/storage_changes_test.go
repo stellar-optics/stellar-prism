@@ -468,3 +468,83 @@ func TestStorageChangeSourceName(t *testing.T) {
 		t.Errorf("Name() = %q, want %q", got, "storage_changes")
 	}
 }
+
+func TestStorageChangeSourceFiltersByStorageKey(t *testing.T) {
+	t.Parallel()
+
+	addr := testContractAddress(3)
+	meta := encodeMeta(t, testMeta(t, addr))
+	encodeKey := func(v xdr.ScVal) string {
+		t.Helper()
+		s, err := xdr.MarshalBase64(v)
+		if err != nil {
+			t.Fatalf("MarshalBase64() error = %v", err)
+		}
+		return s
+	}
+
+	tests := []struct {
+		name string
+		keys []string
+		want []uint32
+	}{
+		{name: "created key", keys: []string{encodeKey(testU32(2))}, want: []uint32{2}},
+		{name: "updated key", keys: []string{encodeKey(testU32(3))}, want: []uint32{3}},
+		{name: "both keys", keys: []string{encodeKey(testU32(2)), encodeKey(testU32(3))}, want: []uint32{2, 3}},
+		// Key 1 only appears as a state change, which is never a mutation.
+		{name: "state-only key", keys: []string{encodeKey(testU32(1))}, want: nil},
+		{name: "instance key", keys: []string{"AAAAFA=="}, want: nil},
+		{name: "surrounding space", keys: []string{"  " + encodeKey(testU32(2)) + " "}, want: []uint32{2}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fakerpc.NewTransactionServer([]protocol.TransactionInfo{
+				testTransaction(200, 1, "abc", meta),
+			})
+			src, err := stream.NewStorageChangeSource(srv, stream.StorageChangeQuery{Keys: tc.keys})
+			if err != nil {
+				t.Fatalf("NewStorageChangeSource() error = %v", err)
+			}
+			records := fetchStorage(t, src)
+			if len(records) != len(tc.want) {
+				t.Fatalf("got %d records, want %d", len(records), len(tc.want))
+			}
+			for i, record := range records {
+				c := record.StorageChange
+				if c == nil || c.EntryType != stream.StorageEntryContractData {
+					t.Fatalf("record %d is not a contract data change: %+v", i, c)
+				}
+				var entry xdr.LedgerEntry
+				if err := xdr.SafeUnmarshalBase64(c.EntryXDR, &entry); err != nil {
+					t.Fatalf("decoding entry: %v", err)
+				}
+				if got := uint32(*entry.Data.ContractData.Key.U32); got != tc.want[i] {
+					t.Errorf("record %d key = %d, want %d", i, got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestStorageChangeSourceInstanceKeyConstant(t *testing.T) {
+	t.Parallel()
+
+	got, err := xdr.MarshalBase64(xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance})
+	if err != nil {
+		t.Fatalf("MarshalBase64() error = %v", err)
+	}
+	if got != "AAAAFA==" {
+		t.Fatalf("instance key = %q, want AAAAFA== (documented in the storage guide)", got)
+	}
+}
+
+func TestStorageChangeSourceRejectsMalformedKey(t *testing.T) {
+	t.Parallel()
+
+	srv := fakerpc.NewTransactionServer(nil)
+	_, err := stream.NewStorageChangeSource(srv, stream.StorageChangeQuery{Keys: []string{"not-xdr"}})
+	if err == nil || !strings.Contains(err.Error(), "--key") {
+		t.Fatalf("NewStorageChangeSource() error = %v, want a --key error", err)
+	}
+}

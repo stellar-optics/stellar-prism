@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/strkey"
@@ -15,6 +19,7 @@ import (
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // testContractID is a syntactically valid contract strkey.
@@ -706,5 +711,208 @@ func TestWriteUnionCaseRejectsMalformedCases(t *testing.T) {
 				t.Fatal("writeUnionCase() error = nil, want a failure")
 			}
 		})
+	}
+}
+
+type countingLedgerClient struct {
+	*fakerpc.Server
+	mu            sync.Mutex
+	requestedKeys []string
+}
+
+func (c *countingLedgerClient) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	c.mu.Lock()
+	c.requestedKeys = append(c.requestedKeys, req.Keys...)
+	c.mu.Unlock()
+	return c.Server.GetLedgerEntries(ctx, req)
+}
+
+func (c *countingLedgerClient) keyCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.requestedKeys)
+}
+
+func (c *countingLedgerClient) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.requestedKeys = nil
+}
+
+func TestResolveContractSpecWithCacheHitAndMiss(t *testing.T) {
+	t.Parallel()
+
+	contractID, srv := fakeABIContract(t)
+	client := &countingLedgerClient{Server: srv}
+
+	cache, err := stream.NewABICache(stream.ABICacheOptions{})
+	if err != nil {
+		t.Fatalf("NewABICache() error = %v", err)
+	}
+
+	// 1. Initial resolution with empty cache -> Cache Miss.
+	// Both instance key and WASM code key must be fetched from RPC (2 keys).
+	spec1, err := resolveContractSpecWithCache(context.Background(), client, contractID, cache)
+	if err != nil {
+		t.Fatalf("first resolve failed: %v", err)
+	}
+	if len(spec1.Functions) == 0 {
+		t.Fatalf("expected resolved functions, got 0")
+	}
+	if client.keyCount() != 2 {
+		t.Fatalf("first resolve fetched %d keys, want 2 (instance + code)", client.keyCount())
+	}
+
+	client.reset()
+
+	// 2. Second resolution -> Cache Hit!
+	// Contract WASM hash is in cache, so only the instance key is fetched (1 key).
+	// Code key lookup is completely bypassed.
+	spec2, err := resolveContractSpecWithCache(context.Background(), client, contractID, cache)
+	if err != nil {
+		t.Fatalf("second resolve failed: %v", err)
+	}
+	if client.keyCount() != 1 {
+		t.Fatalf("second resolve fetched %d keys, want 1 (cache hit skips code key)", client.keyCount())
+	}
+	if len(spec2.Functions) != len(spec1.Functions) {
+		t.Fatalf("functions mismatch: got %d, want %d", len(spec2.Functions), len(spec1.Functions))
+	}
+}
+
+func TestResolveContractSpecWithCacheInvalidationOnCodeHashChange(t *testing.T) {
+	t.Parallel()
+
+	contractID := testContractID(t)
+	srv := fakerpc.NewServer(nil)
+
+	// WASM v1 has sampleSpec()
+	if err := srv.SetContractWasm(contractID, testWasm(t, sampleSpec()...)); err != nil {
+		t.Fatalf("installing initial wasm: %v", err)
+	}
+
+	client := &countingLedgerClient{Server: srv}
+	cache, err := stream.NewABICache(stream.ABICacheOptions{})
+	if err != nil {
+		t.Fatalf("NewABICache() error = %v", err)
+	}
+
+	// Warm the cache with v1
+	spec1, err := resolveContractSpecWithCache(context.Background(), client, contractID, cache)
+	if err != nil {
+		t.Fatalf("initial resolve failed: %v", err)
+	}
+	if len(spec1.Functions) != 3 {
+		t.Fatalf("spec1 functions = %d, want 3", len(spec1.Functions))
+	}
+
+	// Update contract WASM to v2 with a single function "updated_fn"
+	newSpec := []xdr.ScSpecEntry{
+		{
+			Kind: xdr.ScSpecEntryKindScSpecEntryFunctionV0,
+			FunctionV0: &xdr.ScSpecFunctionV0{
+				Name: "updated_fn",
+			},
+		},
+	}
+	if err := srv.SetContractWasm(contractID, testWasm(t, newSpec...)); err != nil {
+		t.Fatalf("updating contract wasm: %v", err)
+	}
+
+	client.reset()
+
+	// Resolve again with cache: instance entry returns new hash -> cache is invalidated -> new code fetched
+	spec2, err := resolveContractSpecWithCache(context.Background(), client, contractID, cache)
+	if err != nil {
+		t.Fatalf("updated resolve failed: %v", err)
+	}
+	if client.keyCount() != 2 {
+		t.Fatalf("cache invalidation should fetch 2 keys (instance + new code), got %d", client.keyCount())
+	}
+	if len(spec2.Functions) != 1 || string(spec2.Functions[0].Name) != "updated_fn" {
+		t.Fatalf("expected updated_fn after invalidation, got %+v", spec2.Functions)
+	}
+}
+
+func TestResolveContractSpecWithCacheTTLExpiration(t *testing.T) {
+	t.Parallel()
+
+	contractID, srv := fakeABIContract(t)
+	client := &countingLedgerClient{Server: srv}
+
+	currTime := time.Now()
+	cache, err := stream.NewABICache(stream.ABICacheOptions{
+		TTL: 1 * time.Hour,
+		Now: func() time.Time { return currTime },
+	})
+	if err != nil {
+		t.Fatalf("NewABICache() error = %v", err)
+	}
+
+	// Cold resolve
+	_, err = resolveContractSpecWithCache(context.Background(), client, contractID, cache)
+	if err != nil {
+		t.Fatalf("cold resolve failed: %v", err)
+	}
+	if client.keyCount() != 2 {
+		t.Fatalf("cold resolve keys = %d, want 2", client.keyCount())
+	}
+
+	// Warm resolve within TTL
+	client.reset()
+	_, err = resolveContractSpecWithCache(context.Background(), client, contractID, cache)
+	if err != nil {
+		t.Fatalf("warm resolve failed: %v", err)
+	}
+	if client.keyCount() != 1 {
+		t.Fatalf("warm resolve keys = %d, want 1", client.keyCount())
+	}
+
+	// Advance time past TTL
+	currTime = currTime.Add(2 * time.Hour)
+	client.reset()
+
+	// Expired resolve: cache entry is expired and evicted -> refetches code key
+	_, err = resolveContractSpecWithCache(context.Background(), client, contractID, cache)
+	if err != nil {
+		t.Fatalf("expired resolve failed: %v", err)
+	}
+	if client.keyCount() != 2 {
+		t.Fatalf("expired resolve keys = %d, want 2 (cache miss on expiration)", client.keyCount())
+	}
+}
+
+func TestABICliWithSpecCacheDirPersistence(t *testing.T) {
+	contractID, srv := fakeABIContract(t)
+	withFake(t, srv)
+
+	tmpDir := t.TempDir()
+
+	// Run abi command with --spec-cache-dir
+	stdout, _, err := run(t, "abi", contractID, "--spec-cache-dir", tmpDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(stdout, "contract: "+contractID) {
+		t.Fatalf("stdout missing contract header: %s", stdout)
+	}
+
+	// Verify cache file was written to disk
+	cacheFile := filepath.Join(tmpDir, contractID+".json")
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		t.Fatalf("expected cache file on disk: %v", err)
+	}
+	if !strings.Contains(string(data), contractID) {
+		t.Fatalf("cache file content missing contract ID: %s", string(data))
+	}
+
+	// Second invocation should succeed using cache file
+	stdout2, _, err := run(t, "abi", contractID, "--spec-cache-dir", tmpDir)
+	if err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if !strings.Contains(stdout2, "contract: "+contractID) {
+		t.Fatalf("second stdout missing contract header: %s", stdout2)
 	}
 }

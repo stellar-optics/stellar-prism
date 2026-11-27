@@ -84,6 +84,11 @@ endpoint**, and malformed XDR arriving in its responses.
   command that lands in your history, and be careful pasting a command line
   into an issue.
 - **prism only reads.** It never submits transactions and never touches keys.
+- **Encrypt state files on shared or regulated storage.** `--state-file`
+  journals can be sealed with AES-256-GCM using a passphrase or AWS/GCP KMS
+  envelope encryption, and tampering is detected on read. See
+  [docs/security/kms_and_state_encryption.md](docs/security/kms_and_state_encryption.md)
+  for setup and least-privilege IAM policies.
 - **Exit code 2 means the stream gapped.** If you script around prism, treat
   it as distinct from a generic failure: records were missed, and the range is
   printed on stderr.

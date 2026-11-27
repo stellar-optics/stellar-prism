@@ -2,13 +2,16 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +24,10 @@ import (
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
+// newAggregateCmd constructs the "prism aggregate" command.
+//
+// See docs/guides/multi_stream_aggregation.md for tumbling vs. sliding
+// window semantics, supported metrics, and throughput analytics pipelines.
 func newAggregateCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		sf          streamFlags
@@ -306,6 +313,9 @@ func runAggregate(
 	}
 	dsn := sf.pgDSN
 	if dsn == "" {
+		dsn = sf.statePG
+	}
+	if dsn == "" {
 		dsn = os.Getenv(envPGDSN)
 	}
 	store, closeStore, err := openCursorStore(ctx, dsn)
@@ -381,4 +391,186 @@ func closeOut(out stream.Sink) error {
 		return closer.Close()
 	}
 	return out.Flush()
+}
+
+// validateAggregate checks the events-only --aggregate flags.
+func (s *streamFlags) validateAggregate(cmd *cobra.Command) error {
+	if !s.aggregate {
+		// Only commands that define --aggregate (events, serve) own these
+		// flags; prism aggregate has an unrelated --window of its own.
+		if cmd.Flags().Lookup("aggregate") == nil {
+			return nil
+		}
+		for _, name := range []string{"window", "aggregate-interval"} {
+			if f := cmd.Flags().Lookup(name); f != nil && f.Changed {
+				return fmt.Errorf("--%s requires --aggregate", name)
+			}
+		}
+		return nil
+	}
+	if s.aggregateWindow <= 0 {
+		return fmt.Errorf("--window must be positive")
+	}
+	if s.aggregateEvery <= 0 {
+		return fmt.Errorf("--aggregate-interval must be positive")
+	}
+	if s.format != "" || s.tsv || s.csvFields != "" {
+		return fmt.Errorf("--aggregate prints window summaries and cannot be combined with CSV/TSV output")
+	}
+	return nil
+}
+
+// windowAggregateSink feeds every event into a sliding time window and
+// prints a summary of the window on a timer, in place of the events
+// themselves: prism events --aggregate --window 1m.
+//
+// The window runs on the stream's event clock: the close time of the newest
+// event seen, advanced by the wall time elapsed since it arrived. On a live
+// --follow stream that is the wall clock, so throughput decays to zero when
+// traffic stops; while backfilling history it tracks the ledgers being
+// replayed, so the summary describes them rather than an empty present.
+type windowAggregateSink struct {
+	out    io.Writer
+	json   bool
+	now    func() time.Time
+	window time.Duration
+
+	mu          sync.Mutex
+	buf         *stream.SlidingWindowBuffer
+	newestEvent time.Time
+	newestAt    time.Time
+	err         error
+
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// newWindowAggregateSink starts a sink that prints every interval. now is
+// injectable for tests; nil uses the wall clock.
+func newWindowAggregateSink(out io.Writer, window, every time.Duration, asJSON bool, now func() time.Time) *windowAggregateSink {
+	if now == nil {
+		now = time.Now
+	}
+	buf, err := stream.NewSlidingWindowBuffer(window)
+	if err != nil {
+		// validateAggregate rejects a non-positive window before this
+		// point; reaching here is a programming error.
+		panic(err)
+	}
+	s := &windowAggregateSink{
+		out:    out,
+		json:   asJSON,
+		now:    now,
+		window: window,
+		buf:    buf,
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	go s.loop(every)
+	return s
+}
+
+func (s *windowAggregateSink) loop(every time.Duration) {
+	defer close(s.done)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			s.print()
+		}
+	}
+}
+
+// Emit implements stream.Sink.
+func (s *windowAggregateSink) Emit(r stream.Record) error {
+	if r.Kind != stream.KindEvent || r.Event == nil {
+		return nil
+	}
+	now := s.now()
+	at := r.Time
+	if at.IsZero() {
+		at = now
+	}
+	sender := stream.EventSender(r)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !at.Before(s.newestEvent) {
+		s.newestEvent, s.newestAt = at, now
+	}
+	s.buf.Add(at, sender)
+	return s.err
+}
+
+// Flush implements stream.Sink. Summaries are written as they are printed,
+// so there is nothing buffered; a failed write is reported here.
+func (s *windowAggregateSink) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// Close stops the timer and prints a final summary, so a bounded run (or an
+// interrupted one) always ends with the window it last saw.
+func (s *windowAggregateSink) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.stop)
+		<-s.done
+		s.print()
+	})
+	return s.Flush()
+}
+
+// clock returns the event-clock reference for a snapshot.
+func (s *windowAggregateSink) clock(now time.Time) time.Time {
+	if s.newestEvent.IsZero() {
+		return now
+	}
+	return s.newestEvent.Add(now.Sub(s.newestAt))
+}
+
+func (s *windowAggregateSink) print() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	summary := s.buf.Snapshot(s.clock(s.now()))
+	if err := writeWindowSummary(s.out, summary, s.json); err != nil && s.err == nil {
+		s.err = fmt.Errorf("writing window summary: %w", err)
+	}
+}
+
+// windowSummaryJSON is the NDJSON shape of one --aggregate summary line.
+type windowSummaryJSON struct {
+	Type          string  `json:"type"`
+	WindowStart   string  `json:"window_start"`
+	WindowEnd     string  `json:"window_end"`
+	Window        string  `json:"window"`
+	Count         int     `json:"count"`
+	EventsPerSec  float64 `json:"events_per_sec"`
+	UniqueSenders int     `json:"unique_senders"`
+}
+
+// writeWindowSummary prints one summary as a human line or an NDJSON object.
+func writeWindowSummary(w io.Writer, s stream.WindowSummary, asJSON bool) error {
+	if asJSON {
+		line, err := json.Marshal(windowSummaryJSON{
+			Type:          "window",
+			WindowStart:   s.WindowStart.UTC().Format(time.RFC3339),
+			WindowEnd:     s.WindowEnd.UTC().Format(time.RFC3339),
+			Window:        s.Window.String(),
+			Count:         s.Count,
+			EventsPerSec:  math.Round(s.EventsPerSec*1000) / 1000,
+			UniqueSenders: s.UniqueSenders,
+		})
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(w, "%s\n", line)
+		return err
+	}
+	_, err := fmt.Fprintf(w, "%s  window=%s  events=%d  events/sec=%.2f  unique_senders=%d\n",
+		s.WindowEnd.UTC().Format(time.RFC3339), s.Window, s.Count, s.EventsPerSec, s.UniqueSenders)
+	return err
 }
