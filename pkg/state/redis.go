@@ -121,7 +121,9 @@ func invokeMethod(client any, name string, args []any) (any, error, bool) {
 		lastIdx := mt.NumOut() - 1
 		if mt.Out(lastIdx).Implements(errType) {
 			if !outs[lastIdx].IsNil() {
-				err = outs[lastIdx].Interface().(error)
+				if e, ok := outs[lastIdx].Interface().(error); ok {
+					err = e
+				}
 			}
 			if mt.NumOut() > 1 {
 				res = outs[0].Interface()
@@ -808,32 +810,38 @@ func (c *redisTCPClient) dial() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(c.timeout))
+	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
 	// AUTH
 	if c.password != "" {
 		if _, err := c.doConn(conn, "AUTH", c.password); err != nil {
-			conn.Close()
-			return nil, err
+			return nil, errors.Join(err, conn.Close())
 		}
 	}
 	if c.db != 0 {
 		if _, err := c.doConn(conn, "SELECT", strconv.Itoa(c.db)); err != nil {
-			conn.Close()
-			return nil, err
+			return nil, errors.Join(err, conn.Close())
 		}
 	}
 	return conn, nil
 }
 
-func (c *redisTCPClient) do(ctx context.Context, args ...string) (any, error) {
+func (c *redisTCPClient) do(ctx context.Context, args ...string) (res any, err error) {
 	conn, err := c.dial()
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() {
+		if cerr := conn.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 	if ctx != nil {
 		if d, ok := ctx.Deadline(); ok {
-			_ = conn.SetDeadline(d)
+			if err := conn.SetDeadline(d); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return c.doConn(conn, args...)
@@ -876,14 +884,20 @@ func readRESP(conn net.Conn) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		n, _ := strconv.ParseInt(line, 10, 64)
+		n, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid RESP integer %q: %w", line, err)
+		}
 		return n, nil
 	case '$':
 		line, err := readLine(conn)
 		if err != nil {
 			return nil, err
 		}
-		n, _ := strconv.Atoi(line)
+		n, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, fmt.Errorf("invalid RESP bulk length %q: %w", line, err)
+		}
 		if n < 0 {
 			return nil, nil
 		}
@@ -892,14 +906,19 @@ func readRESP(conn net.Conn) (any, error) {
 			return nil, err
 		}
 		// consume trailing \r\n
-		_, _ = readLine(conn)
+		if _, err := readLine(conn); err != nil {
+			return nil, err
+		}
 		return string(data), nil
 	case '*':
 		line, err := readLine(conn)
 		if err != nil {
 			return nil, err
 		}
-		n, _ := strconv.Atoi(line)
+		n, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, fmt.Errorf("invalid RESP array length %q: %w", line, err)
+		}
 		if n < 0 {
 			return nil, nil
 		}
@@ -981,8 +1000,8 @@ func (c *redisTCPClient) SetNX(ctx context.Context, key string, value any, expir
 	if v == nil {
 		return false, nil
 	}
-	s, _ := v.(string)
-	return s == "OK", nil
+	s, ok := v.(string)
+	return ok && s == "OK", nil
 }
 
 func (c *redisTCPClient) Eval(ctx context.Context, script string, keys []string, args ...any) (any, error) {

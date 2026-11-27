@@ -83,8 +83,7 @@ var openRedisState = func(ctx context.Context, redisURL, key string, stderr io.W
 	}
 	store, err := redisstate.NewRedisMetadataStore(client, key)
 	if err != nil {
-		_ = client.Close()
-		return nil, nil, err
+		return nil, nil, errors.Join(err, client.Close())
 	}
 	return store, client.Close, nil
 }
