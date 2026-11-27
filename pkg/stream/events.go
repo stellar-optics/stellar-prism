@@ -389,18 +389,18 @@ var (
 			return &s
 		},
 	}
-
-	byteBufferPool = sync.Pool{
-		New: func() any {
-			b := make([]byte, 0, 1024)
-			return &b
-		},
-	}
 )
 
 // GetRecord borrows a Record from the pool.
 func GetRecord() *Record {
-	r := recordPool.Get().(*Record)
+	r, ok := recordPool.Get().(*Record)
+	if !ok {
+		r = &Record{
+			Kind:  KindEvent,
+			Event: GetEvent(),
+		}
+		return r
+	}
 	if r.Event == nil {
 		r.Event = GetEvent()
 	}
@@ -423,7 +423,12 @@ func PutRecord(r *Record) {
 
 // GetEvent borrows an Event from the pool.
 func GetEvent() *Event {
-	e := eventPool.Get().(*Event)
+	e, ok := eventPool.Get().(*Event)
+	if !ok {
+		return &Event{
+			TopicXDR: make([]string, 0, 4),
+		}
+	}
 	e.TopicXDR = e.TopicXDR[:0]
 	e.InvocationPath = nil
 	return e
@@ -454,7 +459,10 @@ func PutEvent(e *Event) {
 
 // GetTopicSlice borrows a string slice for topics from the pool.
 func GetTopicSlice(capacity int) []string {
-	ptr := topicSlicePool.Get().(*[]string)
+	ptr, ok := topicSlicePool.Get().(*[]string)
+	if !ok {
+		return make([]string, 0, capacity)
+	}
 	s := *ptr
 	if cap(s) < capacity {
 		s = make([]string, 0, capacity)
@@ -480,12 +488,17 @@ type EventPageArena struct {
 	enc *xdr.EncodingBuffer
 }
 
+// NewEventPageArena creates a new EventPageArena instance.
+func NewEventPageArena() *EventPageArena {
+	return &EventPageArena{
+		buf: make([]byte, 0, 64*1024),
+		enc: xdr.NewEncodingBuffer(),
+	}
+}
+
 var eventPageArenaPool = sync.Pool{
 	New: func() any {
-		return &EventPageArena{
-			buf: make([]byte, 0, 64*1024),
-			enc: xdr.NewEncodingBuffer(),
-		}
+		return NewEventPageArena()
 	},
 }
 
@@ -553,7 +566,10 @@ func EncodeScValBase64ZeroCopy(val *xdr.ScVal) (string, error) {
 	if val == nil {
 		return "", nil
 	}
-	arena := eventPageArenaPool.Get().(*EventPageArena)
+	arena, ok := eventPageArenaPool.Get().(*EventPageArena)
+	if !ok {
+		arena = NewEventPageArena()
+	}
 	arena.Reset()
 	defer eventPageArenaPool.Put(arena)
 	return arena.EncodeScValBase64(val)
@@ -570,7 +586,10 @@ func ExtractEventsFromLedgerCloseMeta(lcm *xdr.LedgerCloseMeta) []Record {
 	closeTime := lcm.ClosedAt()
 	txCount := lcm.CountTransactions()
 
-	arena := eventPageArenaPool.Get().(*EventPageArena)
+	arena, ok := eventPageArenaPool.Get().(*EventPageArena)
+	if !ok {
+		arena = NewEventPageArena()
+	}
 	arena.Reset()
 	defer eventPageArenaPool.Put(arena)
 
@@ -626,7 +645,9 @@ func ExtractEventsFromLedgerCloseMeta(lcm *xdr.LedgerCloseMeta) []Record {
 
 			var valueStr string
 			if evt.Body.V0 != nil {
-				valueStr, _ = arena.EncodeScValBase64(&evt.Body.V0.Data)
+				if valStr, err := arena.EncodeScValBase64(&evt.Body.V0.Data); err == nil {
+					valueStr = valStr
+				}
 			}
 
 			id := arena.FormatID(seq, txIdx, evtIdx)
@@ -664,7 +685,10 @@ func ExtractEventsFromLedgerCloseMetaPooled(lcm *xdr.LedgerCloseMeta) []*Record 
 	closeTime := lcm.ClosedAt()
 	txCount := lcm.CountTransactions()
 
-	arena := eventPageArenaPool.Get().(*EventPageArena)
+	arena, ok := eventPageArenaPool.Get().(*EventPageArena)
+	if !ok {
+		arena = NewEventPageArena()
+	}
 	arena.Reset()
 
 	records := make([]*Record, 0, txCount*4)
@@ -719,7 +743,9 @@ func ExtractEventsFromLedgerCloseMetaPooled(lcm *xdr.LedgerCloseMeta) []*Record 
 
 			var valueStr string
 			if evt.Body.V0 != nil {
-				valueStr, _ = arena.EncodeScValBase64(&evt.Body.V0.Data)
+				if valStr, err := arena.EncodeScValBase64(&evt.Body.V0.Data); err == nil {
+					valueStr = valStr
+				}
 			}
 
 			r := GetRecord()
@@ -816,7 +842,9 @@ func ExtractEventsFromLedgerCloseMetaStandard(lcm *xdr.LedgerCloseMeta) []Record
 
 			var valueStr string
 			if evt.Body.V0 != nil {
-				valueStr, _ = xdr.MarshalBase64(evt.Body.V0.Data)
+				if valStr, err := xdr.MarshalBase64(evt.Body.V0.Data); err == nil {
+					valueStr = valStr
+				}
 			}
 
 			r := Record{
