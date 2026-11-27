@@ -77,7 +77,11 @@ func _EventStreamService_Subscribe_Handler(srv any, stream grpc.ServerStream) er
 	if err := stream.RecvMsg(in); err != nil {
 		return err
 	}
-	if err := srv.(EventStreamServiceServer).Subscribe(in, &eventStreamServiceSubscribeServer{stream}); err != nil {
+	impl, ok := srv.(EventStreamServiceServer)
+	if !ok {
+		return status.Errorf(codes.Internal, "prism.v1.EventStreamService: unexpected server type %T", srv)
+	}
+	if err := impl.Subscribe(in, &eventStreamServiceSubscribeServer{stream}); err != nil {
 		return err
 	}
 	return nil
