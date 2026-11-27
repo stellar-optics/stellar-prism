@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	redisstate "github.com/stellar-optics/stellar-prism/pkg/state"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
@@ -19,10 +20,11 @@ import (
 // exists — the metadata has to be compacted while the stream is still going,
 // not only when it stops.
 type cursorState struct {
-	store  stream.MetadataStore
-	pruner *stream.Pruner
-	key    string
-	cursor string
+	store      stream.MetadataStore
+	pruner     *stream.Pruner
+	key        string
+	cursor     string
+	closeStore func() error
 }
 
 // stateKey builds the key that identifies a stream inside the cursor
@@ -62,15 +64,8 @@ func eventsStateKey(contractIDs, topics, eventTypes []string, extraFilters ...st
 	return stateKey(append([]string{"events"}, parts...)...)
 }
 
-// openCursorState prepares the cursor metadata file, if one was requested,
-// and resolves the position a resumed run starts from.
-//
-// It returns nil when no --state-file was given, which every caller reads as
-// "no metadata and no pruning".
-//
-// The file is encrypted when a key was configured: the passphrase or the key
-// management service decides how the checkpoints are sealed, and the key
-// itself never reaches the disk.
+// isJournalState reports whether the flags ask for a journal-style state
+// file: resuming, pruning by age, encryption, a lease, or a .jsonl file.
 func isJournalState(sf *streamFlags) bool {
 	return sf.resume ||
 		sf.pruneMaxAge > 0 ||
@@ -82,36 +77,73 @@ func isJournalState(sf *streamFlags) bool {
 		strings.HasSuffix(sf.stateFile, ".jsonl")
 }
 
+// openRedisState connects to Redis and returns a metadata store backed by
+// it, along with a function that closes the connection.
+var openRedisState = func(ctx context.Context, redisURL, key string, stderr io.Writer) (stream.MetadataStore, func() error, error) {
+	client, err := redisstate.NewRedisClient(redisURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	store, err := redisstate.NewRedisMetadataStore(client, key)
+	if err != nil {
+		return nil, nil, errors.Join(err, client.Close())
+	}
+	return store, client.Close, nil
+}
+
+// openCursorState prepares the cursor metadata file, if one was requested,
+// and resolves the position a resumed run starts from.
+//
+// It returns nil when no --state-file was given, which every caller reads as
+// "no metadata and no pruning".
+//
+// The file is encrypted when a key was configured: the passphrase or the key
+// management service decides how the checkpoints are sealed, and the key
+// itself never reaches the disk.
 func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io.Writer) (*cursorState, error) {
-	if sf.stateFile == "" || !isJournalState(sf) {
+	if sf.stateRedisURL == "" && (sf.stateFile == "" || !isJournalState(sf)) {
 		return nil, nil
 	}
+
 	if sf.state.streamID != "" {
 		// An explicit --stream-id names the stream in the journal too, so
 		// processes sharing one journal keep their checkpoints apart.
 		key = sf.state.streamID
 	}
 
-	source, err := stateKeySource(sf)
-	if err != nil {
-		return nil, err
-	}
-
 	var store stream.MetadataStore
-	if source != nil {
-		encrypted, err := stream.NewEncryptedStateStore(sf.stateFile, source)
+	var closeStore func() error
+	if sf.stateRedisURL != "" {
+		redisKey := sf.stateRedisKey
+		if redisKey == "" {
+			redisKey = "prism:cursor:" + key
+		}
+		st, closer, err := openRedisState(ctx, sf.stateRedisURL, redisKey, stderr)
 		if err != nil {
 			return nil, err
 		}
-		store = encrypted
+		store = st
+		closeStore = closer
 	} else {
-		plain, err := stream.NewSharedFileMetadataStore(sf.stateFile)
+		source, err := stateKeySource(sf)
 		if err != nil {
 			return nil, err
 		}
-		store = plain
+		if source != nil {
+			encrypted, err := stream.NewEncryptedStateStore(sf.stateFile, source)
+			if err != nil {
+				return nil, err
+			}
+			store = encrypted
+		} else {
+			plain, err := stream.NewSharedFileMetadataStore(sf.stateFile)
+			if err != nil {
+				return nil, err
+			}
+			store = plain
+		}
 	}
-	state := &cursorState{store: store, key: key}
+	state := &cursorState{store: store, key: key, closeStore: closeStore}
 
 	if sf.resume {
 		meta, found, err := store.Latest(ctx, key)
@@ -185,6 +217,11 @@ func (s *cursorState) close(ctx context.Context) error {
 		return nil
 	}
 	var errs []error
+	if s.closeStore != nil {
+		if err := s.closeStore(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if s.pruner != nil {
 		if err := s.pruner.Close(); err != nil {
 			errs = append(errs, err)

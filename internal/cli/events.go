@@ -111,6 +111,11 @@ type streamFlags struct {
 	kmsKeyID      string
 	// stateKMSRegion is the region of the AWS key.
 	stateKMSRegion string
+
+	// stateRedisURL is the Redis instance backing cursor metadata.
+	stateRedisURL string
+	// stateRedisKey is the Redis key holding cursor metadata.
+	stateRedisKey string
 	// stateKMSTokenEnv names the environment variable holding the token
 	// used to reach the GCP key service.
 	stateKMSTokenEnv string
@@ -269,6 +274,10 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"region of the AWS key (default us-east-1, else $AWS_REGION)")
 	cmd.Flags().StringVar(&s.stateKMSTokenEnv, "state-kms-token-env", gcsTokenEnvVar,
 		"environment variable holding the OAuth token used to reach the GCP key service")
+	cmd.Flags().StringVar(&s.stateRedisURL, "state-redis-url", "",
+		"Redis URL for durable cursor metadata, e.g. redis://user:password@localhost:6379/0")
+	cmd.Flags().StringVar(&s.stateRedisKey, "state-redis-key", "",
+		"Redis key for durable cursor metadata (default prism:cursor:<stream_name>)")
 	cmd.Flags().StringVar(&s.haLeaseFile, "ha-lease-file", "",
 		"run as an active-passive pair, taking this lease file as the lock; only the leader streams")
 	cmd.Flags().DurationVar(&s.haHeartbeat, "ha-heartbeat", stream.DefaultHAHeartbeat,
@@ -474,6 +483,10 @@ func samePath(a, b string) bool {
 // The pruning flags only mean something when there is a file to prune, so
 // they are rejected on their own rather than being silently ignored.
 func (s *streamFlags) validateState(cmd *cobra.Command) error {
+	// Redis-backed cursor metadata is a state store too; the pruning flags
+	// are meaningful with --state-redis-url. The key defaults to
+	// prism:cursor:<stream_name> and is derived later, so nothing to
+	// validate here.
 	if s.pruneInterval < 0 {
 		return fmt.Errorf("--prune-interval must not be negative")
 	}
@@ -486,7 +499,7 @@ func (s *streamFlags) validateState(cmd *cobra.Command) error {
 	if err := s.validateStateEncryption(cmd); err != nil {
 		return err
 	}
-	if s.stateFile != "" {
+	if s.stateFile != "" || s.stateRedisURL != "" {
 		return nil
 	}
 	if s.resume {
