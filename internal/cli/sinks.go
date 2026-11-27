@@ -101,7 +101,9 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	// behaviour while the batching option has a precise name.
 	flags.DurationVar(&s.webhookTimeout, "webhook-timeout", 250*time.Millisecond,
 		"deprecated alias for --webhook-batch-timeout")
-	_ = flags.MarkDeprecated("webhook-timeout", "use --webhook-batch-timeout instead")
+	if err := flags.MarkDeprecated("webhook-timeout", "use --webhook-batch-timeout instead"); err != nil {
+		panic(err)
+	}
 	flags.IntVar(&s.webhookMaxRetry, "webhook-max-retries", 3,
 		"retry a failed webhook delivery this many times (-1 disables retries)")
 

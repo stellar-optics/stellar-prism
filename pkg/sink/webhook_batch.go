@@ -266,7 +266,7 @@ func (w *WebhookBatch) waitForThrottle() {
 	}
 }
 
-func (w *WebhookBatch) post(id string, body []byte) error {
+func (w *WebhookBatch) post(id string, body []byte) (err error) {
 	req, err := http.NewRequest(http.MethodPost, w.opts.URL, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -286,7 +286,11 @@ func (w *WebhookBatch) post(id string, body []byte) error {
 	if err != nil {
 		return fmt.Errorf("posting: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 	data, readErr := io.ReadAll(io.LimitReader(resp.Body, defaultWebhookResponseBytes))
 	if readErr != nil {
 		return readErr
