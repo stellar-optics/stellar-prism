@@ -190,8 +190,9 @@ func resolveContractSpecWithCache(ctx context.Context, client prismrpc.Client, c
 	if codeEntry.Data.Type != xdr.LedgerEntryTypeContractCode || codeEntry.Data.ContractCode == nil {
 		return nil, fmt.Errorf("contract %s: WASM code entry has unexpected type %s", contractID, codeEntry.Data.Type)
 	}
+	code := codeEntry.Data.ContractCode.Code
 
-	specEntries, err := parseContractSpec(codeEntry.Data.ContractCode.Code)
+	specEntries, err := parseContractSpec(code)
 	if err != nil {
 		return nil, fmt.Errorf("contract %s: %w", contractID, err)
 	}
