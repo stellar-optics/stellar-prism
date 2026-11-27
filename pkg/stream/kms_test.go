@@ -46,8 +46,8 @@ func TestAWSKMSClientGenerateAndDecryptDataKey(t *testing.T) {
 	defer srv.Close()
 
 	client, err := stream.NewAWSKMSClient(stream.AWSKMSOptions{
-		KeyID:           "arn:aws:kms:us-east-1:123456789012:key/test",
-		Region:          "us-east-1",
+		KeyID:     "arn:aws:kms:us-east-1:123456789012:key/test",
+		Region:    "us-east-1",
 		AccessKey: "AKIAIOSFODNN7EXAMPLE",
 		SecretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 		Endpoint:  srv.URL,
