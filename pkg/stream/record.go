@@ -144,6 +144,25 @@ type Event struct {
 	// InvocationPath lists the contract IDs from the root invocation to the
 	// contract that emitted this event, when known.
 	InvocationPath []string
+	// Typed is set when the emitting contract's ABI was resolved and the
+	// topics and payload were decoded with it. It is nil when no spec was
+	// available, in which case the wire fields above are the output.
+	Typed *TypedEvent
+}
+
+// TypedEvent is an event rendered with its contract's declared ABI: the event
+// name and its named parameters rather than anonymous tuples.
+type TypedEvent struct {
+	// Name is the event name declared in the contract spec.
+	Name string
+	// Fields are the declared parameters, in declaration order.
+	Fields []TypedField
+}
+
+// TypedField is one named event parameter.
+type TypedField struct {
+	Name  string
+	Value string
 }
 
 // LedgerClose is ledger close metadata as delivered by RPC.

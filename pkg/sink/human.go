@@ -245,6 +245,20 @@ func (h *Human) emitEvent(r stream.Record) error {
 		return nil
 	}
 
+	// A spec-decoded event renders its declared field names instead of the
+	// anonymous topic/value tuples; an unresolved spec leaves Typed nil and
+	// the wire shape below is used.
+	if e.Typed != nil {
+		var typed strings.Builder
+		for _, field := range e.Typed.Fields {
+			fmt.Fprintf(&typed, "%s%s%s%s = %s\n", indent, p.Key, field.Name, p.Reset, field.Value)
+		}
+		if _, err := h.w.WriteString(typed.String()); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		return nil
+	}
+
 	for i, t := range e.TopicXDR {
 		if err := h.writePayload(fmt.Sprintf("%stopic[%d]", indent, i), t); err != nil {
 			return err

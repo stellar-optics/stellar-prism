@@ -185,6 +185,10 @@ type ParquetConfig struct {
 	Compression string
 	// RowGroupSize controls the row group buffer size before writing columnar chunks.
 	RowGroupSize int64
+	// MaxFileBytes rotates the current part early once the staged rows reach
+	// this many bytes, so a part is bounded by size as well as row count.
+	// Zero disables size rotation and leaves parts bounded by BatchSize only.
+	MaxFileBytes int64
 }
 
 func (c ParquetConfig) withDefaults() ParquetConfig {
@@ -222,6 +226,9 @@ func (c ParquetConfig) validate() error {
 	if c.RowGroupSize < 0 {
 		return fmt.Errorf("parquet: row group size must not be negative, got %d", c.RowGroupSize)
 	}
+	if c.MaxFileBytes < 0 {
+		return fmt.Errorf("parquet: max file size must not be negative, got %d", c.MaxFileBytes)
+	}
 	if !parquetCompressions[strings.ToLower(c.Compression)] {
 		return fmt.Errorf(
 			"parquet: unknown compression %q; expected one of zstd, snappy, gzip, uncompressed",
@@ -231,8 +238,7 @@ func (c ParquetConfig) validate() error {
 }
 
 // Parquet writes records as columnar Parquet part files, encoded by an
-// embedded DuckDB instance. See docs/sinks/parquet_and_cloud_storage.md for
-// CLI flags, the union schema, and partitioned analytics recipes.
+// embedded DuckDB instance.
 //
 // Rows are staged in an in-memory DuckDB table and copied out with
 // `COPY … TO`. Each flush becomes one part file, so memory stays bounded even
@@ -247,13 +253,14 @@ type Parquet struct {
 	stmt *sql.Stmt
 	cfg  ParquetConfig
 
-	mu         sync.Mutex
-	pending    int
-	pendingErr error
-	closed     bool
-	partSeq    int
-	parts      int
-	written    int64
+	mu           sync.Mutex
+	pending      int
+	pendingBytes int64
+	pendingErr   error
+	closed       bool
+	partSeq      int
+	parts        int
+	written      int64
 
 	stop      chan struct{}
 	done      chan struct{}
@@ -346,7 +353,9 @@ func (t *Parquet) Emit(r stream.Record) error {
 		return fmt.Errorf("parquet: staging record %s: %w", r.ID, err)
 	}
 	t.pending++
-	if t.pending < t.cfg.BatchSize {
+	t.pendingBytes += estimateParquetRowBytes(row)
+	if t.pending < t.cfg.BatchSize &&
+		(t.cfg.MaxFileBytes <= 0 || t.pendingBytes < t.cfg.MaxFileBytes) {
 		return nil
 	}
 	return t.flushLocked(context.Background())
@@ -449,6 +458,7 @@ func (t *Parquet) flushLocked(ctx context.Context) error {
 	// The part is on disk before the staging table is cleared, so a failure
 	// below stops the stream without re-writing rows that already landed.
 	t.pending = 0
+	t.pendingBytes = 0
 	t.parts++
 	t.written += int64(rows)
 
@@ -456,6 +466,32 @@ func (t *Parquet) flushLocked(ctx context.Context) error {
 		return fmt.Errorf("parquet: clearing staging table after %s: %w", path, err)
 	}
 	return nil
+}
+
+// estimateParquetRowBytes approximates the uncompressed size of one staged
+// row. It only drives size-based rotation, so an estimate is enough: strings
+// dominate, and fixed-width columns contribute their width.
+func estimateParquetRowBytes(row []any) int64 {
+	var size int64
+	for _, value := range row {
+		switch v := value.(type) {
+		case string:
+			size += int64(len(v))
+		case []string:
+			for _, s := range v {
+				size += int64(len(s))
+			}
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					size += int64(len(s))
+				}
+			}
+		default:
+			size += 8
+		}
+	}
+	return size + 32
 }
 
 // nextPartPath picks the next free part file name, continuing after any files
