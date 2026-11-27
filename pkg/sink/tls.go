@@ -77,8 +77,12 @@ func (r *DynamicTLSReloader) startWatcher() error {
 	for dir := range dirsToWatch {
 		if err := watcher.Add(dir); err != nil {
 			// If directory watch fails, attempt watching the file directly
-			_ = watcher.Add(r.certFile)
-			_ = watcher.Add(r.keyFile)
+			if err := watcher.Add(r.certFile); err != nil {
+				return err
+			}
+			if err := watcher.Add(r.keyFile); err != nil {
+				return err
+			}
 		}
 	}
 
