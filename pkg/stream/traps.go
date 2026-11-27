@@ -24,6 +24,11 @@ func TrappedFilter() TransactionFilter {
 	}
 }
 
+// TrappedTxFilter is an alias for TrappedFilter.
+func TrappedTxFilter() TransactionFilter {
+	return TrappedFilter()
+}
+
 // TrapQuery describes a stream of trapped Soroban transactions.
 type TrapQuery struct {
 	// StartLedger is where a fresh stream begins. Zero means start from the

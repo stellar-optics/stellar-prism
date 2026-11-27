@@ -284,12 +284,18 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	if s.fanoutAsync && s.fanoutBuffer <= 0 {
 		return fmt.Errorf("--sink-fanout-buffer must be greater than zero")
 	}
-	switch sink.OverflowPolicy(s.fanoutOverflow) {
+	overflow := sink.OverflowPolicy(s.fanoutOverflow)
+	if overflow == "" {
+		// The zero value comes from programmatic construction, not the flag
+		// default, and means the same safe backpressure policy.
+		overflow = sink.OverflowBlock
+	}
+	switch overflow {
 	case sink.OverflowBlock, sink.OverflowDrop, sink.OverflowDLQ:
 	default:
 		return fmt.Errorf(`invalid --sink-fanout-overflow %q: want "block", "drop" or "dlq"`, s.fanoutOverflow)
 	}
-	if sink.OverflowPolicy(s.fanoutOverflow) == sink.OverflowDLQ && s.fanoutDLQPath == "" {
+	if overflow == sink.OverflowDLQ && s.fanoutDLQPath == "" {
 		return fmt.Errorf("--sink-fanout-overflow=dlq requires --sink-fanout-dlq")
 	}
 	if s.clickhouseAddr != "" && s.clickhouseBatchSize <= 0 {

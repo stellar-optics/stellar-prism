@@ -49,7 +49,8 @@ type streamFlags struct {
 	maxGapRecoveries int
 	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
 	// to the environment default resolved in runStream.
-	pgDSN string
+	pgDSN   string
+	statePG string
 	// pgCursorKey overrides the derived cursor row name.
 	pgCursorKey string
 	// derivedKey is computed by each command from its own query before
@@ -107,6 +108,7 @@ type streamFlags struct {
 	stateKMSProvider string
 	// stateKMSKeyID identifies the key in the key management service.
 	stateKMSKeyID string
+	kmsKeyID      string
 	// stateKMSRegion is the region of the AWS key.
 	stateKMSRegion string
 	// stateKMSTokenEnv names the environment variable holding the token
@@ -207,6 +209,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"longest wait between retries of a failed RPC call (0 uses the default)")
 	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
 		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
+	cmd.Flags().StringVar(&s.statePG, "state-pg", "",
+		"alias for --pg-dsn: PostgreSQL DSN for a durable cursor")
 	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
 		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
@@ -259,6 +263,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		`encrypt the state file with a key management service: "aws" or "gcp"`)
 	cmd.Flags().StringVar(&s.stateKMSKeyID, "state-kms-key-id", "",
 		"the key to use in the key management service (an ARN for AWS, a resource name for GCP)")
+	cmd.Flags().StringVar(&s.kmsKeyID, "kms-key-id", "",
+		"alias for --state-kms-key-id: the key to use in the key management service")
 	cmd.Flags().StringVar(&s.stateKMSRegion, "state-kms-region", "",
 		"region of the AWS key (default us-east-1, else $AWS_REGION)")
 	cmd.Flags().StringVar(&s.stateKMSTokenEnv, "state-kms-token-env", gcsTokenEnvVar,
@@ -508,11 +514,17 @@ func (s *streamFlags) validateStateEncryption(cmd *cobra.Command) error {
 	if s.statePassphraseFile != "" {
 		sources++
 	}
+	if s.stateKMSKeyID == "" {
+		s.stateKMSKeyID = s.kmsKeyID
+	}
 	if s.stateKMSProvider != "" {
 		sources++
 	}
 	if sources > 1 {
 		return fmt.Errorf("only one of --state-passphrase-env, --state-passphrase-file and --state-kms-provider may be given")
+	}
+	if s.stateKMSKeyID == "" {
+		s.stateKMSKeyID = s.kmsKeyID
 	}
 	if s.stateKMSProvider != "" {
 		provider := strings.ToLower(s.stateKMSProvider)
@@ -1437,6 +1449,9 @@ func runStream(
 		key = sf.pgCursorKey
 	}
 	dsn := sf.pgDSN
+	if dsn == "" {
+		dsn = sf.statePG
+	}
 	if dsn == "" {
 		dsn = os.Getenv(envPGDSN)
 	}

@@ -69,6 +69,7 @@ func TestPGFlagsAreDocumented(t *testing.T) {
 			}
 			for _, want := range []string{
 				"--pg-dsn",
+				"--state-pg",
 				"--pg-cursor-key",
 				"PRISM_PG_DSN",
 				"resumes where",

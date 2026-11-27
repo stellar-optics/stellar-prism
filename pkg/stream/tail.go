@@ -138,6 +138,14 @@ type Options struct {
 	// A nil Leader leaves the stream ungated, which is what a single
 	// instance wants.
 	Leader *LeaderElection
+	// BackfillWorkers is the number of concurrent backfill workers. When > 1,
+	// Tailer uses ResequenceBuffer to emit out-of-order worker pages in
+	// strictly monotonic ledger order.
+	BackfillWorkers int
+	// ResequenceWindow bounds how many ledgers ahead ResequenceBuffer may
+	// buffer before flagging a missing ledger. Zero uses
+	// DefaultMaxResequenceWindow.
+	ResequenceWindow uint32
 	// LeaderResume, when set, is called when this instance takes the
 	// lease and returns the cursor to resume from. It is how a standby
 	// picks up the work the previous leader committed rather than
@@ -267,6 +275,7 @@ type Tailer struct {
 	stats    Stats
 	recovery GapRecovery
 	reorder  *ReorderBuffer
+	reseq    *ResequenceBuffer
 	// Checkpoints wait until all records through their page have left the
 	// reorder buffer and reached the sink. The fetch cursor can run ahead.
 	pages           []pendingPage
@@ -336,6 +345,9 @@ func NewTailer(src Source, sink Sink, opts Options) *Tailer {
 		},
 		reorder:   NewReorderBuffer(),
 		flushGate: make(chan struct{}, 1),
+	}
+	if opts.BackfillWorkers > 1 {
+		t.reseq = NewResequenceBuffer(0, opts.ResequenceWindow)
 	}
 	if opts.Adaptive {
 		t.adaptive = NewAdaptivePoller(opts.AdaptiveMin, opts.AdaptiveMax, 2)
@@ -496,8 +508,8 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		// A bounded follow has all it needs once the available pages are
 		// drained and the buffered suffix satisfies the limit. Do not wait
 		// for another ledger just to finish an explicitly bounded request.
-		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+len(t.reorder.pending) >= t.opts.Limit {
-			done, _, err = t.emitReady(ctx, t.reorder.Flush())
+		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+t.pendingCount() >= t.opts.Limit {
+			done, _, err = t.emitReady(ctx, t.flushPending())
 			if err != nil {
 				return err
 			}
@@ -670,7 +682,7 @@ func (t *Tailer) Drain(ctx context.Context, timeout time.Duration) error {
 // quietly become N plus whatever the run happened to be holding.
 func (t *Tailer) drain(ctx context.Context) error {
 	if t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit {
-		if _, _, err := t.emitReady(ctx, t.reorder.Flush()); err != nil {
+		if _, _, err := t.emitReady(ctx, t.flushPending()); err != nil {
 			return err
 		}
 	}
@@ -688,7 +700,7 @@ func (t *Tailer) drain(ctx context.Context) error {
 // run that ends flushes exactly once whatever path it ended by.
 func (t *Tailer) finish(err error) error {
 	if err == nil && (t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit) {
-		if _, _, flushErr := t.emitReady(context.Background(), t.reorder.Flush()); flushErr != nil {
+		if _, _, flushErr := t.emitReady(context.Background(), t.flushPending()); flushErr != nil {
 			return flushErr
 		}
 	}
@@ -814,6 +826,12 @@ func (t *Tailer) applyRewind() error {
 		return nil
 	}
 
+	if t.reseq != nil {
+		if _, _, err := t.emitReady(context.Background(), t.reseq.Flush()); err != nil {
+			return err
+		}
+		t.reseq = NewResequenceBuffer(0, t.opts.ResequenceWindow)
+	}
 	if t.reorder != nil {
 		if _, _, err := t.emitReady(context.Background(), t.reorder.Flush()); err != nil {
 			return err
@@ -994,9 +1012,30 @@ func (t *Tailer) reportReadyPages() {
 	}
 }
 
+func (t *Tailer) pendingCount() int {
+	if t.reseq != nil {
+		return t.reseq.Len()
+	}
+	return len(t.reorder.pending)
+}
+
+func (t *Tailer) flushPending() []Record {
+	if t.reseq != nil {
+		return t.reseq.Flush()
+	}
+	return t.reorder.Flush()
+}
+
 // emit writes a batch's records, suppressing any the server replayed, and
 // reports whether the configured limit has been reached and records written.
 func (t *Tailer) emit(ctx context.Context, b Batch) (done bool, emitted int, err error) {
+	if t.reseq != nil {
+		ready, err := t.reseq.Push(b.Records)
+		if err != nil {
+			return false, 0, err
+		}
+		return t.emitReady(ctx, ready)
+	}
 	if t.opts.Store != nil {
 		return t.emitReady(ctx, b.Records)
 	}
