@@ -8,29 +8,37 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // fakeAMQPChannel records the declaration and publish calls the publisher
 // makes, so the broker contract can be asserted without a broker.
 type fakeAMQPChannel struct {
-	declareErr  error
-	confirmErr  error
-	publishErr  error
-	closeErr    error
-	ack         bool
-	noConfirm   bool
-	declared    bool
-	durable     bool
-	autoDelete  bool
-	exclusive   bool
-	confirmed   bool
-	confirms    chan amqp.Confirmation
-	published   []amqp.Publishing
-	exchange    string
-	routingKey  string
-	mandatory   bool
-	immediate   bool
-	closeCalled bool
+	declareErr error
+	confirmErr error
+	publishErr error
+	closeErr   error
+	ack        bool
+	noConfirm  bool
+	declared   bool
+	durable    bool
+	autoDelete bool
+	exclusive  bool
+	confirmed  bool
+	confirms   chan amqp.Confirmation
+	published  []amqp.Publishing
+	exchange   string
+	// Exchange declaration and queue binding, recorded so the topic
+	// routing contract can be asserted without a broker.
+	exchangeDeclared string
+	exchangeKind     string
+	bindKey          string
+	bindExchange     string
+	routingKey       string
+	mandatory        bool
+	immediate        bool
+	closeCalled      bool
 }
 
 func (c *fakeAMQPChannel) QueueDeclare(name string, durable, autoDelete, exclusive, _ bool, _ amqp.Table) (amqp.Queue, error) {
@@ -39,6 +47,18 @@ func (c *fakeAMQPChannel) QueueDeclare(name string, durable, autoDelete, exclusi
 	c.autoDelete = autoDelete
 	c.exclusive = exclusive
 	return amqp.Queue{Name: name}, c.declareErr
+}
+
+func (c *fakeAMQPChannel) ExchangeDeclare(name, kind string, _, _, _, _ bool, _ amqp.Table) error {
+	c.exchangeDeclared = name
+	c.exchangeKind = kind
+	return c.declareErr
+}
+
+func (c *fakeAMQPChannel) QueueBind(_ string, key, exchange string, _ bool, _ amqp.Table) error {
+	c.bindKey = key
+	c.bindExchange = exchange
+	return c.declareErr
 }
 
 func (c *fakeAMQPChannel) Confirm(_ bool) error {
@@ -293,4 +313,66 @@ func TestNewAMQPPublisherFailurePaths(t *testing.T) {
 			t.Error("NewAMQPPublisher(no queue) error = nil, want an error")
 		}
 	})
+}
+
+func TestAMQPEventRoutingKey(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		record stream.Record
+		want   string
+	}{
+		{
+			name:   "contract event",
+			record: stream.Record{Kind: stream.KindEvent, Event: &stream.Event{ContractID: "CABC", Type: "contract"}},
+			want:   "contract.CABC.contract",
+		},
+		{
+			name:   "system event without a contract",
+			record: stream.Record{Kind: stream.KindEvent, Event: &stream.Event{Type: "system"}},
+			want:   "contract.unknown.system",
+		},
+		{
+			name:   "record without event metadata",
+			record: stream.Record{Kind: stream.KindLedger},
+			want:   "contract.unknown.ledger",
+		},
+		{
+			name:   "empty event type falls back to the record kind",
+			record: stream.Record{Kind: stream.KindEvent, Event: &stream.Event{ContractID: "CXYZ"}},
+			want:   "contract.CXYZ.event",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := AMQPEventRoutingKey(tc.record); got != tc.want {
+				t.Errorf("AMQPEventRoutingKey() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAMQPPublisherDeclaresTopicExchange(t *testing.T) {
+	t.Parallel()
+
+	ch := &fakeAMQPChannel{ack: true}
+	conn := &fakeAMQPConnection{ch: ch}
+	if _, err := newAMQPPublisher("amqp://broker", AMQPOptions{
+		Queue:    "events",
+		Exchange: "stellar.events",
+	}, fakeDialer(conn, nil)); err != nil {
+		t.Fatalf("newAMQPPublisher() error = %v", err)
+	}
+	if ch.exchangeDeclared != "stellar.events" {
+		t.Errorf("declared exchange = %q, want stellar.events", ch.exchangeDeclared)
+	}
+	if ch.exchangeKind != "topic" {
+		t.Errorf("exchange kind = %q, want topic", ch.exchangeKind)
+	}
+	if ch.bindKey != "#" || ch.bindExchange != "stellar.events" {
+		t.Errorf("queue bound with key %q on %q, want \"#\" on stellar.events", ch.bindKey, ch.bindExchange)
+	}
 }

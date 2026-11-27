@@ -70,6 +70,14 @@ type sinkFlags struct {
 	parquetDir          string
 	parquetCodec        string
 	parquetRowGroupSize int64
+	parquetMaxSizeMB    int64
+	amqpURL             string
+	amqpQueue           string
+	amqpExchange        string
+	fanoutAsync         bool
+	fanoutBuffer        int
+	fanoutOverflow      string
+	fanoutDLQPath       string
 	clickhouseAddr      string
 	clickhouseDB        string
 	clickhouseUser      string
@@ -149,6 +157,22 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.StringVar(&s.parquetDir, "parquet-dir", "", "alias for --sink-parquet-dir")
 	flags.StringVar(&s.parquetCodec, "parquet-codec", "snappy", "Parquet compression codec: snappy, zstd, gzip, or uncompressed")
 	flags.Int64Var(&s.parquetRowGroupSize, "parquet-row-group-size", 128*1024*1024, "Parquet row group size in bytes (default: 128MB)")
+	flags.Int64Var(&s.parquetMaxSizeMB, "parquet-max-mb", 0,
+		"rotate a Parquet part file once its staged rows reach this many megabytes (0 bounds parts by row count only)")
+	flags.StringVar(&s.amqpURL, "sink-amqp-url", "",
+		"publish records to RabbitMQ at this AMQP 0-9-1 URL, in addition to the other outputs")
+	flags.StringVar(&s.amqpQueue, "sink-amqp-queue", "stellar.events",
+		"durable AMQP queue to declare and bind to the exchange")
+	flags.StringVar(&s.amqpExchange, "sink-amqp-exchange", "stellar.events",
+		"topic exchange to declare; routing keys are contract.<contract_id>.<event_type>")
+	flags.BoolVar(&s.fanoutAsync, "sink-fanout-async", false,
+		"give each extra sink its own buffered worker, so a slow destination cannot block the fast ones")
+	flags.IntVar(&s.fanoutBuffer, "sink-fanout-buffer", sink.DefaultAsyncFanoutBuffer,
+		"per-sink buffer for --sink-fanout-async")
+	flags.StringVar(&s.fanoutOverflow, "sink-fanout-overflow", string(sink.OverflowBlock),
+		`what --sink-fanout-async does when a sink buffer is full: "block", "drop" or "dlq"`)
+	flags.StringVar(&s.fanoutDLQPath, "sink-fanout-dlq", "",
+		"NDJSON file that receives overflowed records when --sink-fanout-overflow=dlq")
 	flags.StringVar(&s.clickhouseAddr, "clickhouse-addr", "", "ClickHouse native TCP endpoint (host:port, default port 9000)")
 	flags.StringVar(&s.clickhouseDB, "clickhouse-db", "default", "ClickHouse database name")
 	flags.StringVar(&s.clickhouseUser, "clickhouse-user", "default", "ClickHouse user")
@@ -242,6 +266,34 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.parquetRowGroupSize < 0 {
 		return fmt.Errorf("--parquet-row-group-size must not be negative")
+	}
+	if s.parquetMaxSizeMB < 0 {
+		return fmt.Errorf("--parquet-max-mb must not be negative")
+	}
+	if s.amqpURL != "" {
+		if strings.TrimSpace(s.amqpQueue) == "" {
+			return fmt.Errorf("--sink-amqp-url requires a non-empty --sink-amqp-queue")
+		}
+		if strings.TrimSpace(s.amqpExchange) == "" {
+			return fmt.Errorf("--sink-amqp-url requires a non-empty --sink-amqp-exchange")
+		}
+	}
+	if s.fanoutAsync && s.fanoutBuffer <= 0 {
+		return fmt.Errorf("--sink-fanout-buffer must be greater than zero")
+	}
+	overflow := sink.OverflowPolicy(s.fanoutOverflow)
+	if overflow == "" {
+		// The zero value comes from programmatic construction, not the flag
+		// default, and means the same safe backpressure policy.
+		overflow = sink.OverflowBlock
+	}
+	switch overflow {
+	case sink.OverflowBlock, sink.OverflowDrop, sink.OverflowDLQ:
+	default:
+		return fmt.Errorf(`invalid --sink-fanout-overflow %q: want "block", "drop" or "dlq"`, s.fanoutOverflow)
+	}
+	if overflow == sink.OverflowDLQ && s.fanoutDLQPath == "" {
+		return fmt.Errorf("--sink-fanout-overflow=dlq requires --sink-fanout-dlq")
 	}
 	if s.clickhouseAddr != "" && s.clickhouseBatchSize <= 0 {
 		return fmt.Errorf("--clickhouse-batch-size must be greater than zero")
@@ -428,12 +480,34 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 			Dir:          s.parquetDir,
 			Compression:  s.parquetCodec,
 			RowGroupSize: s.parquetRowGroupSize,
+			MaxFileBytes: s.parquetMaxSizeMB << 20,
 		})
 		if parquetErr != nil {
 			return nil, parquetErr
 		}
 		s.constructedSinks = append(s.constructedSinks, parquetSink)
 		sinks = append(sinks, parquetSink)
+	}
+	if s.amqpURL != "" {
+		publisher, amqpErr := sink.NewAMQPPublisher(s.amqpURL, sink.AMQPOptions{
+			Queue:        s.amqpQueue,
+			Exchange:     s.amqpExchange,
+			ExchangeKind: "topic",
+		})
+		if amqpErr != nil {
+			return nil, amqpErr
+		}
+		amqpSink, amqpErr := sink.NewAMQP(sink.AMQPConfig{
+			Queue:    s.amqpQueue,
+			Exchange: s.amqpExchange,
+			Decode:   decode,
+		}, publisher)
+		if amqpErr != nil {
+			_ = publisher.Close()
+			return nil, amqpErr
+		}
+		s.constructedSinks = append(s.constructedSinks, amqpSink)
+		sinks = append(sinks, amqpSink)
 	}
 	if s.clickhouseAddr != "" {
 		chSink, chErr := sink.NewClickHouse(context.Background(), sink.ClickHouseConfig{
@@ -494,6 +568,33 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 
 	if len(sinks) == 1 {
 		return base, nil
+	}
+	if s.fanoutAsync {
+		var dlq stream.Sink
+		var dlqFile *os.File
+		if sink.OverflowPolicy(s.fanoutOverflow) == sink.OverflowDLQ {
+			file, openErr := os.OpenFile(s.fanoutDLQPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if openErr != nil {
+				return nil, fmt.Errorf("opening fanout dead letter queue: %w", openErr)
+			}
+			dlqFile = file
+			dlq = sink.NewNDJSON(file, decode)
+		}
+
+		async := sink.NewAsyncFanout(sinks, sink.AsyncFanoutOptions{
+			Buffer:  s.fanoutBuffer,
+			Policy:  sink.OverflowPolicy(s.fanoutOverflow),
+			DLQ:     dlq,
+			OnError: observeError,
+		})
+		// The async sink closes every sink it wraps, so only the dead letter
+		// file it does not own is tracked separately.
+		s.constructedSinks = nil
+		if dlqFile != nil {
+			s.constructedSinks = append(s.constructedSinks, dlqFile)
+		}
+		s.constructedSinks = append(s.constructedSinks, async)
+		return async, nil
 	}
 	return sink.NewMultiSink(sinks, sink.MultiSinkOptions{Policy: sink.MultiSinkAbortAll})
 }

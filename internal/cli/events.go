@@ -68,6 +68,10 @@ type streamFlags struct {
 	amqpExchange     string
 	amqpRoutingKey   string
 
+	// decodeSpec resolves each contract's ABI and renders event topics and
+	// payloads with their declared field names.
+	decodeSpec bool
+
 	quiet     bool
 	verbosity int
 	stats     bool
@@ -1036,6 +1040,8 @@ start the next run where the last one stopped.`,
 		"event type to include: contract, system or diagnostic (default: all)")
 	cmd.Flags().StringVar(&filterExpr, "filter-expr", "", "client-side boolean expression evaluated against decoded event payloads")
 	cmd.Flags().StringArrayVar(&topicRegex, "topic-regex", nil, "client-side topic rule as segment-index:regexp; repeatable and all rules must match")
+	cmd.Flags().BoolVar(&sf.decodeSpec, "decode-spec", false,
+		"resolve each contract's ABI through RPC and render events with their declared field names (falls back to the wire shape when no spec is published)")
 	cmd.Flags().StringVar(&watchlistFile, "watchlist", "",
 		"read contract IDs from this file (one per line, # comments allowed) and hot-reload it while streaming; lifts the 5-contract limit")
 	cmd.Flags().StringVar(&contractsFile, "contracts-file", "", "alias for --watchlist")
@@ -1252,6 +1258,14 @@ func runStream(
 		if err != nil {
 			return err
 		}
+	}
+	if sf.decodeSpec {
+		specOut, specErr := newSpecDecodeSink(out, client)
+		if specErr != nil {
+			closeSink(out)
+			return specErr
+		}
+		out = specOut
 	}
 	if sf.statsBar {
 		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
