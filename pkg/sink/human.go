@@ -3,6 +3,7 @@ package sink
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -202,10 +203,59 @@ func (h *Human) emitSimulation(r stream.Record) error {
 	if _, err := h.w.WriteString("\n"); err != nil {
 		return fmt.Errorf("human: write: %w", err)
 	}
-	if h.compact || sim.ReturnValueXDR == "" {
+	if h.compact {
 		return nil
 	}
-	return h.writePayload("return", sim.ReturnValueXDR)
+
+	payloads := []struct {
+		label  string
+		values []string
+	}{
+		{label: "return", values: []string{sim.ReturnValueXDR}},
+		{label: "auth", values: sim.AuthXDR},
+		{label: "diagnostic event", values: sim.EventsXDR},
+		{label: "read-only footprint", values: sim.ReadOnlyFootprint},
+		{label: "read-write footprint", values: sim.ReadWriteFootprint},
+	}
+	for _, payload := range payloads {
+		for i, value := range payload.values {
+			if value == "" {
+				continue
+			}
+			label := payload.label
+			if len(payload.values) > 1 {
+				label = fmt.Sprintf("%s[%d]", label, i)
+			}
+			if err := h.writePayload(label, value); err != nil {
+				return err
+			}
+		}
+	}
+	if sim.ReturnValueXDR == "" && len(sim.ReturnValueJSON) > 0 {
+		if _, err := fmt.Fprintf(h.w, "  return %s\n", sim.ReturnValueJSON); err != nil {
+			return fmt.Errorf("human: write return value: %w", err)
+		}
+	}
+	if len(sim.AuthXDR) == 0 {
+		if err := writeRawJSONPayloads(h.w, "auth", sim.AuthJSON); err != nil {
+			return err
+		}
+	}
+	if len(sim.EventsXDR) == 0 {
+		if err := writeRawJSONPayloads(h.w, "diagnostic event", sim.EventsJSON); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeRawJSONPayloads(w io.Writer, label string, values []json.RawMessage) error {
+	for i, value := range values {
+		if _, err := fmt.Fprintf(w, "  %s[%d] %s\n", label, i, value); err != nil {
+			return fmt.Errorf("human: write %s: %w", label, err)
+		}
+	}
+	return nil
 }
 
 func (h *Human) emitEvent(r stream.Record) error {
@@ -509,6 +559,11 @@ func (h *Human) emitStorageChange(r stream.Record) error {
 
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
+	}
+	if c.StructuralDiff != "" {
+		if _, err := fmt.Fprintf(h.w, "  %sdiff%s\n%s\n", p.Key, p.Reset, strings.TrimRight(c.StructuralDiff, "\n")); err != nil {
+			return fmt.Errorf("human: write diff: %w", err)
+		}
 	}
 	if h.compact {
 		return nil

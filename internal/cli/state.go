@@ -52,11 +52,14 @@ func filterPart(name string, values []string) string {
 }
 
 // eventsStateKey identifies an event stream by its filters.
-func eventsStateKey(contractIDs, topics, eventTypes []string) string {
-	return stateKey("events",
+func eventsStateKey(contractIDs, topics, eventTypes []string, extraFilters ...string) string {
+	parts := []string{
 		filterPart("contract", contractIDs),
 		filterPart("topic", topics),
-		filterPart("type", eventTypes))
+		filterPart("type", eventTypes),
+	}
+	parts = append(parts, extraFilters...)
+	return stateKey(append([]string{"events"}, parts...)...)
 }
 
 // openCursorState prepares the cursor metadata file, if one was requested,

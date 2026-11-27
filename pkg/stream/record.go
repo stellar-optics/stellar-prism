@@ -10,6 +10,7 @@
 package stream
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -323,9 +324,14 @@ type StorageChange struct {
 	KeyXDR string
 	// EntryXDR is the base64 LedgerEntry, absent for removed entries.
 	EntryXDR string
+	// PreviousEntryXDR is the base64 LedgerEntry immediately before this
+	// mutation, when transaction metadata provides it or the source observed it.
+	PreviousEntryXDR string
 	// ChangeXDR is the base64 LedgerEntryChange exactly as the ledger emitted
 	// it, so consumers can re-decode without reconstructing anything.
-	ChangeXDR       string
+	ChangeXDR string
+	// StructuralDiff is populated by the contract diff source.
+	StructuralDiff  string
 	LiveUntilLedger uint32
 	RemainingTTL    uint32
 	TTLWarning      bool
@@ -377,22 +383,33 @@ type FootprintConflict struct {
 
 // Simulation is the resource estimate returned by simulateTransaction.
 type Simulation struct {
-	Ledger         uint32
-	Error          string
-	ReturnValueXDR string
-	Instructions   uint32
-	DiskReadBytes  uint32
-	WriteBytes     uint32
-	MinResourceFee int64
-	Changed        []string
-	Previous       *SimulationSnapshot
+	Ledger             uint32
+	Error              string
+	ReturnValueXDR     string
+	ReturnValueJSON    json.RawMessage
+	Instructions       uint32
+	DiskReadBytes      uint32
+	WriteBytes         uint32
+	MinResourceFee     int64
+	ReadOnlyFootprint  []string
+	ReadWriteFootprint []string
+	AuthXDR            []string
+	AuthJSON           []json.RawMessage
+	EventsXDR          []string
+	EventsJSON         []json.RawMessage
+	Changed            []string
+	Previous           *SimulationSnapshot
 }
 
 // SimulationSnapshot contains the comparable values from the previous head.
 type SimulationSnapshot struct {
-	ReturnValueXDR string
-	Instructions   uint32
-	DiskReadBytes  uint32
-	WriteBytes     uint32
-	MinResourceFee int64
+	ReturnValueXDR     string
+	Instructions       uint32
+	DiskReadBytes      uint32
+	WriteBytes         uint32
+	MinResourceFee     int64
+	ReadOnlyFootprint  []string
+	ReadWriteFootprint []string
+	AuthXDR            []string
+	EventsXDR          []string
 }

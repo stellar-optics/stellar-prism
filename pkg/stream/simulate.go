@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -72,16 +73,23 @@ func (s *SimulationSource) Fetch(ctx context.Context, cursor string) (Batch, err
 	if err != nil {
 		return Batch{}, err
 	}
+	current, err := simulationFromResponse(head.Sequence, resp)
+	if err != nil {
+		return Batch{}, err
+	}
 	s.lastHead = head.Sequence
-	current := simulationFromResponse(head.Sequence, resp)
 	if s.previous != nil {
 		current.Changed = simulationChanges(s.previous, current)
 		current.Previous = &SimulationSnapshot{
-			ReturnValueXDR: s.previous.ReturnValueXDR,
-			Instructions:   s.previous.Instructions,
-			DiskReadBytes:  s.previous.DiskReadBytes,
-			WriteBytes:     s.previous.WriteBytes,
-			MinResourceFee: s.previous.MinResourceFee,
+			ReturnValueXDR:     s.previous.ReturnValueXDR,
+			Instructions:       s.previous.Instructions,
+			DiskReadBytes:      s.previous.DiskReadBytes,
+			WriteBytes:         s.previous.WriteBytes,
+			MinResourceFee:     s.previous.MinResourceFee,
+			ReadOnlyFootprint:  append([]string(nil), s.previous.ReadOnlyFootprint...),
+			ReadWriteFootprint: append([]string(nil), s.previous.ReadWriteFootprint...),
+			AuthXDR:            append([]string(nil), s.previous.AuthXDR...),
+			EventsXDR:          append([]string(nil), s.previous.EventsXDR...),
 		}
 	}
 	s.previous = current
@@ -97,25 +105,67 @@ func (s *SimulationSource) Fetch(ctx context.Context, cursor string) (Batch, err
 	}, nil
 }
 
-func simulationFromResponse(ledger uint32, response protocol.SimulateTransactionResponse) *Simulation {
-	simulation := &Simulation{Ledger: ledger, Error: response.Error, MinResourceFee: response.MinResourceFee}
-	if len(response.Results) > 0 && response.Results[0].ReturnValueXDR != nil {
-		simulation.ReturnValueXDR = *response.Results[0].ReturnValueXDR
+func simulationFromResponse(ledger uint32, response protocol.SimulateTransactionResponse) (*Simulation, error) {
+	simulation := &Simulation{
+		Ledger:         ledger,
+		Error:          response.Error,
+		MinResourceFee: response.MinResourceFee,
+		EventsXDR:      append([]string(nil), response.EventsXDR...),
+		EventsJSON:     cloneRawMessages(response.EventsJSON),
+	}
+	for _, result := range response.Results {
+		if simulation.ReturnValueXDR == "" && len(simulation.ReturnValueJSON) == 0 {
+			if result.ReturnValueXDR != nil {
+				simulation.ReturnValueXDR = *result.ReturnValueXDR
+			}
+			simulation.ReturnValueJSON = append(json.RawMessage(nil), result.ReturnValueJSON...)
+		}
+		if result.AuthXDR != nil {
+			simulation.AuthXDR = append(simulation.AuthXDR, (*result.AuthXDR)...)
+		}
+		simulation.AuthJSON = append(simulation.AuthJSON, cloneRawMessages(result.AuthJSON)...)
 	}
 	if response.TransactionDataXDR != "" {
 		var data xdr.SorobanTransactionData
-		if err := xdr.SafeUnmarshalBase64(response.TransactionDataXDR, &data); err == nil {
-			simulation.Instructions = uint32(data.Resources.Instructions)
-			simulation.DiskReadBytes = uint32(data.Resources.DiskReadBytes)
-			simulation.WriteBytes = uint32(data.Resources.WriteBytes)
+		if err := xdr.SafeUnmarshalBase64(response.TransactionDataXDR, &data); err != nil {
+			return nil, fmt.Errorf("decoding simulation transaction data: %w", err)
+		}
+		simulation.Instructions = uint32(data.Resources.Instructions)
+		simulation.DiskReadBytes = uint32(data.Resources.DiskReadBytes)
+		simulation.WriteBytes = uint32(data.Resources.WriteBytes)
+		for _, key := range data.Resources.Footprint.ReadOnly {
+			encoded, err := xdr.MarshalBase64(key)
+			if err != nil {
+				return nil, fmt.Errorf("encoding read-only footprint key: %w", err)
+			}
+			simulation.ReadOnlyFootprint = append(simulation.ReadOnlyFootprint, encoded)
+		}
+		for _, key := range data.Resources.Footprint.ReadWrite {
+			encoded, err := xdr.MarshalBase64(key)
+			if err != nil {
+				return nil, fmt.Errorf("encoding read-write footprint key: %w", err)
+			}
+			simulation.ReadWriteFootprint = append(simulation.ReadWriteFootprint, encoded)
 		}
 	}
-	return simulation
+	return simulation, nil
+}
+
+func cloneRawMessages(messages []json.RawMessage) []json.RawMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	cloned := make([]json.RawMessage, len(messages))
+	for i := range messages {
+		cloned[i] = append(json.RawMessage(nil), messages[i]...)
+	}
+	return cloned
 }
 
 func simulationChanges(previous, current *Simulation) []string {
 	var changed []string
-	if !sameScVal(previous.ReturnValueXDR, current.ReturnValueXDR) {
+	if !sameScVal(previous.ReturnValueXDR, current.ReturnValueXDR) ||
+		!reflect.DeepEqual(previous.ReturnValueJSON, current.ReturnValueJSON) {
 		changed = append(changed, "return_value")
 	}
 	if previous.Instructions != current.Instructions {
@@ -129,6 +179,18 @@ func simulationChanges(previous, current *Simulation) []string {
 	}
 	if previous.Error != current.Error {
 		changed = append(changed, "error")
+	}
+	if !reflect.DeepEqual(previous.ReadOnlyFootprint, current.ReadOnlyFootprint) ||
+		!reflect.DeepEqual(previous.ReadWriteFootprint, current.ReadWriteFootprint) {
+		changed = append(changed, "footprint")
+	}
+	if !reflect.DeepEqual(previous.AuthXDR, current.AuthXDR) ||
+		!reflect.DeepEqual(previous.AuthJSON, current.AuthJSON) {
+		changed = append(changed, "auth")
+	}
+	if !reflect.DeepEqual(previous.EventsXDR, current.EventsXDR) ||
+		!reflect.DeepEqual(previous.EventsJSON, current.EventsJSON) {
+		changed = append(changed, "events")
 	}
 	return changed
 }

@@ -24,10 +24,10 @@ func newSimulateCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		Use:   "simulate",
 		Short: "Continuously simulate a transaction template",
 		Long: `Simulate a base64 TransactionEnvelope at each newly observed ledger
-head and report changes to its return value, instructions, memory footprint,
-and minimum resource fee.`,
+head and report its return value, resource use, footprint, authorization
+requirements and diagnostic events. Simulation failures are included verbatim.`,
 		Example: `  prism simulate --tx-envelope AAA... --follow
-  prism simulate --tx-envelope AAA... --json --limit 1`,
+  prism simulate --envelope AAA... --json --limit 1`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if envelope == "" {
@@ -52,6 +52,7 @@ and minimum resource fee.`,
 	}
 	sf.register(cmd, 1)
 	cmd.Flags().StringVar(&envelope, "tx-envelope", "", "base64 TransactionEnvelope to simulate")
+	cmd.Flags().StringVar(&envelope, "envelope", "", "alias for --tx-envelope")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 	return cmd
 }

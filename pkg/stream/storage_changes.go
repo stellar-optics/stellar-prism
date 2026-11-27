@@ -65,7 +65,8 @@ type StorageChangeSource struct {
 	changes map[string]bool
 	entries map[string]bool
 	// keys holds the canonical base64 XDR of every --key filter value.
-	keys map[string]bool
+	keys       map[string]bool
+	entryState map[string]string
 }
 
 // NewStorageChangeSource returns a Source over the given RPC client.
@@ -101,10 +102,11 @@ func NewStorageChangeSource(client rpc.Client, q StorageChangeQuery) (*StorageCh
 			StartLedger: q.StartLedger,
 			PageLimit:   q.PageLimit,
 		}),
-		query:   q,
-		changes: changes,
-		entries: entries,
-		keys:    keys,
+		query:      q,
+		changes:    changes,
+		entries:    entries,
+		keys:       keys,
+		entryState: make(map[string]string),
 	}, nil
 }
 
@@ -192,6 +194,7 @@ func (s *StorageChangeSource) Name() string { return "storage_changes" }
 func (s *StorageChangeSource) Rewind(ledger uint32) {
 	s.query.StartLedger = ledger
 	s.tx.Rewind(ledger)
+	s.entryState = make(map[string]string)
 }
 
 // CursorLedger implements Source.
@@ -249,12 +252,34 @@ func (s *StorageChangeSource) extract(record *Record) ([]Record, error) {
 	}
 
 	var records []Record
+	transactionState := make(map[string]string)
+	touched := make(map[string]bool)
 	for _, group := range groups {
 		for i := range group {
 			change := &group[i]
 			if change.Type == xdr.LedgerEntryChangeTypeLedgerEntryState {
-				// State changes restate an entry the transaction read; they
-				// are not mutations and would duplicate the stream.
+				entry, ok := change.GetLedgerEntry()
+				if !ok {
+					continue
+				}
+				key, err := change.LedgerKey()
+				if err != nil {
+					return nil, fmt.Errorf("reading state ledger key: %w", err)
+				}
+				keyXDR, err := key.MarshalBinaryBase64()
+				if err != nil {
+					return nil, fmt.Errorf("encoding state ledger key: %w", err)
+				}
+				entryXDR, err := xdr.MarshalBase64(entry)
+				if err != nil {
+					return nil, fmt.Errorf("encoding state ledger entry: %w", err)
+				}
+				if !touched[keyXDR] {
+					transactionState[keyXDR] = entryXDR
+				}
+				if _, exists := s.entryState[keyXDR]; !exists {
+					s.entryState[keyXDR] = entryXDR
+				}
 				continue
 			}
 
@@ -264,6 +289,21 @@ func (s *StorageChangeSource) extract(record *Record) ([]Record, error) {
 			}
 			if !ok {
 				continue
+			}
+			previous, found := transactionState[payload.KeyXDR]
+			if found {
+				delete(transactionState, payload.KeyXDR)
+			} else {
+				previous, found = s.entryState[payload.KeyXDR]
+			}
+			if found {
+				payload.PreviousEntryXDR = previous
+			}
+			touched[payload.KeyXDR] = true
+			if payload.ChangeType == StorageChangeRemoved {
+				delete(s.entryState, payload.KeyXDR)
+			} else if payload.EntryXDR != "" {
+				s.entryState[payload.KeyXDR] = payload.EntryXDR
 			}
 			if !s.matches(payload) {
 				continue

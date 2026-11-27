@@ -138,19 +138,27 @@ type operationLine struct {
 }
 
 type simulationLine struct {
-	Kind           string                     `json:"kind"`
-	ID             string                     `json:"id"`
-	Ledger         uint32                     `json:"ledger"`
-	Time           string                     `json:"time,omitempty"`
-	Error          string                     `json:"error,omitempty"`
-	ReturnValue    json.RawMessage            `json:"returnValue,omitempty"`
-	ReturnValueXDR string                     `json:"returnValueXdr,omitempty"`
-	Instructions   uint32                     `json:"instructions"`
-	DiskReadBytes  uint32                     `json:"diskReadBytes"`
-	WriteBytes     uint32                     `json:"writeBytes"`
-	MinResourceFee int64                      `json:"minResourceFee"`
-	Changed        []string                   `json:"changed,omitempty"`
-	Previous       *stream.SimulationSnapshot `json:"previous,omitempty"`
+	Kind                  string                     `json:"kind"`
+	ID                    string                     `json:"id"`
+	Ledger                uint32                     `json:"ledger"`
+	Time                  string                     `json:"time,omitempty"`
+	Error                 string                     `json:"error,omitempty"`
+	ReturnValue           json.RawMessage            `json:"returnValue,omitempty"`
+	ReturnValueXDR        string                     `json:"returnValueXdr,omitempty"`
+	Instructions          uint32                     `json:"instructions"`
+	DiskReadBytes         uint32                     `json:"diskReadBytes"`
+	WriteBytes            uint32                     `json:"writeBytes"`
+	MinResourceFee        int64                      `json:"minResourceFee"`
+	ReadOnlyFootprint     []json.RawMessage          `json:"readOnlyFootprint,omitempty"`
+	ReadOnlyFootprintXDR  []string                   `json:"readOnlyFootprintXdr,omitempty"`
+	ReadWriteFootprint    []json.RawMessage          `json:"readWriteFootprint,omitempty"`
+	ReadWriteFootprintXDR []string                   `json:"readWriteFootprintXdr,omitempty"`
+	Auth                  []json.RawMessage          `json:"auth,omitempty"`
+	AuthXDR               []string                   `json:"authXdr,omitempty"`
+	Events                []json.RawMessage          `json:"events,omitempty"`
+	EventsXDR             []string                   `json:"eventsXdr,omitempty"`
+	Changed               []string                   `json:"changed,omitempty"`
+	Previous              *stream.SimulationSnapshot `json:"previous,omitempty"`
 }
 
 // failureLine is the documented NDJSON shape for a decoded failure.
@@ -211,6 +219,7 @@ type storageChangeLine struct {
 	KeyXDR          string          `json:"keyXdr,omitempty"`
 	EntryXDR        string          `json:"entryXdr,omitempty"`
 	ChangeXDR       string          `json:"changeXdr,omitempty"`
+	StructuralDiff  string          `json:"structuralDiff,omitempty"`
 	LiveUntilLedger uint32          `json:"liveUntilLedger,omitempty"`
 	RemainingTTL    uint32          `json:"remainingTtl,omitempty"`
 	TTLWarning      bool            `json:"ttlWarning,omitempty"`
@@ -421,14 +430,56 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 			line.Ledger, line.Error = sim.Ledger, sim.Error
 			line.Instructions, line.DiskReadBytes, line.WriteBytes, line.MinResourceFee = sim.Instructions, sim.DiskReadBytes, sim.WriteBytes, sim.MinResourceFee
 			line.Changed, line.Previous = sim.Changed, sim.Previous
-			if n.decode && sim.ReturnValueXDR != "" {
-				raw, err := n.decodeXDR(sim.ReturnValueXDR)
+			if n.decode {
+				if len(sim.ReturnValueJSON) > 0 {
+					line.ReturnValue = sim.ReturnValueJSON
+				} else if sim.ReturnValueXDR != "" {
+					raw, err := n.decodeXDR(sim.ReturnValueXDR)
+					if err != nil {
+						return nil, err
+					}
+					line.ReturnValue = raw
+				}
+				line.Auth = sim.AuthJSON
+				if len(line.Auth) == 0 {
+					var err error
+					line.Auth, err = n.decodeXDRs(sim.AuthXDR)
+					if err != nil {
+						return nil, err
+					}
+				}
+				line.Events = sim.EventsJSON
+				if len(line.Events) == 0 {
+					var err error
+					line.Events, err = n.decodeXDRs(sim.EventsXDR)
+					if err != nil {
+						return nil, err
+					}
+				}
+				var err error
+				line.ReadOnlyFootprint, err = n.decodeXDRs(sim.ReadOnlyFootprint)
 				if err != nil {
 					return nil, err
 				}
-				line.ReturnValue = raw
+				line.ReadWriteFootprint, err = n.decodeXDRs(sim.ReadWriteFootprint)
+				if err != nil {
+					return nil, err
+				}
 			} else {
 				line.ReturnValueXDR = sim.ReturnValueXDR
+				if line.ReturnValueXDR == "" {
+					line.ReturnValue = sim.ReturnValueJSON
+				}
+				line.AuthXDR = sim.AuthXDR
+				if len(line.AuthXDR) == 0 {
+					line.Auth = sim.AuthJSON
+				}
+				line.EventsXDR = sim.EventsXDR
+				if len(line.EventsXDR) == 0 {
+					line.Events = sim.EventsJSON
+				}
+				line.ReadOnlyFootprintXDR = sim.ReadOnlyFootprint
+				line.ReadWriteFootprintXDR = sim.ReadWriteFootprint
 			}
 		}
 		payload = line
@@ -450,6 +501,7 @@ func (n *NDJSON) document(r stream.Record) (any, error) {
 			line.LiveUntilLedger = c.LiveUntilLedger
 			line.RemainingTTL = c.RemainingTTL
 			line.TTLWarning = c.TTLWarning
+			line.StructuralDiff = c.StructuralDiff
 			if n.decode {
 				if c.KeyXDR != "" {
 					raw, err := n.decodeXDR(c.KeyXDR)
@@ -633,6 +685,18 @@ func (n *NDJSON) decodeXDR(payload string) (json.RawMessage, error) {
 		return nil, fmt.Errorf("ndjson: formatting decoded payload: %w", err)
 	}
 	return json.RawMessage(bytes.TrimSpace(buf.Bytes())), nil
+}
+
+func (n *NDJSON) decodeXDRs(values []string) ([]json.RawMessage, error) {
+	decoded := make([]json.RawMessage, 0, len(values))
+	for _, value := range values {
+		raw, err := n.decodeXDR(value)
+		if err != nil {
+			return nil, err
+		}
+		decoded = append(decoded, raw)
+	}
+	return decoded, nil
 }
 
 // Flush implements stream.Sink.

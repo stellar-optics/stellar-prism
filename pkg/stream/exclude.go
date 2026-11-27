@@ -8,10 +8,14 @@ import (
 
 // ExcludeFilter wraps a Source to exclude events matching topic or contract filters.
 type ExcludeFilter struct {
-	source           Source
+	source   Source
+	matcher  *excludeMatcher
+	excluded int
+}
+
+type excludeMatcher struct {
 	excludePatterns  []ExcludeTopicPattern
 	excludeContracts map[string]bool
-	excluded         int
 }
 
 type ExcludeTopicPattern struct {
@@ -23,21 +27,26 @@ type ExcludeTopicPattern struct {
 }
 
 func NewExcludeFilter(source Source, excludeTopics []string, excludeContracts []string) (*ExcludeFilter, error) {
-	f := &ExcludeFilter{
-		source:           source,
-		excludeContracts: make(map[string]bool),
+	matcher, err := newExcludeMatcher(excludeTopics, excludeContracts)
+	if err != nil {
+		return nil, err
 	}
+	return &ExcludeFilter{source: source, matcher: matcher}, nil
+}
+
+func newExcludeMatcher(excludeTopics, excludeContracts []string) (*excludeMatcher, error) {
+	matcher := &excludeMatcher{excludeContracts: make(map[string]bool)}
 	for _, c := range excludeContracts {
-		f.excludeContracts[c] = true
+		matcher.excludeContracts[c] = true
 	}
 	for _, t := range excludeTopics {
 		pattern, err := parseExcludeTopicPattern(t)
 		if err != nil {
 			return nil, err
 		}
-		f.excludePatterns = append(f.excludePatterns, pattern)
+		matcher.excludePatterns = append(matcher.excludePatterns, pattern)
 	}
-	return f, nil
+	return matcher, nil
 }
 
 func parseExcludeTopicPattern(pattern string) (ExcludeTopicPattern, error) {
@@ -82,12 +91,12 @@ func (f *ExcludeFilter) Fetch(ctx context.Context, cursor string) (Batch, error)
 	if err != nil {
 		return batch, err
 	}
-	if len(f.excludePatterns) == 0 && len(f.excludeContracts) == 0 {
+	if len(f.matcher.excludePatterns) == 0 && len(f.matcher.excludeContracts) == 0 {
 		return batch, nil
 	}
 	filtered := make([]Record, 0, len(batch.Records))
 	for _, r := range batch.Records {
-		if f.shouldExclude(r) {
+		if f.matcher.shouldExclude(r) {
 			f.excluded++
 			continue
 		}
@@ -97,7 +106,7 @@ func (f *ExcludeFilter) Fetch(ctx context.Context, cursor string) (Batch, error)
 	return batch, nil
 }
 
-func (f *ExcludeFilter) shouldExclude(r Record) bool {
+func (f *excludeMatcher) shouldExclude(r Record) bool {
 	if r.Kind != KindEvent || r.Event == nil {
 		return false
 	}

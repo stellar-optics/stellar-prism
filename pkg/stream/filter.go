@@ -40,6 +40,24 @@ func (filters FilterSet) Match(record Record) (bool, error) {
 	return true, nil
 }
 
+type blacklistFilter struct {
+	matcher *excludeMatcher
+}
+
+// NewBlacklistFilter compiles contract and topic exclusions as a record filter.
+// Add it after inclusion filters to make blacklists take precedence.
+func NewBlacklistFilter(excludeTopics, excludeContracts []string) (RecordFilter, error) {
+	matcher, err := newExcludeMatcher(excludeTopics, excludeContracts)
+	if err != nil {
+		return nil, err
+	}
+	return blacklistFilter{matcher: matcher}, nil
+}
+
+func (f blacklistFilter) Match(record Record) (bool, error) {
+	return !f.matcher.shouldExclude(record), nil
+}
+
 type expressionFilter struct {
 	source string
 	root   ast.Expr
