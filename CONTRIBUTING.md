@@ -39,6 +39,10 @@ picks it up. Run it when you touch the RPC adapter or the streaming loop:
 make test-e2e    # starts a Quickstart container, streams, then removes it
 ```
 
+For step-by-step instructions on running a standalone Quickstart container,
+deploying a sample contract, and tailing local events, see the
+[local Quickstart testing guide](docs/development/local_quickstart_testing.md).
+
 Install the linter if you need it:
 
 ```sh
@@ -67,6 +71,11 @@ obvious next one — it is already a cursor-paginated API of the same shape.
 
 Implement `stream.Sink`. A file rotator or a webhook poster would each be
 small.
+
+[docs/contributing/authoring_custom_sinks.md](docs/contributing/authoring_custom_sinks.md)
+walks through the whole process: the `Emit`/`Flush`/`Close` contract, how to
+buffer without breaking backpressure or the delivery guarantee, a complete
+and tested Redis Streams sink, and how to wire a new sink into the CLI flags.
 
 ### Improve the fake
 

@@ -138,6 +138,14 @@ type Options struct {
 	// A nil Leader leaves the stream ungated, which is what a single
 	// instance wants.
 	Leader *LeaderElection
+	// BackfillWorkers is the number of concurrent backfill workers. When > 1,
+	// Tailer uses ResequenceBuffer to emit out-of-order worker pages in
+	// strictly monotonic ledger order.
+	BackfillWorkers int
+	// ResequenceWindow bounds how many ledgers ahead ResequenceBuffer may
+	// buffer before flagging a missing ledger. Zero uses
+	// DefaultMaxResequenceWindow.
+	ResequenceWindow uint32
 	// LeaderResume, when set, is called when this instance takes the
 	// lease and returns the cursor to resume from. It is how a standby
 	// picks up the work the previous leader committed rather than
@@ -267,6 +275,7 @@ type Tailer struct {
 	stats    Stats
 	recovery GapRecovery
 	reorder  *ReorderBuffer
+	reseq    *ResequenceBuffer
 	// Checkpoints wait until all records through their page have left the
 	// reorder buffer and reached the sink. The fetch cursor can run ahead.
 	pages           []pendingPage
@@ -275,6 +284,11 @@ type Tailer struct {
 	// adaptive is non-nil only when Options.Adaptive is set, and then drives
 	// the wait between polls instead of the fixed interval.
 	adaptive *AdaptivePoller
+	// closeEst is set alongside adaptive and, once the source reports a
+	// head, schedules each poll for the predicted next ledger close.
+	closeEst *LedgerCloseEstimator
+	// lastFetchAt is when the most recent successful fetch returned.
+	lastFetchAt time.Time
 	// latestSeen tracks the head the previous poll reported, so the adaptive
 	// poller can count how many ledgers closed during each wait.
 	latestSeen uint32
@@ -332,21 +346,43 @@ func NewTailer(src Source, sink Sink, opts Options) *Tailer {
 		reorder:   NewReorderBuffer(),
 		flushGate: make(chan struct{}, 1),
 	}
+	if opts.BackfillWorkers > 1 {
+		t.reseq = NewResequenceBuffer(0, opts.ResequenceWindow)
+	}
 	if opts.Adaptive {
 		t.adaptive = NewAdaptivePoller(opts.AdaptiveMin, opts.AdaptiveMax, 2)
+		t.closeEst = NewLedgerCloseEstimator(DefaultCloseEMAWindow, opts.AdaptiveMin, opts.AdaptiveMax)
 	}
 	return t
 }
 
 // wait returns how long to hold before the next poll, given what the last
-// batch reported. The fixed interval is the default; the adaptive poller
-// replaces it by observing how many new ledgers closed during the previous
-// wait.
+// batch reported. The fixed interval is the default. With Adaptive set, the
+// ledger close estimator schedules the poll for the predicted next close;
+// for a source that reports no head ledger at all, the ledger-count poller
+// in backoff.go tunes the wait instead.
 func (t *Tailer) wait(b Batch) time.Duration {
 	if t.adaptive == nil {
 		return t.opts.PollInterval
 	}
-	return t.adaptive.Observe(t.newLedgers(b))
+	newLedgers := t.newLedgers(b)
+	if b.Latest == 0 {
+		return t.adaptive.Observe(newLedgers)
+	}
+	observedAt := t.lastFetchAt
+	if observedAt.IsZero() {
+		observedAt = t.opts.Clock.Now()
+	}
+	t.closeEst.Observe(b.Latest, b.LatestCloseTime, observedAt)
+	// Until the head has advanced at least once there is no interval to
+	// predict from, and an RPC whose head is not moving at all is better
+	// served by the ledger-count poller's widening idle backoff. Both are
+	// fed every observation, so the switch is seamless.
+	fallback := t.adaptive.Observe(newLedgers)
+	if !t.closeEst.Ready() {
+		return fallback
+	}
+	return t.closeEst.Sleep(t.opts.Clock.Now())
 }
 
 // newLedgers reports how many ledgers closed since the previous poll, or
@@ -447,9 +483,11 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 			t.stats.Gaps++
 			recovered, recoverErr := t.recovery.Handle(t.src, gapErr)
 			if recoverErr != nil {
+				t.releaseBatchRecords(batch)
 				return recoverErr
 			}
 			if recovered {
+				t.releaseBatchRecords(batch)
 				t.stats.Recovered = t.recovery.Recovered()
 				t.cursor = ""
 				continue
@@ -459,17 +497,19 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		t.queuePage(batch)
 		done, _, err := t.emit(ctx, batch)
 		if err != nil {
+			t.releaseBatchRecords(batch)
 			if IsCancellation(err) {
 				return t.finish(nil)
 			}
 			return err
 		}
 		t.reportProgress(batch)
+		t.releaseBatchRecords(batch)
 		// A bounded follow has all it needs once the available pages are
 		// drained and the buffered suffix satisfies the limit. Do not wait
 		// for another ledger just to finish an explicitly bounded request.
-		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+len(t.reorder.pending) >= t.opts.Limit {
-			done, _, err = t.emitReady(ctx, t.reorder.Flush())
+		if !done && !batch.Full && t.opts.Limit > 0 && t.stats.Emitted+t.pendingCount() >= t.opts.Limit {
+			done, _, err = t.emitReady(ctx, t.flushPending())
 			if err != nil {
 				return err
 			}
@@ -519,6 +559,17 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		if err := t.opts.Clock.Sleep(ctx, t.wait(batch)); err != nil {
 			return t.finish(nil)
 		}
+	}
+}
+
+func (t *Tailer) releaseBatchRecords(batch Batch) {
+	// Process receives the source's backing slice and may retain it. Otherwise
+	// only the slice storage is recycled; the Records' payloads remain owned.
+	if t.opts.Process != nil {
+		return
+	}
+	if source, ok := t.src.(interface{ releaseRecords([]Record) }); ok {
+		source.releaseRecords(batch.Records)
 	}
 }
 
@@ -631,7 +682,7 @@ func (t *Tailer) Drain(ctx context.Context, timeout time.Duration) error {
 // quietly become N plus whatever the run happened to be holding.
 func (t *Tailer) drain(ctx context.Context) error {
 	if t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit {
-		if _, _, err := t.emitReady(ctx, t.reorder.Flush()); err != nil {
+		if _, _, err := t.emitReady(ctx, t.flushPending()); err != nil {
 			return err
 		}
 	}
@@ -649,7 +700,7 @@ func (t *Tailer) drain(ctx context.Context) error {
 // run that ends flushes exactly once whatever path it ended by.
 func (t *Tailer) finish(err error) error {
 	if err == nil && (t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit) {
-		if _, _, flushErr := t.emitReady(context.Background(), t.reorder.Flush()); flushErr != nil {
+		if _, _, flushErr := t.emitReady(context.Background(), t.flushPending()); flushErr != nil {
 			return flushErr
 		}
 	}
@@ -703,9 +754,14 @@ func (t *Tailer) flushOutput(ctx context.Context) error {
 func (t *Tailer) fetchWithRetry(ctx context.Context) (Batch, error) {
 	var attempt int
 	for {
+		started := t.opts.Clock.Now()
 		batch, err := t.src.Fetch(ctx, t.cursor)
 		if err == nil {
 			t.stats.Fetches++
+			if t.closeEst != nil {
+				t.lastFetchAt = t.opts.Clock.Now()
+				t.closeEst.ObserveLatency(t.lastFetchAt.Sub(started))
+			}
 			return batch, nil
 		}
 
@@ -770,6 +826,12 @@ func (t *Tailer) applyRewind() error {
 		return nil
 	}
 
+	if t.reseq != nil {
+		if _, _, err := t.emitReady(context.Background(), t.reseq.Flush()); err != nil {
+			return err
+		}
+		t.reseq = NewResequenceBuffer(0, t.opts.ResequenceWindow)
+	}
 	if t.reorder != nil {
 		if _, _, err := t.emitReady(context.Background(), t.reorder.Flush()); err != nil {
 			return err
@@ -950,9 +1012,30 @@ func (t *Tailer) reportReadyPages() {
 	}
 }
 
+func (t *Tailer) pendingCount() int {
+	if t.reseq != nil {
+		return t.reseq.Len()
+	}
+	return len(t.reorder.pending)
+}
+
+func (t *Tailer) flushPending() []Record {
+	if t.reseq != nil {
+		return t.reseq.Flush()
+	}
+	return t.reorder.Flush()
+}
+
 // emit writes a batch's records, suppressing any the server replayed, and
 // reports whether the configured limit has been reached and records written.
 func (t *Tailer) emit(ctx context.Context, b Batch) (done bool, emitted int, err error) {
+	if t.reseq != nil {
+		ready, err := t.reseq.Push(b.Records)
+		if err != nil {
+			return false, 0, err
+		}
+		return t.emitReady(ctx, ready)
+	}
 	if t.opts.Store != nil {
 		return t.emitReady(ctx, b.Records)
 	}
@@ -1085,4 +1168,235 @@ func (t *Tailer) persistState(pagingToken string, ledger uint32) error {
 		return fmt.Errorf("persisting stream position: %w", err)
 	}
 	return nil
+}
+
+// Ledger close estimation for the adaptive poller.
+//
+// Stellar ledgers close roughly every five seconds, but the interval is not
+// fixed: validator voting delays and load spikes stretch it to eight seconds
+// or more for runs of ledgers at a time. A poller that only reacts to "did a
+// new ledger appear?" either polls far more often than ledgers close, wasting
+// RPC calls on empty answers, or lags well behind the head. The estimator
+// below instead predicts when the next ledger will close and schedules the
+// poll for the moment its answer should first include it.
+const (
+	// DefaultCloseEMAWindow is how many recent ledger intervals the
+	// exponential moving average effectively spans.
+	DefaultCloseEMAWindow = 10
+	// DefaultCloseEstimateMinSleep and DefaultCloseEstimateMaxSleep clamp
+	// the scheduled wait. The floor keeps a late ledger from turning into a
+	// tight retry loop; the ceiling keeps a stalled network from parking
+	// the stream for longer than an operator would notice.
+	DefaultCloseEstimateMinSleep = 500 * time.Millisecond
+	DefaultCloseEstimateMaxSleep = 10 * time.Second
+)
+
+// LedgerCloseEstimator predicts the next ledger close from an exponential
+// moving average of observed close intervals, and turns that prediction into
+// a poll wait:
+//
+//	sleep = (lastClose + emaInterval + margin) - now - estimatedRpcLatency
+//
+// clamped into [MinSleep, MaxSleep].
+//
+// lastClose is the server-reported close time of the newest ledger when the
+// source provides it (getEvents, getLedgers and getTransactions all do) and
+// the time the advance was observed otherwise. estimatedRpcLatency is an EMA
+// of how long fetches take, subtracted so the response — not the request —
+// lands at the target. margin is a small, self-tuning allowance for the gap
+// between a ledger closing and the RPC serving it, plus the one-second
+// granularity of reported close times: it grows on each poll that arrives
+// before the ledger it expected, and shrinks slowly on polls that find
+// exactly one new ledger, so the schedule locks on just behind the head.
+//
+// When the expected ledger is overdue the wait backs off from MinSleep,
+// doubling on each consecutive empty poll up to the estimated interval, so a
+// stretched close costs a handful of polls rather than one every MinSleep.
+//
+// The estimator is not safe for concurrent use; it lives inside the tailer's
+// goroutine, like AdaptivePoller.
+type LedgerCloseEstimator struct {
+	// MinSleep and MaxSleep bound every wait returned.
+	MinSleep time.Duration
+	MaxSleep time.Duration
+
+	alpha float64
+
+	interval   float64 // EMA of seconds-per-ledger, in nanoseconds
+	intervals  int     // samples folded into interval
+	latency    float64 // EMA of fetch round-trip, in nanoseconds
+	latencies  int
+	margin     time.Duration
+	lastLedger uint32
+	lastClose  time.Time
+	misses     int
+}
+
+// NewLedgerCloseEstimator returns an estimator whose EMA spans roughly window
+// intervals (smoothing factor 2/(window+1)) and whose waits are clamped to
+// [minSleep, maxSleep]. Non-positive arguments fall back to the defaults.
+func NewLedgerCloseEstimator(window int, minSleep, maxSleep time.Duration) *LedgerCloseEstimator {
+	if window <= 0 {
+		window = DefaultCloseEMAWindow
+	}
+	if minSleep <= 0 {
+		minSleep = DefaultCloseEstimateMinSleep
+	}
+	if maxSleep <= 0 {
+		maxSleep = DefaultCloseEstimateMaxSleep
+	}
+	if maxSleep < minSleep {
+		maxSleep = minSleep
+	}
+	return &LedgerCloseEstimator{
+		MinSleep: minSleep,
+		MaxSleep: maxSleep,
+		alpha:    2 / float64(window+1),
+	}
+}
+
+// Ready reports whether at least one ledger close interval has been
+// observed, so Sleep is scheduling from data rather than the nominal cadence.
+func (e *LedgerCloseEstimator) Ready() bool { return e.intervals > 0 }
+
+// Interval returns the current estimate of the time between ledger closes,
+// or RoughLedgerCloseInterval before any interval has been observed.
+func (e *LedgerCloseEstimator) Interval() time.Duration {
+	if e.intervals == 0 {
+		return RoughLedgerCloseInterval
+	}
+	return time.Duration(e.interval)
+}
+
+// Latency returns the current estimate of a fetch's round-trip time.
+func (e *LedgerCloseEstimator) Latency() time.Duration { return time.Duration(e.latency) }
+
+// NextClose returns when the next ledger is expected to close, or the zero
+// time before a ledger has been observed.
+func (e *LedgerCloseEstimator) NextClose() time.Time {
+	if e.lastClose.IsZero() {
+		return time.Time{}
+	}
+	return e.lastClose.Add(e.Interval())
+}
+
+// ObserveLatency folds one fetch round-trip into the latency estimate.
+func (e *LedgerCloseEstimator) ObserveLatency(d time.Duration) {
+	if d < 0 {
+		return
+	}
+	e.latency = e.ema(e.latency, float64(d), e.latencies)
+	e.latencies++
+}
+
+// Observe records the head a poll reported. latest is the newest ledger,
+// closedAt its server-reported close time (zero if unknown), and observedAt
+// when the poll's answer arrived.
+func (e *LedgerCloseEstimator) Observe(latest uint32, closedAt, observedAt time.Time) {
+	if latest == 0 {
+		return
+	}
+	if closedAt.IsZero() {
+		// Without a server timestamp the best estimate of when the head
+		// moved is when the server answered, about half a round trip
+		// before the answer arrived.
+		closedAt = observedAt.Add(-time.Duration(e.latency / 2))
+	}
+	if e.lastLedger == 0 {
+		e.lastLedger, e.lastClose = latest, closedAt
+		return
+	}
+	if latest <= e.lastLedger {
+		// No new ledger. Only a poll scheduled for an expected close counts
+		// as early; one taken before the estimate exists does not.
+		e.misses++
+		if e.intervals > 0 {
+			e.adjustMargin(+marginStep)
+		}
+		return
+	}
+	delta := latest - e.lastLedger
+	if dt := closedAt.Sub(e.lastClose); dt > 0 {
+		e.interval = e.ema(e.interval, float64(dt)/float64(delta), e.intervals)
+		e.intervals++
+	}
+	switch {
+	case delta == 1 && e.misses == 0:
+		// Found exactly the ledger expected, first try: creep the target
+		// earlier so the schedule hugs the close.
+		e.adjustMargin(-marginStep / 4)
+	case delta > 1:
+		// Missed whole ledgers: the target is too late.
+		e.adjustMargin(-marginStep)
+	}
+	e.lastLedger, e.lastClose = latest, closedAt
+	e.misses = 0
+}
+
+// marginStep is how far one early poll moves the availability margin.
+const marginStep = 250 * time.Millisecond
+
+// adjustMargin moves the margin by d within ±half an interval. It may go
+// negative: when close times are inferred from observation rather than
+// reported by the server, the anchor itself runs late, and only a negative
+// margin can pull the schedule back toward the real close.
+func (e *LedgerCloseEstimator) adjustMargin(d time.Duration) {
+	limit := e.Interval() / 2
+	e.margin += d
+	if e.margin < -limit {
+		e.margin = -limit
+	}
+	if e.margin > limit {
+		e.margin = limit
+	}
+}
+
+// Sleep returns how long to wait, from now, before the next poll.
+func (e *LedgerCloseEstimator) Sleep(now time.Time) time.Duration {
+	if e.lastClose.IsZero() {
+		return e.clamp(e.Interval())
+	}
+	target := e.NextClose().Add(e.margin)
+	d := target.Sub(now) - e.Latency()
+	if d <= 0 {
+		// The expected ledger is due or overdue. Retry soon, but back off
+		// on each consecutive empty poll so a stretched close is not
+		// hammered.
+		d = e.MinSleep
+		for i := 1; i < e.misses && d < e.Interval(); i++ {
+			d *= 2
+		}
+		if d > e.Interval() {
+			d = e.Interval()
+		}
+	}
+	return e.clamp(d)
+}
+
+func (e *LedgerCloseEstimator) clamp(d time.Duration) time.Duration {
+	if d < e.MinSleep {
+		return e.MinSleep
+	}
+	if d > e.MaxSleep {
+		return e.MaxSleep
+	}
+	return d
+}
+
+// ema folds sample into prev; the first sample seeds the average outright so
+// the estimate is not dragged toward zero while it warms up.
+func (e *LedgerCloseEstimator) ema(prev, sample float64, n int) float64 {
+	if n == 0 {
+		return sample
+	}
+	return e.alpha*sample + (1-e.alpha)*prev
+}
+
+// unixCloseTime converts an RPC close timestamp in Unix seconds to a time,
+// mapping the zero "not reported" value to the zero time.
+func unixCloseTime(sec int64) time.Time {
+	if sec <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0).UTC()
 }

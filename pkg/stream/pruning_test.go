@@ -3,6 +3,8 @@ package stream_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -742,4 +744,323 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// steppedClock is a Clock whose Now the test sets, and whose Sleep returns
+// almost at once so a background loop can be driven quickly.
+type steppedClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *steppedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *steppedClock) set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = t
+}
+
+func (c *steppedClock) Sleep(ctx context.Context, _ time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Millisecond):
+		return nil
+	}
+}
+
+// thirtyDayHistory builds a state whose history holds one checkpoint an hour
+// for the 30 days before now, oldest first, and whose active cursor is the
+// newest position.
+func thirtyDayHistory(now time.Time) stream.State {
+	const hours = 30 * 24
+	st := stream.State{Version: stream.StateVersion, Source: "events"}
+	for i := hours; i >= 1; i-- {
+		ledger := uint32(1_000_000 + (hours-i)*720) //nolint:gosec // test data
+		st.History = append(st.History, stream.Checkpoint{
+			Ledger:      ledger,
+			PagingToken: fmt.Sprintf("tok-%d", ledger),
+			RecordedAt:  now.Add(-time.Duration(i) * time.Hour),
+		})
+	}
+	last := st.History[len(st.History)-1]
+	st.Ledger, st.PagingToken, st.Cursor, st.LastID = last.Ledger, last.PagingToken, last.PagingToken, last.PagingToken
+	return st
+}
+
+// TestPruneStateHistoryThirtyDays prunes a simulated 30-day history down to a
+// 7-day window and checks exactly what survives.
+func TestPruneStateHistoryThirtyDays(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	st := thirtyDayHistory(now)
+	before := len(st.History)
+	ledger, token, lastID := st.Ledger, st.PagingToken, st.LastID
+
+	removed := stream.PruneStateHistoryAt(&st, 7*24*time.Hour, now)
+
+	// Hourly checkpoints from now-168h to now-1h are inside the window.
+	const want = 7 * 24
+	if len(st.History) != want {
+		t.Fatalf("kept %d checkpoints, want %d (7 days of hourly checkpoints)", len(st.History), want)
+	}
+	if removed != before-want {
+		t.Errorf("removed = %d, want %d", removed, before-want)
+	}
+	cutoff := now.Add(-7 * 24 * time.Hour)
+	for i, cp := range st.History {
+		if cp.RecordedAt.Before(cutoff) {
+			t.Errorf("checkpoint %d at %v survived the 7-day cutoff %v", i, cp.RecordedAt, cutoff)
+		}
+		if i > 0 && !cp.RecordedAt.After(st.History[i-1].RecordedAt) {
+			t.Errorf("checkpoint %d is out of order after pruning", i)
+		}
+	}
+	if st.Ledger != ledger || st.PagingToken != token || st.LastID != lastID {
+		t.Errorf("active cursor moved: %d/%q/%q, want %d/%q/%q", st.Ledger, st.PagingToken, st.LastID, ledger, token, lastID)
+	}
+}
+
+// TestPruneStateHistoryKeepsLatestCheckpoint checks that a stream idle for
+// longer than the retention window keeps its most recent checkpoint, and that
+// the active resume cursor is never touched.
+func TestPruneStateHistoryKeepsLatestCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	st := thirtyDayHistory(now.Add(-60 * 24 * time.Hour)) // all 60-90 days old
+	newest := st.History[len(st.History)-1]
+	token := st.PagingToken
+
+	removed := stream.PruneStateHistoryAt(&st, 7*24*time.Hour, now)
+
+	if len(st.History) != 1 || st.History[0] != newest {
+		t.Fatalf("history = %+v, want only the newest checkpoint %+v", st.History, newest)
+	}
+	if removed != 30*24-1 {
+		t.Errorf("removed = %d, want %d", removed, 30*24-1)
+	}
+	if st.PagingToken != token {
+		t.Errorf("active cursor = %q, want %q", st.PagingToken, token)
+	}
+}
+
+func TestPruneStateHistoryNoOps(t *testing.T) {
+	t.Parallel()
+
+	if got := stream.PruneStateHistory(nil, time.Hour); got != 0 {
+		t.Errorf("nil state removed %d", got)
+	}
+	now := time.Now()
+	st := thirtyDayHistory(now)
+	if got := stream.PruneStateHistory(&st, 0); got != 0 || len(st.History) != 30*24 {
+		t.Errorf("zero retention removed %d, kept %d; want nothing removed", got, len(st.History))
+	}
+	empty := stream.State{Source: "events", PagingToken: "x"}
+	if got := stream.PruneStateHistory(&empty, time.Hour); got != 0 || empty.PagingToken != "x" {
+		t.Errorf("empty history: removed %d, cursor %q", got, empty.PagingToken)
+	}
+}
+
+// TestStateFileHistoryCompactsDuringSaves runs a simulated 30 days of a
+// stream saving every hour through a StateFile with a 7-day retention,
+// and checks that the file stays bounded and the resume cursor is intact.
+func TestStateFileHistoryCompactsDuringSaves(t *testing.T) {
+	t.Parallel()
+
+	clock := &steppedClock{now: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)}
+	path := filepath.Join(t.TempDir(), "state.json")
+	sf, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{
+		StreamID:  "events_amm",
+		Retention: 7 * 24 * time.Hour,
+		Clock:     clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := clock.Now()
+	var maxSize int64
+	var last stream.State
+	for step := 0; step <= 30*24; step++ { // hourly for 30 days
+		at := start.Add(time.Duration(step) * time.Hour)
+		clock.set(at)
+		last = stream.State{
+			Source:      "events",
+			Ledger:      uint32(1_000 + step), //nolint:gosec // test data
+			PagingToken: fmt.Sprintf("p%d", step),
+			LastID:      fmt.Sprintf("p%d", step),
+			UpdatedAt:   at,
+		}
+		if err := sf.Save(last); err != nil {
+			t.Fatalf("Save() at step %d error = %v", step, err)
+		}
+		if info, err := os.Stat(path); err == nil && info.Size() > maxSize {
+			maxSize = info.Size()
+		}
+	}
+
+	got, err := sf.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Ledger != last.Ledger || got.PagingToken != last.PagingToken || got.LastID != last.LastID {
+		t.Fatalf("resume cursor = %d/%q, want the last saved %d/%q", got.Ledger, got.PagingToken, last.Ledger, last.PagingToken)
+	}
+	// One checkpoint an hour, 7 days retained, plus at most one compaction
+	// interval of growth between prunes.
+	limit := 7*24 + int(stream.DefaultStateCompactInterval/time.Hour) + 1
+	if n := len(got.History); n == 0 || n > limit {
+		t.Fatalf("history holds %d checkpoints after 30 days, want 1..%d", n, limit)
+	}
+	cutoff := clock.Now().Add(-7*24*time.Hour - stream.DefaultStateCompactInterval)
+	if oldest := got.History[0].RecordedAt; oldest.Before(cutoff) {
+		t.Errorf("oldest checkpoint %v is older than retention plus one compaction interval (%v)", oldest, cutoff)
+	}
+	if newest := got.History[len(got.History)-1]; clock.Now().Sub(newest.RecordedAt) > stream.DefaultStateCheckpointInterval {
+		t.Errorf("newest checkpoint %v is more than one checkpoint interval old", newest.RecordedAt)
+	}
+	// A compact file: well under the size an unpruned 30-day history would
+	// reach (720 hourly checkpoints of ~90 bytes each).
+	if maxSize > 32*1024 {
+		t.Errorf("state file grew to %d bytes; pruning is not keeping it compact", maxSize)
+	}
+}
+
+// TestStateFileCompactPrunesEveryStream checks the explicit compaction pass
+// over a shared file: every stream's history is pruned, every resume cursor
+// survives.
+func TestStateFileCompactPrunesEveryStream(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	clock := &steppedClock{now: now}
+	path := filepath.Join(t.TempDir(), "state.json")
+	for _, id := range []string{"a", "b"} {
+		// Retention off while seeding, so the save does not prune.
+		sf, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{StreamID: id, Clock: clock})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sf.Save(thirtyDayHistory(now)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sf, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{
+		StreamID: "a", Retention: 7 * 24 * time.Hour, Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := sf.Compact()
+	if err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+	if want := 2 * (30*24 - 7*24); removed != want {
+		t.Errorf("Compact() removed %d, want %d", removed, want)
+	}
+	for _, id := range []string{"a", "b"} {
+		other, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{StreamID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := other.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(st.History) != 7*24 {
+			t.Errorf("%s history = %d checkpoints, want %d", id, len(st.History), 7*24)
+		}
+		if st.PagingToken == "" || st.PagingToken != st.History[len(st.History)-1].PagingToken {
+			t.Errorf("%s resume cursor = %q, want the newest position", id, st.PagingToken)
+		}
+	}
+}
+
+// TestStateFileStartCompactionRunsInBackground checks the background
+// compactor: it prunes without any save happening, and stop joins its
+// goroutine.
+func TestStateFileStartCompactionRunsInBackground(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	clock := &steppedClock{now: now}
+	path := filepath.Join(t.TempDir(), "state.json")
+
+	seed, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Save(thirtyDayHistory(now)); err != nil {
+		t.Fatal(err)
+	}
+
+	sf, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{Retention: 7 * 24 * time.Hour, Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := runtime.NumGoroutine()
+	stop := sf.StartCompaction(context.Background(), stream.DefaultStateCompactInterval, func(err error) {
+		t.Errorf("compaction error: %v", err)
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := sf.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(st.History) == 7*24 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background compaction never pruned the history (%d checkpoints)", len(st.History))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stop()
+	stop() // idempotent
+
+	deadline = time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > before {
+		t.Errorf("goroutines after stop = %d, want <= %d", n, before)
+	}
+}
+
+// TestStateFileHistoryRespectsCheckpointInterval checks that saves closer
+// together than the checkpoint interval do not each add a checkpoint.
+func TestStateFileHistoryRespectsCheckpointInterval(t *testing.T) {
+	t.Parallel()
+
+	clock := &steppedClock{now: time.Date(2026, 11, 25, 0, 0, 0, 0, time.UTC)}
+	sf, err := stream.OpenStateFileWithOptions(filepath.Join(t.TempDir(), "s.json"), stream.StateFileOptions{
+		StreamID:           "s",
+		CheckpointInterval: time.Hour,
+		Clock:              clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := clock.Now()
+	for minute := 0; minute < 180; minute += 5 { // three hours, one save every 5 minutes
+		at := start.Add(time.Duration(minute) * time.Minute)
+		if err := sf.Save(stream.State{Source: "events", Ledger: uint32(minute + 1), PagingToken: fmt.Sprint(minute), UpdatedAt: at}); err != nil { //nolint:gosec // test data
+			t.Fatal(err)
+		}
+	}
+	st, err := sf.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.History) != 3 {
+		t.Fatalf("history = %d checkpoints over 3 hours at a 1h interval, want 3: %+v", len(st.History), st.History)
+	}
 }

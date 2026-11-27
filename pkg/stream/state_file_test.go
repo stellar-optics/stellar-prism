@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,7 +84,7 @@ func TestStateFileMissingFileLoadsZeroState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() on a missing file error = %v, want the zero state and no error", err)
 	}
-	if got != (stream.State{}) {
+	if !reflect.DeepEqual(got, stream.State{}) {
 		t.Errorf("Load() = %+v, want the zero state", got)
 	}
 }
@@ -101,7 +105,7 @@ func TestStateFileEmptyFileLoadsZeroState(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load() on %q error = %v, want the zero state and no error", content, err)
 		}
-		if got != (stream.State{}) {
+		if !reflect.DeepEqual(got, stream.State{}) {
 			t.Errorf("Load() = %+v, want the zero state", got)
 		}
 	}
@@ -652,5 +656,325 @@ func TestTailStateLeavesNoGoroutinesAfterCancel(t *testing.T) {
 	}
 	if got := runtime.NumGoroutine(); got > baseline {
 		t.Errorf("goroutines after cancellation = %d, want at most the baseline %d", got, baseline)
+	}
+}
+
+// openShared opens path as the partition streamID of a shared state file.
+func openShared(t *testing.T, path, streamID string) *stream.StateFile {
+	t.Helper()
+	sf, err := stream.OpenStateFileWithOptions(path, stream.StateFileOptions{StreamID: streamID})
+	if err != nil {
+		t.Fatalf("OpenStateFileWithOptions(%q) error = %v", streamID, err)
+	}
+	return sf
+}
+
+// readShared decodes a shared state file.
+func readShared(t *testing.T, path string) map[string]stream.State {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading state file: %v", err)
+	}
+	var doc struct {
+		Version int                     `json:"version"`
+		Streams map[string]stream.State `json:"streams"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("state file is not valid JSON: %v\n%s", err, data)
+	}
+	if doc.Version != stream.PartitionedStateVersion {
+		t.Fatalf("state file version = %d, want %d\n%s", doc.Version, stream.PartitionedStateVersion, data)
+	}
+	return doc.Streams
+}
+
+// TestStateFileStreamsShareOneFile is the core of stream partitioning: two
+// streams with different IDs write one file and each reads back only its own
+// position.
+func TestStateFileStreamsShareOneFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "shared.json")
+	amm := openShared(t, path, "events_amm")
+	txs := openShared(t, path, "transactions_main")
+
+	if err := amm.Save(stream.State{Source: "events", Ledger: 10, PagingToken: "e10"}); err != nil {
+		t.Fatalf("events Save() error = %v", err)
+	}
+	if err := txs.Save(stream.State{Source: "transactions", Ledger: 20, PagingToken: "t20"}); err != nil {
+		t.Fatalf("transactions Save() error = %v", err)
+	}
+	if err := amm.Save(stream.State{Source: "events", Ledger: 11, PagingToken: "e11"}); err != nil {
+		t.Fatalf("second events Save() error = %v", err)
+	}
+
+	gotAMM, err := amm.Load()
+	if err != nil {
+		t.Fatalf("events Load() error = %v", err)
+	}
+	if gotAMM.Source != "events" || gotAMM.Ledger != 11 || gotAMM.PagingToken != "e11" {
+		t.Errorf("events state = %+v, want ledger 11 / e11", gotAMM)
+	}
+	gotTxs, err := txs.Load()
+	if err != nil {
+		t.Fatalf("transactions Load() error = %v", err)
+	}
+	if gotTxs.Source != "transactions" || gotTxs.Ledger != 20 || gotTxs.PagingToken != "t20" {
+		t.Errorf("transactions state = %+v, want ledger 20 / t20; another stream's save overwrote it", gotTxs)
+	}
+
+	streams := readShared(t, path)
+	if len(streams) != 2 {
+		t.Errorf("file holds %d streams, want 2: %v", len(streams), streams)
+	}
+	ids, err := amm.StreamIDs()
+	if err != nil {
+		t.Fatalf("StreamIDs() error = %v", err)
+	}
+	if !reflect.DeepEqual(ids, []string{"events_amm", "transactions_main"}) {
+		t.Errorf("StreamIDs() = %v", ids)
+	}
+
+	// A third stream that has never saved starts from nothing.
+	fresh := openShared(t, path, "ledgers")
+	got, err := fresh.Load()
+	if err != nil {
+		t.Fatalf("fresh Load() error = %v", err)
+	}
+	if got.Source != "" || got.PagingToken != "" {
+		t.Errorf("unsaved stream loaded %+v, want the zero State", got)
+	}
+}
+
+// stateHelperEnv turns the test binary into a writer for
+// TestStateFileSharedAcrossProcesses: "<path>|<stream id>|<saves>".
+const stateHelperEnv = "PRISM_STATE_HELPER"
+
+// TestStateHelperWriter is not a test of its own. Re-executed with
+// stateHelperEnv set, the binary saves its stream's position as fast as it
+// can, one ledger at a time, then exits.
+func TestStateHelperWriter(t *testing.T) {
+	spec := os.Getenv(stateHelperEnv)
+	if spec == "" {
+		t.Skip("helper process only")
+	}
+	parts := strings.Split(spec, "|")
+	if len(parts) != 3 {
+		t.Fatalf("bad helper spec %q", spec)
+	}
+	var saves int
+	if _, err := fmt.Sscan(parts[2], &saves); err != nil {
+		t.Fatal(err)
+	}
+	sf, err := stream.OpenStateFileWithOptions(parts[0], stream.StateFileOptions{StreamID: parts[1]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= saves; i++ {
+		if err := sf.Save(stream.State{Source: "events", Ledger: uint32(i), PagingToken: fmt.Sprintf("%s-%d", parts[1], i)}); err != nil { //nolint:gosec // test data
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestStateFileSharedAcrossProcesses runs several prism-like processes that
+// hammer one shared state file at the same time, each with its own stream ID.
+// Every read-modify-write is serialised by the cross-process lock, so when
+// they finish every stream holds its own final position: no process's rename
+// discarded another's update.
+func TestStateFileSharedAcrossProcesses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns subprocesses")
+	}
+	path := filepath.Join(t.TempDir(), "shared.json")
+	const writers, saves = 4, 150
+
+	cmds := make([]*exec.Cmd, writers)
+	for i := range cmds {
+		id := fmt.Sprintf("stream-%d", i)
+		cmd := exec.Command(os.Args[0], "-test.run=^TestStateHelperWriter$", "-test.count=1")
+		cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%s|%s|%d", stateHelperEnv, path, id, saves))
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		cmds[i] = cmd
+	}
+	for i, cmd := range cmds {
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("writer %d failed: %v", i, err)
+		}
+	}
+
+	streams := readShared(t, path)
+	if len(streams) != writers {
+		t.Fatalf("file holds %d streams, want %d: a concurrent save dropped a stream", len(streams), writers)
+	}
+	for i := range writers {
+		id := fmt.Sprintf("stream-%d", i)
+		st := streams[id]
+		if st.Ledger != saves || st.PagingToken != fmt.Sprintf("%s-%d", id, saves) {
+			t.Errorf("%s = ledger %d / %q, want its final position %d", id, st.Ledger, st.PagingToken, saves)
+		}
+	}
+	if _, err := os.Stat(path + ".lock"); err != nil {
+		t.Errorf("shared state file has no lock file beside it: %v", err)
+	}
+}
+
+// TestStateFileSharedConcurrentGoroutines is the in-process counterpart: many
+// StateFile values over one path, saving concurrently.
+func TestStateFileSharedConcurrentGoroutines(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "shared.json")
+	const writers, saves = 8, 40
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := range writers {
+		sf := openShared(t, path, fmt.Sprintf("s%d", i))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 1; n <= saves; n++ {
+				if err := sf.Save(stream.State{Source: "ledgers", Ledger: uint32(n)}); err != nil { //nolint:gosec // test data
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("Save() error = %v", err)
+	}
+	streams := readShared(t, path)
+	for i := range writers {
+		if got := streams[fmt.Sprintf("s%d", i)].Ledger; got != saves {
+			t.Errorf("s%d ledger = %d, want %d", i, got, saves)
+		}
+	}
+}
+
+// TestStateFileSharedUpgradesSingleStreamFile checks the migration path: a
+// stream that starts using a stream ID over an existing single-stream file
+// keeps its position, and the file becomes a shared one.
+func TestStateFileSharedUpgradesSingleStreamFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "cursor.json")
+	legacy, err := stream.OpenStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Save(stream.State{Source: "events", Ledger: 77, PagingToken: "p77", LastID: "p77"}); err != nil {
+		t.Fatal(err)
+	}
+
+	shared := openShared(t, path, "events/abc")
+	got, err := shared.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Ledger != 77 || got.PagingToken != "p77" {
+		t.Fatalf("Load() = %+v, want the single-stream position adopted", got)
+	}
+	if err := shared.Save(stream.State{Source: "events", Ledger: 78, PagingToken: "p78"}); err != nil {
+		t.Fatal(err)
+	}
+	streams := readShared(t, path)
+	if len(streams) != 1 || streams["events/abc"].Ledger != 78 {
+		t.Errorf("upgraded file = %+v, want only events/abc at ledger 78", streams)
+	}
+}
+
+// TestStateFileSharedUpgradeKeepsOtherStreamsPosition checks that upgrading
+// a single-stream file on behalf of a *different* stream keeps the original
+// position under LegacyStreamID instead of dropping it.
+func TestStateFileSharedUpgradeKeepsOtherStreamsPosition(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "cursor.json")
+	legacy, err := stream.OpenStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Save(stream.State{Source: "ledgers", Ledger: 5, PagingToken: "5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := openShared(t, path, "events_amm").Save(stream.State{Source: "events", Ledger: 9, PagingToken: "e9"}); err != nil {
+		t.Fatal(err)
+	}
+	streams := readShared(t, path)
+	if streams[stream.LegacyStreamID].Source != "ledgers" || streams[stream.LegacyStreamID].Ledger != 5 {
+		t.Errorf("legacy position = %+v, want the ledgers stream at 5 under %q", streams[stream.LegacyStreamID], stream.LegacyStreamID)
+	}
+	if streams["events_amm"].Ledger != 9 {
+		t.Errorf("events_amm = %+v, want ledger 9", streams["events_amm"])
+	}
+}
+
+// TestStateFileSingleStreamRefusesSharedFile checks that a reader without a
+// stream ID refuses a shared file instead of misreading it — and that a
+// single-stream writer cannot clobber every partition with its own state.
+func TestStateFileSingleStreamRefusesSharedFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "shared.json")
+	if err := openShared(t, path, "a").Save(stream.State{Source: "events", Ledger: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := stream.OpenStateFile(path)
+	if err == nil || !strings.Contains(err.Error(), "--stream-id") {
+		t.Fatalf("OpenStateFile() error = %v, want a request for --stream-id", err)
+	}
+}
+
+// TestStateFileSharedRewindTouchesOnlyItsStream checks that rewinding one
+// stream of a shared file leaves the others exactly as they were.
+func TestStateFileSharedRewindTouchesOnlyItsStream(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "shared.json")
+	a := openShared(t, path, "a")
+	b := openShared(t, path, "b")
+	if err := a.Save(stream.State{Source: "events", Ledger: 100, PagingToken: "a100", LastID: "a100"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Save(stream.State{Source: "events", Ledger: 200, PagingToken: "b200", LastID: "b200"}); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := a.Rewind(50)
+	if err != nil {
+		t.Fatalf("Rewind() error = %v", err)
+	}
+	if _, err := os.Stat(backup); err != nil {
+		t.Errorf("backup %s missing: %v", backup, err)
+	}
+	streams := readShared(t, path)
+	if got := streams["a"]; got.Ledger != 50 || got.PagingToken != "" || got.LastID != "" {
+		t.Errorf("a after rewind = %+v, want ledger 50 with cleared cursor", got)
+	}
+	if got := streams["b"]; got.Ledger != 200 || got.PagingToken != "b200" {
+		t.Errorf("b after rewinding a = %+v, want it untouched", got)
+	}
+}
+
+func TestValidateStreamID(t *testing.T) {
+	t.Parallel()
+	for _, id := range []string{"events_amm", "events/3fa2c1d09b7e4a55", "tx-main.v2"} {
+		if err := stream.ValidateStreamID(id); err != nil {
+			t.Errorf("ValidateStreamID(%q) = %v, want ok", id, err)
+		}
+	}
+	for _, id := range []string{"", "has space", "tab\tid", "nl\n", strings.Repeat("x", 257)} {
+		if err := stream.ValidateStreamID(id); err == nil {
+			t.Errorf("ValidateStreamID(%q) = nil, want an error", id)
+		}
+	}
+	if _, err := stream.OpenStateFileWithOptions(filepath.Join(t.TempDir(), "s.json"), stream.StateFileOptions{StreamID: "bad id"}); err == nil {
+		t.Error("OpenStateFileWithOptions accepted an invalid stream ID")
 	}
 }

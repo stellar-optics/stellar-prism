@@ -375,10 +375,14 @@ func TestTimescaleBackgroundFailureReachesNextEmit(t *testing.T) {
 		t.Fatalf("Emit() error = %v", err)
 	}
 
+	// A failed COPY keeps the batch buffered and every tick retries it, so by
+	// the time this poll runs the timer may have made several attempts. Wait
+	// for at least one rather than exactly one: on a loaded runner the count
+	// can step past 1 between polls, and "== 1" would then never hold.
 	waitFor(t, "the background flush", func() bool {
 		db.mu.Lock()
 		defer db.mu.Unlock()
-		return db.attempts == 1
+		return db.attempts >= 1
 	})
 
 	if err := s.Emit(eventRecord()); !errors.Is(err, boom) {

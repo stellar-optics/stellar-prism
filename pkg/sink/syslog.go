@@ -143,6 +143,9 @@ type SyslogOptions struct {
 // A record is never split across messages: a collector sees either the whole
 // JSON object or nothing. The JSON payload is the documented NDJSON shape, so
 // a syslog pipeline can parse it exactly like a file or webhook stream.
+//
+// See docs/sinks/file_rotation_and_syslog.md for syslog, journald, and
+// systemd setup examples.
 type Syslog struct {
 	opts     SyslogOptions
 	format   SyslogFormat

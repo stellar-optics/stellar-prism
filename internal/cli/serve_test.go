@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -14,6 +16,78 @@ import (
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
+
+func TestSuperviseServeRestartsAfterPanic(t *testing.T) {
+	var calls int
+	var delays []time.Duration
+	var stderr bytes.Buffer
+	err := superviseServe(context.Background(), 1, &stderr, func() error {
+		calls++
+		if calls == 1 {
+			panic("injected crash")
+		}
+		return nil
+	}, func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("run called %d times, want 2", calls)
+	}
+	if len(delays) != 1 || delays[0] != 5*time.Second {
+		t.Fatalf("restart delays = %v, want [5s]", delays)
+	}
+	if !strings.Contains(stderr.String(), "recovered panic") || !strings.Contains(stderr.String(), "injected crash") {
+		t.Fatalf("restart was not logged: %s", stderr.String())
+	}
+}
+
+func TestSuperviseServeStopsAtMaxRestarts(t *testing.T) {
+	var calls int
+	err := superviseServe(context.Background(), 1, io.Discard, func() error {
+		calls++
+		panic("injected crash")
+	}, func(context.Context, time.Duration) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "restart limit 1 reached") {
+		t.Fatalf("supervisor error = %v, want restart limit error", err)
+	}
+	if calls != 2 {
+		t.Fatalf("run called %d times, want 2", calls)
+	}
+}
+
+func TestSuperviseServeRejectsNegativeMaxRestarts(t *testing.T) {
+	called := false
+	err := superviseServe(context.Background(), -1, io.Discard, func() error {
+		called = true
+		return nil
+	}, func(context.Context, time.Duration) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "--max-restarts must not be negative") {
+		t.Fatalf("supervisor error = %v, want invalid restart limit", err)
+	}
+	if called {
+		t.Fatal("run called with invalid restart limit")
+	}
+}
+
+func TestServeRestartDelayGrowsAndCaps(t *testing.T) {
+	for _, test := range []struct {
+		restarts int
+		want     time.Duration
+	}{
+		{restarts: 1, want: 5 * time.Second},
+		{restarts: 2, want: 10 * time.Second},
+		{restarts: 3, want: 20 * time.Second},
+		{restarts: 10, want: 5 * time.Minute},
+	} {
+		if got := serveRestartDelay(test.restarts); got != test.want {
+			t.Errorf("serveRestartDelay(%d) = %s, want %s", test.restarts, got, test.want)
+		}
+	}
+}
 
 func TestBroadcastCLIFlagsAndServe(t *testing.T) {
 	for _, args := range [][]string{

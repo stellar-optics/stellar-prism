@@ -36,3 +36,41 @@ func TestCSVSinkHeaderEscapingAndTSV(t *testing.T) {
 		t.Errorf("TSV = %q", out.String())
 	}
 }
+
+func TestCSVSinkDefaultColumnsMapEventsAndTransactions(t *testing.T) {
+	var out bytes.Buffer
+	s, err := sink.NewCSVSink(&out, sink.CSVOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := stream.Record{
+		Time:     time.Date(2026, 10, 22, 1, 2, 3, 0, time.UTC),
+		Sequence: 42,
+		Kind:     stream.KindEvent,
+		Event: &stream.Event{
+			ContractID: "C123",
+			TxHash:     "event-tx",
+			TopicXDR:   []string{"topic,one", "topic-two"},
+			ValueXDR:   "event-value",
+		},
+	}
+	if err := s.Emit(event); err != nil {
+		t.Fatal(err)
+	}
+	transaction := stream.Record{
+		Time:        event.Time,
+		Sequence:    43,
+		Kind:        stream.KindTransaction,
+		Transaction: &stream.Transaction{Hash: "transaction-hash"},
+	}
+	if err := s.Emit(transaction); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "timestamp,ledger,tx_hash,contract_id,topics,value\n" +
+		"2026-10-22T01:02:03Z,42,event-tx,C123,\"topic,one,topic-two\",event-value\n" +
+		"2026-10-22T01:02:03Z,43,transaction-hash,,,\n"
+	if got := out.String(); got != want {
+		t.Errorf("CSV = %q, want %q", got, want)
+	}
+}

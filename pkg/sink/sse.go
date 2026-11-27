@@ -13,6 +13,9 @@ import (
 // SSE broadcasts NDJSON records at /events. Replay retains the latest 1024
 // records in memory; an unknown/expired Last-Event-ID receives HTTP 409. Replay
 // does not survive process restarts. Slow clients are disconnected and may replay.
+//
+// See docs/tutorials/web_streaming_sse_websocket.md for browser examples and
+// the supported filtering and resume behavior.
 type SSE struct {
 	hub          *broadcastHub
 	pingInterval time.Duration

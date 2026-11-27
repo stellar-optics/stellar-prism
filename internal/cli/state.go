@@ -62,15 +62,8 @@ func eventsStateKey(contractIDs, topics, eventTypes []string) string {
 		filterPart("type", eventTypes))
 }
 
-// openCursorState prepares the cursor metadata file, if one was requested,
-// and resolves the position a resumed run starts from.
-//
-// It returns nil when no --state-file was given, which every caller reads as
-// "no metadata and no pruning".
-//
-// The file is encrypted when a key was configured: the passphrase or the key
-// management service decides how the checkpoints are sealed, and the key
-// itself never reaches the disk.
+// isJournalState reports whether the flags ask for a journal-style state
+// file: resuming, pruning by age, encryption, a lease, or a .jsonl file.
 func isJournalState(sf *streamFlags) bool {
 	return sf.resume ||
 		sf.pruneMaxAge > 0 ||
@@ -82,6 +75,8 @@ func isJournalState(sf *streamFlags) bool {
 		strings.HasSuffix(sf.stateFile, ".jsonl")
 }
 
+// openRedisState connects to Redis and returns a metadata store backed by
+// it, along with a function that closes the connection.
 var openRedisState = func(ctx context.Context, redisURL, key string, stderr io.Writer) (stream.MetadataStore, func() error, error) {
 	client, err := redisstate.NewRedisClient(redisURL)
 	if err != nil {
@@ -95,9 +90,24 @@ var openRedisState = func(ctx context.Context, redisURL, key string, stderr io.W
 	return store, client.Close, nil
 }
 
+// openCursorState prepares the cursor metadata file, if one was requested,
+// and resolves the position a resumed run starts from.
+//
+// It returns nil when no --state-file was given, which every caller reads as
+// "no metadata and no pruning".
+//
+// The file is encrypted when a key was configured: the passphrase or the key
+// management service decides how the checkpoints are sealed, and the key
+// itself never reaches the disk.
 func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io.Writer) (*cursorState, error) {
 	if sf.stateRedisURL == "" && (sf.stateFile == "" || !isJournalState(sf)) {
 		return nil, nil
+	}
+
+	if sf.state.streamID != "" {
+		// An explicit --stream-id names the stream in the journal too, so
+		// processes sharing one journal keep their checkpoints apart.
+		key = sf.state.streamID
 	}
 
 	var store stream.MetadataStore
@@ -125,7 +135,7 @@ func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io
 			}
 			store = encrypted
 		} else {
-			plain, err := stream.NewFileMetadataStore(sf.stateFile)
+			plain, err := stream.NewSharedFileMetadataStore(sf.stateFile)
 			if err != nil {
 				return nil, err
 			}

@@ -12,6 +12,10 @@ import (
 // GRPCSink is both a stream sink and the generated PrismStream service. Each
 // subscriber has a bounded queue; a slow disconnected client is never allowed
 // to stall the tailer.
+//
+// Client integration (Go and Python examples, filtering, delivery semantics)
+// is documented in docs/integration/grpc_streaming.md; the wire contract is
+// proto/prism.proto.
 type GRPCSink struct {
 	prismpb.UnimplementedPrismStreamServer
 	mu      sync.Mutex

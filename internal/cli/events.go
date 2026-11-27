@@ -38,6 +38,8 @@ type streamFlags struct {
 	heartbeat        time.Duration
 	pageSize         uint
 	retries          int
+	retryBackoff     time.Duration // first retry wait; see backoff
+	retryBackoffMax  time.Duration // retry wait ceiling; see backoff
 	adaptive         bool
 	backfillWorkers  int
 	batch            bool
@@ -47,7 +49,8 @@ type streamFlags struct {
 	maxGapRecoveries int
 	// pgDSN enables durable cursors in PostgreSQL. Empty means off, subject
 	// to the environment default resolved in runStream.
-	pgDSN string
+	pgDSN   string
+	statePG string
 	// pgCursorKey overrides the derived cursor row name.
 	pgCursorKey string
 	// derivedKey is computed by each command from its own query before
@@ -81,8 +84,11 @@ type streamFlags struct {
 	rotateCompress bool
 	rotateKeep     int
 
-	stateFile     string
-	resume        bool
+	stateFile string
+	resume    bool
+	// state selects and bounds this stream's partition of a shared
+	// --state-file; see flags.go.
+	state         stateFlags
 	pruneInterval time.Duration
 	pruneKeep     int
 	pruneMaxAge   time.Duration
@@ -116,6 +122,8 @@ type streamFlags struct {
 	haHeartbeat time.Duration
 	// haTTL is how long the lease stays valid without a renewal.
 	haTTL time.Duration
+	// haStandbyPoll is how often a standby asks for the lease.
+	haStandbyPoll time.Duration
 
 	// healthPort is the port the liveness and readiness probes are served
 	// on. Zero leaves them off.
@@ -143,6 +151,13 @@ type streamFlags struct {
 	topicPatterns []string
 	fanoutDir     string
 
+	// aggregate, aggregateWindow and aggregateEvery are events-only. With
+	// aggregate set, records feed a sliding time window and rolling
+	// throughput is printed in place of each event.
+	aggregate       bool
+	aggregateWindow time.Duration
+	aggregateEvery  time.Duration
+
 	// dedupWindow is the events-only re-poll de-duplicator window. Zero
 	// disables it.
 	dedupWindow int
@@ -159,6 +174,7 @@ type streamFlags struct {
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
+	before := flagNames(cmd)
 	cmd.Flags().BoolVarP(&s.follow, "follow", "f", false,
 		"keep streaming as new ledgers close, like tail -f")
 	cmd.Flags().Uint32Var(&s.from, "from", 0,
@@ -172,7 +188,7 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
 		"emit NDJSON, one record per line")
 	cmd.Flags().StringVar(&s.format, "format", "", "output format: csv or tsv (default is human-readable; --json remains supported)")
-	cmd.Flags().StringVar(&s.csvFields, "csv-fields", "", "comma-separated CSV/TSV columns: id,ledger,time,kind,contract,tx,topic0,value")
+	cmd.Flags().StringVar(&s.csvFields, "csv-fields", "", "comma-separated CSV/TSV columns: timestamp,ledger,tx_hash,contract_id,topics,value")
 	cmd.Flags().BoolVar(&s.tsv, "tsv", false, "write tab-separated output (equivalent to --format tsv)")
 	cmd.Flags().BoolVar(&s.raw, "raw", false,
 		"leave XDR base64-encoded instead of decoding it")
@@ -186,12 +202,19 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	defaultBackoff := stream.DefaultBackoff()
+	cmd.Flags().DurationVar(&s.retryBackoff, "retry-backoff", defaultBackoff.Initial,
+		"wait before the first retry of a failed RPC call; each further retry doubles it, with jitter (0 uses the default)")
+	cmd.Flags().DurationVar(&s.retryBackoffMax, "retry-backoff-max", defaultBackoff.Max,
+		"longest wait between retries of a failed RPC call (0 uses the default)")
 	cmd.Flags().StringVar(&s.pgDSN, "pg-dsn", "",
 		"PostgreSQL DSN for a durable cursor, so a restart resumes where this run stopped (default $"+envPGDSN+"; empty disables persistence)")
+	cmd.Flags().StringVar(&s.statePG, "state-pg", "",
+		"alias for --pg-dsn: PostgreSQL DSN for a durable cursor")
 	cmd.Flags().StringVar(&s.pgCursorKey, "pg-cursor-key", "",
 		"cursor row to save and resume under (default: <command>/<hash of --from and filters, so each distinct stream resumes itself)")
 	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
-		"tune the wait between polls from how many new ledgers close each interval (with --follow)")
+		"schedule each poll for the predicted next ledger close, from a moving average of recent close intervals (with --follow)")
 	cmd.Flags().IntVar(&s.backfillWorkers, "backfill-workers", 1,
 		"fetch historical pages concurrently with this many workers when --from is set (1 means sequential)")
 	cmd.Flags().BoolVar(&s.batch, "batch", false,
@@ -254,6 +277,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how often the leader renews the lease")
 	cmd.Flags().DurationVar(&s.haTTL, "ha-ttl", stream.DefaultHATTL,
 		"how long the lease stays valid without a renewal")
+	cmd.Flags().DurationVar(&s.haStandbyPoll, "ha-standby-poll", stream.DefaultHAStandbyPoll,
+		"how often a standby polls for the lease; bounds failover time after the leader exits")
 	cmd.Flags().IntVar(&s.healthPort, "health-port", 0,
 		"serve /healthz, /readyz and /metrics on this port (0 disables the health server)")
 	cmd.Flags().Uint32Var(&s.maxLag, "max-lag", 0,
@@ -280,6 +305,7 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"AMQP routing key (default: the queue name)")
 	registerFlagCompletion(cmd, "kafka-partition-by", string(sink.PartitionContract), string(sink.PartitionTx), string(sink.PartitionRecord))
 	s.sinks.register(cmd)
+	s.registerStateFlags(cmd, before)
 }
 
 // validate checks the stream options before anything is fetched.
@@ -313,6 +339,13 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
+	}
+	if s.retryBackoff < 0 || s.retryBackoffMax < 0 {
+		return fmt.Errorf("--retry-backoff and --retry-backoff-max must not be negative")
+	}
+	if b := s.backoff(); b.Max < b.Initial && s.retryBackoffMax > 0 {
+		return fmt.Errorf("--retry-backoff-max (%s) must not be less than --retry-backoff (%s)",
+			b.Max, b.Initial)
 	}
 	if _, _, err := s.rewindDistance(); err != nil {
 		return err
@@ -371,7 +404,13 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.statsBar && !s.follow {
 		return fmt.Errorf("--stats-bar requires --follow")
 	}
+	if err := s.validateAggregate(cmd); err != nil {
+		return err
+	}
 	if err := s.validateState(cmd); err != nil {
+		return err
+	}
+	if err := s.validateStateFlags(cmd); err != nil {
 		return err
 	}
 	if err := s.validateRuntime(); err != nil {
@@ -403,6 +442,9 @@ func (s *streamFlags) validateRuntime() error {
 	}
 	if s.haTTL < 0 {
 		return fmt.Errorf("--ha-ttl must not be negative")
+	}
+	if s.haStandbyPoll < 0 {
+		return fmt.Errorf("--ha-standby-poll must not be negative")
 	}
 	if s.haHeartbeat > 0 && s.haTTL > 0 && s.haTTL < 2*s.haHeartbeat {
 		// A lease that expires before the leader could renew it would be
@@ -702,6 +744,24 @@ func closeSink(s stream.Sink) {
 }
 
 // options builds the tailer options implied by the flags.
+// backoff is the retry schedule for failed RPC calls: --retry-backoff,
+// doubled after each consecutive failure up to --retry-backoff-max, with
+// full jitter so several instances do not retry in lockstep. Unset values
+// leave the zero Backoff, which the tailer replaces with its default.
+func (s *streamFlags) backoff() stream.Backoff {
+	if s.retryBackoff <= 0 && s.retryBackoffMax <= 0 {
+		return stream.Backoff{}
+	}
+	b := stream.DefaultBackoff()
+	if s.retryBackoff > 0 {
+		b.Initial = s.retryBackoff
+	}
+	if s.retryBackoffMax > 0 {
+		b.Max = s.retryBackoffMax
+	}
+	return b
+}
+
 func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, error) {
 	strategy, err := stream.ParseGapStrategy(s.gapStrategy)
 	if err != nil {
@@ -726,6 +786,7 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		Filter:       s.filter,
 		PollInterval: s.poll,
 		MaxRetries:   s.retries,
+		Backoff:      s.backoff(),
 		// DrainTimeout bounds the final flush, so a sink that cannot be
 		// written does not hold the process past the grace period an
 		// orchestrator gives it.
@@ -794,6 +855,7 @@ func newEventsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		filterExpr    string
 		topicRegex    []string
 		contractsFile string
+		watchlistFile string
 	)
 
 	cmd := &cobra.Command{
@@ -811,8 +873,10 @@ last. The semantics are identical to ` + "`stellar events --topic`" + `.
 
 Use --filter-expr for client-side predicates over decoded values and topics,
 or --topic-regex for regular expressions over decoded topic symbols and
-strings. --contracts-file reads a hot-reloaded watchlist; addresses beyond
-the RPC limit of five are queried in coordinated groups.
+strings. --watchlist reads contract IDs from a file and reloads it whenever it
+changes, so contracts can be added or removed without restarting a --follow
+stream; addresses beyond the RPC limit of five are queried in coordinated
+groups.
 
 Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
@@ -837,10 +901,13 @@ start the next run where the last one stopped.`,
   prism events --filter-expr 'value.amount > 1000000000 && topics[0].symbol == "transfer"'
 
   # Match related topic names and hot-reload a larger contract set
-  prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
+  prism events --watchlist /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
 
   # Backfill from a ledger then keep following
   prism events --from 1234567 --follow
+
+  # Rolling throughput over the last minute, printed every 10s
+  prism events --watchlist ./watchlist.txt --follow --aggregate --window 1m
 
   # Resume across restarts with a durable cursor in PostgreSQL
   prism events --contract CBGSB... --follow --pg-dsn "$PRISM_PG_DSN"
@@ -870,31 +937,45 @@ start the next run where the last one stopped.`,
 				}
 				filters = append(filters, compiled)
 			}
-			if len(filters) > 0 {
-				sf.filter = filters
+			watchPath, err := resolveWatchlistFlag(watchlistFile, contractsFile)
+			if err != nil {
+				return err
 			}
-			var watchlist *stream.WatchlistManager
-			var cancelWatch context.CancelFunc
-			if contractsFile != "" {
+			var watchlist *stream.WatchlistFilter
+			if watchPath != "" {
 				if len(contractIDs) != 0 {
-					return fmt.Errorf("--contract cannot be combined with --contracts-file")
+					return fmt.Errorf("--contract cannot be combined with --watchlist")
 				}
-				var err error
-				watchlist, err = stream.NewWatchlistManager(contractsFile)
+				watchlist, err = stream.NewWatchlistFilter(watchPath)
 				if err != nil {
 					return err
 				}
-				watchCtx, cancel := context.WithCancel(cmd.Context())
-				cancelWatch = cancel
+				watchlist.OnChange(func(change stream.WatchlistChange) {
+					if !sf.quiet {
+						logWatchlistChange(stderr, watchPath, change)
+					}
+				})
+				watchCtx, cancelWatch := context.WithCancel(cmd.Context())
 				defer cancelWatch()
 				if err := watchlist.Start(watchCtx); err != nil {
 					return err
 				}
 				go func() {
 					for err := range watchlist.Errors() {
-						fmt.Fprintf(stderr, "prism: %v\n", err)
+						fmt.Fprintf(stderr, "prism: %v; keeping the previous watchlist\n", err)
 					}
 				}()
+				if !sf.quiet {
+					fmt.Fprintf(stderr, "prism: watching %d contracts from %s (hot-reload enabled)\n", watchlist.Len(), watchPath)
+				}
+				// The RPC filter already narrows each request to the active
+				// set; the client-side filter additionally drops records from
+				// a contract removed after its page was fetched, so a removal
+				// takes effect on the very next record.
+				filters = append(filters, watchlist)
+			}
+			if len(filters) > 0 {
+				sf.filter = filters
 			}
 
 			client, closeClient, err := openClient(g, stderr)
@@ -962,7 +1043,9 @@ start the next run where the last one stopped.`,
 		"event type to include: contract, system or diagnostic (default: all)")
 	cmd.Flags().StringVar(&filterExpr, "filter-expr", "", "client-side boolean expression evaluated against decoded event payloads")
 	cmd.Flags().StringArrayVar(&topicRegex, "topic-regex", nil, "client-side topic rule as segment-index:regexp; repeatable and all rules must match")
-	cmd.Flags().StringVar(&contractsFile, "contracts-file", "", "read and hot-reload contract IDs from this file (one per line)")
+	cmd.Flags().StringVar(&watchlistFile, "watchlist", "",
+		"read contract IDs from this file (one per line, # comments allowed) and hot-reload it while streaming; lifts the 5-contract limit")
+	cmd.Flags().StringVar(&contractsFile, "contracts-file", "", "alias for --watchlist")
 	// StringArray, not StringSlice: a comma separates segment *patterns*
 	// within one filter, which StringSlice's comma-splitting would destroy.
 	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
@@ -971,10 +1054,16 @@ start the next run where the last one stopped.`,
 		"topic to exclude: base64 ScVal or symbol string (e.g., 'transfer'); repeatable")
 	cmd.Flags().StringSliceVar(&sf.excludeContracts, "exclude-contract", nil,
 		"contract ID to exclude; repeatable")
+	cmd.Flags().BoolVar(&sf.aggregate, "aggregate", false,
+		"print rolling throughput (event count, events/sec, unique senders) over a sliding --window instead of each event")
+	cmd.Flags().DurationVar(&sf.aggregateWindow, "window", time.Minute,
+		"sliding window length for --aggregate (e.g. 30s, 1m, 5m)")
+	cmd.Flags().DurationVar(&sf.aggregateEvery, "aggregate-interval", 10*time.Second,
+		"how often --aggregate prints a window summary")
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
-	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", 0,
-		"drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin)")
+	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", stream.DefaultDedupWindow,
+		"drop re-polled duplicate events, remembering this many recent fingerprints (default 10000; 0 disables)")
 	cmd.Flags().Float64Var(&sf.sampleRate, "sample-rate", 0,
 		"fraction of matching events to emit deterministically (0.0 to 1.0; 0 disables)")
 	cmd.Flags().Float64Var(&sf.maxRate, "max-rate", 0,
@@ -1150,18 +1239,26 @@ func runStream(
 		from = target.Ledger
 	}
 
-	out, err := sf.newSink(stdout, stderr, g.color, func(err error) {
-		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
-	}, func(entry sink.DLQEntry) {
-		record := "-"
-		if entry.Record != nil {
-			record = entry.Record.ID
+	var out stream.Sink
+	if sf.aggregate {
+		// Aggregation replaces per-event output with periodic window
+		// summaries; the sink owns the ticker and prints a final summary
+		// when it is closed.
+		out = newWindowAggregateSink(stdout, sf.aggregateWindow, sf.aggregateEvery, sf.asJSON, nil)
+	} else {
+		out, err = sf.newSink(stdout, stderr, g.color, func(err error) {
+			fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
+		}, func(entry sink.DLQEntry) {
+			record := "-"
+			if entry.Record != nil {
+				record = entry.Record.ID
+			}
+			fmt.Fprintf(stderr, "prism: dead-lettered record %s (%s): %s\n",
+				record, entry.Stage, entry.Error)
+		})
+		if err != nil {
+			return err
 		}
-		fmt.Fprintf(stderr, "prism: dead-lettered record %s (%s): %s\n",
-			record, entry.Stage, entry.Error)
-	})
-	if err != nil {
-		return err
 	}
 	if sf.statsBar {
 		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
@@ -1346,6 +1443,9 @@ func runStream(
 	}
 	dsn := sf.pgDSN
 	if dsn == "" {
+		dsn = sf.statePG
+	}
+	if dsn == "" {
 		dsn = os.Getenv(envPGDSN)
 	}
 	store, closeStore, err := openCursorStore(ctx, dsn)
@@ -1374,10 +1474,23 @@ func runStream(
 			}
 		}
 	} else if sf.stateFile != "" {
-		file, err := stream.OpenStateFile(sf.stateFile)
+		streamID := sf.resolveStreamID(cmd, g.network)
+		file, err := stream.OpenStateFileWithOptions(sf.stateFile, stream.StateFileOptions{
+			StreamID:  streamID,
+			Retention: sf.state.retention,
+		})
 		if err != nil {
 			return err
 		}
+		if !sf.quiet && sf.verbosity > 0 {
+			fmt.Fprintf(stderr, "prism: state file %s, stream %s\n", file.Path(), streamID)
+		}
+		// History is pruned during saves, and also on a timer so a stream
+		// that goes quiet still has its old checkpoints compacted.
+		stopCompaction := file.StartCompaction(ctx, stream.DefaultStateCompactInterval, func(err error) {
+			fmt.Fprintf(stderr, "prism: compacting state file history: %v\n", err)
+		})
+		defer stopCompaction()
 		if sf.from != 0 {
 			saved, loadErr := file.Load()
 			if loadErr != nil {
@@ -1418,6 +1531,9 @@ func runStream(
 		controller := stream.NewRewindController()
 		opts.Rewind = controller
 		opts.OnRewind = func(target stream.RewindTarget) {
+			if dedupOut != nil {
+				dedupOut.Reset()
+			}
 			if !sf.quiet {
 				fmt.Fprintf(stderr, "prism: rewound %d ledgers back to ledger %d\n",
 					target.Back, target.Ledger)
@@ -1590,4 +1706,43 @@ func latestLedger(ctx context.Context, client rpc.Client) (uint32, error) {
 		return 0, fmt.Errorf("server did not report a latest ledger; pass --from to choose a start point")
 	}
 	return resp.Sequence, nil
+}
+
+// resolveWatchlistFlag folds --contracts-file, the original spelling, into
+// --watchlist. Naming the same file twice is harmless; naming two different
+// files is ambiguous and rejected rather than silently picking one.
+func resolveWatchlistFlag(watchlist, contractsFile string) (string, error) {
+	switch {
+	case watchlist == "":
+		return contractsFile, nil
+	case contractsFile == "" || contractsFile == watchlist:
+		return watchlist, nil
+	default:
+		return "", fmt.Errorf("--watchlist and --contracts-file name different files; use only --watchlist")
+	}
+}
+
+// watchlistLogLimit caps how many addresses one reload line spells out, so
+// replacing a several-hundred-contract file does not flood stderr.
+const watchlistLogLimit = 10
+
+// logWatchlistChange reports a hot reload on stderr. The stream itself keeps
+// running; this line is the operator's confirmation that the edit landed.
+func logWatchlistChange(w io.Writer, path string, change stream.WatchlistChange) {
+	fmt.Fprintf(w, "prism: watchlist %s reloaded: +%d added, -%d removed, now watching %d contracts\n",
+		path, len(change.Added), len(change.Removed), change.Total)
+	logIDs := func(sign string, ids []string) {
+		for i, id := range ids {
+			if i == watchlistLogLimit {
+				fmt.Fprintf(w, "prism:   %s ... and %d more\n", sign, len(ids)-watchlistLogLimit)
+				return
+			}
+			fmt.Fprintf(w, "prism:   %s %s\n", sign, id)
+		}
+	}
+	logIDs("+", change.Added)
+	logIDs("-", change.Removed)
+	if change.Total == 0 {
+		fmt.Fprintln(w, "prism: watchlist is empty; the stream stays open and resumes when contracts are added")
+	}
 }
