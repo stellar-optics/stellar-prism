@@ -3,6 +3,7 @@ package sink
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -98,7 +99,19 @@ func (h *Human) emitRecord(r stream.Record) error {
 			return fmt.Errorf("human: fee stats record %s has no payload", r.ID)
 		}
 		f := r.FeeStats
-		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  base fee %d stroops  base reserve %d stroops  fee pool %d  coins %d  avg fee 10/50 %.2f/%.2f  tx %d  Soroban resource/bid %d/%d\n", formatTime(r.Time), r.Sequence, f.BaseFee, f.BaseReserve, f.FeePool, f.CoinsInCirculation, f.AverageFee10, f.AverageFee50, f.Transactions, f.SorobanResourceFee, f.SorobanFeeBid); err != nil {
+		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  base fee %d stroops  base reserve %d stroops  fee pool %d  coins %d  avg fee 10/50 %.2f/%.2f  tx %d  Soroban resource/bid %d/%d", formatTime(r.Time), r.Sequence, f.BaseFee, f.BaseReserve, f.FeePool, f.CoinsInCirculation, f.AverageFee10, f.AverageFee50, f.Transactions, f.SorobanResourceFee, f.SorobanFeeBid); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		if d := f.InclusionFeeCharged; d != nil {
+			if _, err := fmt.Fprintf(h.w, "  inclusion fee/op min/mode/p10/p50/p95 %d/%d/%d/%d/%d", d.Min, d.Mode, d.P10, d.P50, d.P95); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		surge := "no"
+		if f.SurgePricing {
+			surge = "yes (" + f.SurgeReason + ")"
+		}
+		if _, err := fmt.Fprintf(h.w, "  capacity %.0f%%  surge %s\n", f.CapacityUsage*100, surge); err != nil {
 			return fmt.Errorf("human: write: %w", err)
 		}
 	case stream.KindTrade:
@@ -190,10 +203,59 @@ func (h *Human) emitSimulation(r stream.Record) error {
 	if _, err := h.w.WriteString("\n"); err != nil {
 		return fmt.Errorf("human: write: %w", err)
 	}
-	if h.compact || sim.ReturnValueXDR == "" {
+	if h.compact {
 		return nil
 	}
-	return h.writePayload("return", sim.ReturnValueXDR)
+
+	payloads := []struct {
+		label  string
+		values []string
+	}{
+		{label: "return", values: []string{sim.ReturnValueXDR}},
+		{label: "auth", values: sim.AuthXDR},
+		{label: "diagnostic event", values: sim.EventsXDR},
+		{label: "read-only footprint", values: sim.ReadOnlyFootprint},
+		{label: "read-write footprint", values: sim.ReadWriteFootprint},
+	}
+	for _, payload := range payloads {
+		for i, value := range payload.values {
+			if value == "" {
+				continue
+			}
+			label := payload.label
+			if len(payload.values) > 1 {
+				label = fmt.Sprintf("%s[%d]", label, i)
+			}
+			if err := h.writePayload(label, value); err != nil {
+				return err
+			}
+		}
+	}
+	if sim.ReturnValueXDR == "" && len(sim.ReturnValueJSON) > 0 {
+		if _, err := fmt.Fprintf(h.w, "  return %s\n", sim.ReturnValueJSON); err != nil {
+			return fmt.Errorf("human: write return value: %w", err)
+		}
+	}
+	if len(sim.AuthXDR) == 0 {
+		if err := writeRawJSONPayloads(h.w, "auth", sim.AuthJSON); err != nil {
+			return err
+		}
+	}
+	if len(sim.EventsXDR) == 0 {
+		if err := writeRawJSONPayloads(h.w, "diagnostic event", sim.EventsJSON); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeRawJSONPayloads(w io.Writer, label string, values []json.RawMessage) error {
+	for i, value := range values {
+		if _, err := fmt.Fprintf(w, "  %s[%d] %s\n", label, i, value); err != nil {
+			return fmt.Errorf("human: write %s: %w", label, err)
+		}
+	}
+	return nil
 }
 
 func (h *Human) emitEvent(r stream.Record) error {
@@ -230,6 +292,20 @@ func (h *Human) emitEvent(r stream.Record) error {
 		return fmt.Errorf("human: write: %w", err)
 	}
 	if h.compact {
+		return nil
+	}
+
+	// A spec-decoded event renders its declared field names instead of the
+	// anonymous topic/value tuples; an unresolved spec leaves Typed nil and
+	// the wire shape below is used.
+	if e.Typed != nil {
+		var typed strings.Builder
+		for _, field := range e.Typed.Fields {
+			fmt.Fprintf(&typed, "%s%s%s%s = %s\n", indent, p.Key, field.Name, p.Reset, field.Value)
+		}
+		if _, err := h.w.WriteString(typed.String()); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
 		return nil
 	}
 
@@ -483,6 +559,11 @@ func (h *Human) emitStorageChange(r stream.Record) error {
 
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
+	}
+	if c.StructuralDiff != "" {
+		if _, err := fmt.Fprintf(h.w, "  %sdiff%s\n%s\n", p.Key, p.Reset, strings.TrimRight(c.StructuralDiff, "\n")); err != nil {
+			return fmt.Errorf("human: write diff: %w", err)
+		}
 	}
 	if h.compact {
 		return nil

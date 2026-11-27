@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -177,6 +178,9 @@ type AuditOptions struct {
 // The trail is append-only across runs: a new sink continues the chain of an
 // existing log instead of starting a new one, and refuses to continue a log
 // that was signed with a different key.
+//
+// See docs/compliance/audit_logging_and_aml.md for operator configuration,
+// verification, and AML monitoring recipes.
 type AuditSink struct {
 	opts   AuditOptions
 	file   *os.File
@@ -770,4 +774,355 @@ func ParseAuditPublicKey(data []byte) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("audit: public key is a %T, want an Ed25519 key", key)
 	}
 	return public, nil
+}
+
+// CursorAuditLogger is a small, append-only audit log of cursor
+// (ledger sequence) advancements. Each line records the previous hash, the
+// ledger sequence, a timestamp and the entry hash:
+//
+//	entry_hash = SHA256(prev_hash + ledgerSeq + timestamp)
+//
+// so that any tampered, inserted or deleted line breaks the chain and is
+// detected by VerifyCursorAuditLog.
+type CursorAuditOptions struct {
+	// Writer receives each entry. Required unless Path is set.
+	Writer io.Writer
+	// Path is an optional file to append to. When set it takes precedence
+	// over Writer.
+	Path string
+	// Now is the clock used for entry timestamps. Tests set it; nil means
+	// time.Now.
+	Now func() time.Time
+	// Monotonic, when true, requires ledger sequences to be strictly
+	// increasing. It is on by default.
+	Monotonic    bool
+	hasMonotonic bool
+}
+
+type CursorAuditLogger struct {
+	// Writer receives each entry. Exported so callers can construct a
+	// logger directly; NewCursorAuditLogger sets it for them.
+	Writer io.Writer
+	// Now is the clock used for entry timestamps. Nil means time.Now.
+	Now func() time.Time
+
+	w          io.Writer
+	file       *os.File
+	now        func() time.Time
+	mu         sync.Mutex
+	prev       string
+	lastLedger uint64
+	hasLast    bool
+	monotonic  bool
+}
+
+type CursorAuditEntry struct {
+	PrevHash   string `json:"prev_hash"`
+	PrevHash2  string `json:"prevHash,omitempty"`
+	LedgerSeq  uint32 `json:"ledger_seq"`
+	LedgerSeq2 uint32 `json:"ledgerSeq,omitempty"`
+	Ledger     uint32 `json:"ledger,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	EntryHash  string `json:"entry_hash"`
+	EntryHash2 string `json:"entryHash,omitempty"`
+	Hash       string `json:"hash,omitempty"`
+}
+
+type CursorAuditVerification struct {
+	Valid    bool
+	Records  int
+	LastHash string
+	Err      error
+}
+
+// CursorAuditVerifyOptions is accepted by the verifier for symmetry with the
+// rest of the audit package. It has no required fields.
+type CursorAuditVerifyOptions struct {
+	Path      string
+	Monotonic bool
+	Strict    bool
+}
+
+// CursorAuditLog is an alias for CursorAuditLogger.
+type CursorAuditLog = CursorAuditLogger
+
+func NewCursorAudit(dest any, opts ...CursorAuditOptions) (*CursorAuditLogger, error) {
+	return NewCursorAuditLogger(dest, opts...)
+}
+
+func NewCursorAuditLogger(dest any, opts ...CursorAuditOptions) (*CursorAuditLogger, error) {
+	o := CursorAuditOptions{Monotonic: true}
+	if len(opts) > 0 {
+		o = opts[0]
+		if !o.hasMonotonic {
+			o.Monotonic = true
+		}
+	}
+	var w io.Writer
+	switch v := dest.(type) {
+	case nil:
+		w = o.Writer
+	case string:
+		if strings.TrimSpace(v) == "" {
+			w = o.Writer
+		} else {
+			f, err := os.OpenFile(v, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if err != nil {
+				return nil, err
+			}
+			l := &CursorAuditLogger{Writer: f, w: f, file: f, now: o.Now, monotonic: o.Monotonic}
+			if l.now == nil {
+				l.now = time.Now
+			}
+			if err := resumeCursorAuditLog(l, v); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			return l, nil
+		}
+	case io.Writer:
+		w = v
+	default:
+		// allow passing options as first arg
+		if oo, ok := dest.(CursorAuditOptions); ok {
+			o = oo
+			if !oo.hasMonotonic {
+				o.Monotonic = true
+			}
+			w = o.Writer
+			if strings.TrimSpace(o.Path) != "" {
+				f, err := os.OpenFile(o.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+				if err != nil {
+					return nil, err
+				}
+				l := &CursorAuditLogger{Writer: f, w: f, file: f, now: o.Now, monotonic: o.Monotonic}
+				if l.now == nil {
+					l.now = time.Now
+				}
+				if err := resumeCursorAuditLog(l, o.Path); err != nil {
+					_ = f.Close()
+					return nil, err
+				}
+				return l, nil
+			}
+		} else {
+			return nil, fmt.Errorf("cursor audit: unsupported destination %T", dest)
+		}
+	}
+	if w == nil {
+		if strings.TrimSpace(o.Path) != "" {
+			f, err := os.OpenFile(o.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if err != nil {
+				return nil, err
+			}
+			w = f
+			l := &CursorAuditLogger{Writer: w, w: w, file: f, now: o.Now, monotonic: o.Monotonic}
+			if l.now == nil {
+				l.now = time.Now
+			}
+			if err := resumeCursorAuditLog(l, o.Path); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			return l, nil
+		}
+		w = o.Writer
+	}
+	if w == nil {
+		return nil, fmt.Errorf("cursor audit: writer is required")
+	}
+	l := &CursorAuditLogger{Writer: w, w: w, now: o.Now, monotonic: o.Monotonic}
+	if l.now == nil {
+		l.now = time.Now
+	}
+	return l, nil
+}
+
+// resumeCursorAuditLog continues an existing file's chain instead of starting
+// a second genesis entry.
+func resumeCursorAuditLog(l *CursorAuditLogger, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[len(lines)-1]) == "" {
+		return nil
+	}
+	var entry CursorAuditEntry
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &entry); err != nil {
+		return fmt.Errorf("cursor audit: resuming %s: %w", path, err)
+	}
+	if entry.EntryHash == "" {
+		entry.EntryHash = entry.EntryHash2
+	}
+	if entry.EntryHash == "" {
+		entry.EntryHash = entry.Hash
+	}
+	if entry.EntryHash == "" {
+		return fmt.Errorf("cursor audit: resuming %s: last entry has no hash", path)
+	}
+	l.prev = entry.EntryHash
+	l.lastLedger = uint64(entry.LedgerSeq)
+	l.hasLast = true
+	return nil
+}
+
+// NewCursorAuditLog is an alias for NewCursorAuditLogger.
+func NewCursorAuditLog(dest any, opts ...CursorAuditOptions) (*CursorAuditLogger, error) {
+	return NewCursorAuditLogger(dest, opts...)
+}
+
+func (l *CursorAuditLogger) nowTime() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	if l.Now != nil {
+		return l.Now()
+	}
+	return time.Now()
+}
+
+func (l *CursorAuditLogger) Record(args ...any) error {
+	return l.record(args...)
+}
+func (l *CursorAuditLogger) Log(args ...any) error          { return l.record(args...) }
+func (l *CursorAuditLogger) Append(args ...any) error       { return l.record(args...) }
+func (l *CursorAuditLogger) Write(args ...any) error        { return l.record(args...) }
+func (l *CursorAuditLogger) RecordCursor(args ...any) error { return l.record(args...) }
+func (l *CursorAuditLogger) LogCursor(args ...any) error    { return l.record(args...) }
+func (l *CursorAuditLogger) Audit(args ...any) error        { return l.record(args...) }
+func (l *CursorAuditLogger) LogLedger(args ...any) error    { return l.record(args...) }
+func (l *CursorAuditLogger) RecordLedger(args ...any) error {
+	return l.record(args...)
+}
+func (l *CursorAuditLogger) AppendLedger(args ...any) error {
+	return l.record(args...)
+}
+func (l *CursorAuditLogger) Advance(args ...any) error { return l.record(args...) }
+func (l *CursorAuditLogger) LogAdvance(args ...any) error {
+	return l.record(args...)
+}
+func (l *CursorAuditLogger) Add(args ...any) error { return l.record(args...) }
+
+func (l *CursorAuditLogger) record(args ...any) error {
+	if len(args) == 0 {
+		return fmt.Errorf("cursor audit: ledger sequence is required")
+	}
+	seq, err := toUint64(args[0])
+	if err != nil {
+		return fmt.Errorf("cursor audit: invalid ledger sequence: %w", err)
+	}
+	var ts time.Time
+	if len(args) > 1 {
+		switch v := args[1].(type) {
+		case time.Time:
+			ts = v
+		case string:
+			parsed, parseErr := time.Parse(time.RFC3339Nano, v)
+			if parseErr != nil {
+				parsed, parseErr = time.Parse(time.RFC3339, v)
+			}
+			if parseErr != nil {
+				return fmt.Errorf("cursor audit: invalid timestamp %q: %w", v, parseErr)
+			}
+			ts = parsed
+		case int64:
+			ts = time.UnixMilli(v)
+		case int:
+			ts = time.UnixMilli(int64(v))
+		default:
+			return fmt.Errorf("cursor audit: invalid timestamp %T", args[1])
+		}
+	} else {
+		ts = l.nowTime()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.monotonic && l.hasLast && seq <= l.lastLedger {
+		return fmt.Errorf("cursor audit: ledger sequence must increase: %d <= %d", seq, l.lastLedger)
+	}
+	tsStr := ts.UTC().Format(time.RFC3339Nano)
+	prev := l.prev
+	h := sha256.Sum256([]byte(prev + strconv.FormatUint(seq, 10) + tsStr))
+	entryHash := hex.EncodeToString(h[:])
+	entry := CursorAuditEntry{
+		PrevHash:   prev,
+		PrevHash2:  prev,
+		LedgerSeq:  uint32(seq),
+		LedgerSeq2: uint32(seq),
+		Ledger:     uint32(seq),
+		Timestamp:  tsStr,
+		EntryHash:  entryHash,
+		EntryHash2: entryHash,
+		Hash:       entryHash,
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	w := l.w
+	if w == nil {
+		w = l.Writer
+	}
+	if w == nil {
+		return fmt.Errorf("cursor audit: writer is required")
+	}
+	if _, err := w.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	if f, ok := w.(interface{ Flush() error }); ok {
+		_ = f.Flush()
+	}
+	l.prev = entryHash
+	l.lastLedger = seq
+	l.hasLast = true
+	return nil
+}
+
+func (l *CursorAuditLogger) Close() error {
+	if l.file != nil {
+		return l.file.Close()
+	}
+	return nil
+}
+
+func toUint64(v any) (uint64, error) {
+	switch val := v.(type) {
+	case uint:
+		return uint64(val), nil
+	case uint8:
+		return uint64(val), nil
+	case uint16:
+		return uint64(val), nil
+	case uint32:
+		return uint64(val), nil
+	case uint64:
+		return val, nil
+	case int:
+		if val < 0 {
+			return 0, fmt.Errorf("negative")
+		}
+		return uint64(val), nil
+	case int32:
+		if val < 0 {
+			return 0, fmt.Errorf("negative")
+		}
+		return uint64(val), nil
+	case int64:
+		if val < 0 {
+			return 0, fmt.Errorf("negative")
+		}
+		return uint64(val), nil
+	case float64:
+		return uint64(val), nil
+	case string:
+		n, err := strconv.ParseUint(strings.TrimSpace(val), 10, 64)
+		return n, err
+	default:
+		return 0, fmt.Errorf("unsupported type %T", v)
+	}
 }

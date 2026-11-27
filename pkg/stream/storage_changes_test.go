@@ -239,6 +239,52 @@ func TestStorageChangeSourceExtractsContractEntries(t *testing.T) {
 	}
 }
 
+func TestContractStateDiffSourceRendersUpdatedEntryPaths(t *testing.T) {
+	t.Parallel()
+
+	addr := testContractAddress(3)
+	before := testContractDataEntry(addr, 1)
+	after := testContractDataEntry(addr, 1)
+	after.Data.ContractData.Val = testU32(999)
+	meta := xdr.TransactionMeta{
+		V: 4,
+		V4: &xdr.TransactionMetaV4{
+			TxChangesBefore: xdr.LedgerEntryChanges{stateChange(t, before)},
+			Operations: []xdr.OperationMetaV2{{
+				Changes: xdr.LedgerEntryChanges{updatedChange(t, after)},
+			}},
+		},
+	}
+	contractID, err := addr.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := fakerpc.NewTransactionServer([]protocol.TransactionInfo{
+		testTransaction(123, 0, "diff-test", encodeMeta(t, meta)),
+	})
+	src, err := stream.NewContractStateDiffSource(srv, stream.StorageChangeQuery{
+		StartLedger: 123,
+		ContractIDs: []string{contractID},
+	})
+	if err != nil {
+		t.Fatalf("NewContractStateDiffSource() error = %v", err)
+	}
+	batch, err := src.Fetch(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if len(batch.Records) != 1 {
+		t.Fatalf("got %d diff records, want 1", len(batch.Records))
+	}
+	change := batch.Records[0].StorageChange
+	if change == nil || change.PreviousEntryXDR == "" {
+		t.Fatalf("diff record = %+v, want the prior entry state", batch.Records[0])
+	}
+	if change.StructuralDiff == "" || !strings.Contains(change.StructuralDiff, "Val") {
+		t.Fatalf("structural diff = %q, want a path-level value change", change.StructuralDiff)
+	}
+}
+
 func TestStorageChangeSourceFilters(t *testing.T) {
 	t.Parallel()
 
@@ -466,5 +512,85 @@ func TestStorageChangeSourceName(t *testing.T) {
 	}
 	if got := src.Name(); got != "storage_changes" {
 		t.Errorf("Name() = %q, want %q", got, "storage_changes")
+	}
+}
+
+func TestStorageChangeSourceFiltersByStorageKey(t *testing.T) {
+	t.Parallel()
+
+	addr := testContractAddress(3)
+	meta := encodeMeta(t, testMeta(t, addr))
+	encodeKey := func(v xdr.ScVal) string {
+		t.Helper()
+		s, err := xdr.MarshalBase64(v)
+		if err != nil {
+			t.Fatalf("MarshalBase64() error = %v", err)
+		}
+		return s
+	}
+
+	tests := []struct {
+		name string
+		keys []string
+		want []uint32
+	}{
+		{name: "created key", keys: []string{encodeKey(testU32(2))}, want: []uint32{2}},
+		{name: "updated key", keys: []string{encodeKey(testU32(3))}, want: []uint32{3}},
+		{name: "both keys", keys: []string{encodeKey(testU32(2)), encodeKey(testU32(3))}, want: []uint32{2, 3}},
+		// Key 1 only appears as a state change, which is never a mutation.
+		{name: "state-only key", keys: []string{encodeKey(testU32(1))}, want: nil},
+		{name: "instance key", keys: []string{"AAAAFA=="}, want: nil},
+		{name: "surrounding space", keys: []string{"  " + encodeKey(testU32(2)) + " "}, want: []uint32{2}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fakerpc.NewTransactionServer([]protocol.TransactionInfo{
+				testTransaction(200, 1, "abc", meta),
+			})
+			src, err := stream.NewStorageChangeSource(srv, stream.StorageChangeQuery{Keys: tc.keys})
+			if err != nil {
+				t.Fatalf("NewStorageChangeSource() error = %v", err)
+			}
+			records := fetchStorage(t, src)
+			if len(records) != len(tc.want) {
+				t.Fatalf("got %d records, want %d", len(records), len(tc.want))
+			}
+			for i, record := range records {
+				c := record.StorageChange
+				if c == nil || c.EntryType != stream.StorageEntryContractData {
+					t.Fatalf("record %d is not a contract data change: %+v", i, c)
+				}
+				var entry xdr.LedgerEntry
+				if err := xdr.SafeUnmarshalBase64(c.EntryXDR, &entry); err != nil {
+					t.Fatalf("decoding entry: %v", err)
+				}
+				if got := uint32(*entry.Data.ContractData.Key.U32); got != tc.want[i] {
+					t.Errorf("record %d key = %d, want %d", i, got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestStorageChangeSourceInstanceKeyConstant(t *testing.T) {
+	t.Parallel()
+
+	got, err := xdr.MarshalBase64(xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance})
+	if err != nil {
+		t.Fatalf("MarshalBase64() error = %v", err)
+	}
+	if got != "AAAAFA==" {
+		t.Fatalf("instance key = %q, want AAAAFA== (documented in the storage guide)", got)
+	}
+}
+
+func TestStorageChangeSourceRejectsMalformedKey(t *testing.T) {
+	t.Parallel()
+
+	srv := fakerpc.NewTransactionServer(nil)
+	_, err := stream.NewStorageChangeSource(srv, stream.StorageChangeQuery{Keys: []string{"not-xdr"}})
+	if err == nil || !strings.Contains(err.Error(), "--key") {
+		t.Fatalf("NewStorageChangeSource() error = %v, want a --key error", err)
 	}
 }

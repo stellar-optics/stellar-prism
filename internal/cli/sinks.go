@@ -33,47 +33,62 @@ const (
 // commands. Every one is off unless its flag is set, so default behaviour is
 // unchanged and no network is touched.
 type sinkFlags struct {
-	webhookURL       string
-	webhookSecret    string
-	webhookBatch     int
-	webhookTimeout   time.Duration
-	webhookMaxRetry  int
-	cloudURL         string
-	cloudProvider    string
-	cloudBucket      string
-	cloudPrefix      string
-	cloudRegion      string
-	cloudRecords     int
-	cloudBytes       int
-	cloudTimeout     time.Duration
-	cloudCompress    bool
-	metricsAddr      string
-	syslogAddress    string
-	syslogFormat     string
-	syslogFacility   string
-	syslogAppName    string
-	esURL            string
-	esIndex          string
-	esUsername       string
-	esPassword       string
-	esAPIKey         string
-	esBatchSize      int
-	esFlushInterval  time.Duration
-	natsURL          string
-	natsSubject      string
-	natsJetStream    bool
-	zmqEndpoint      string
-	zmqTopic         string
-	auditFile        string
-	auditKeyFile     string
-	auditCheckpoint  int
-	parquetDir       string
-	sqsQueue         string
-	snsTopic         string
-	awsRegion        string
-	pubsubTopic      string
-	metrics          *sink.Prometheus
-	constructedSinks []io.Closer
+	webhookURL          string
+	webhookSecret       string
+	webhookBatch        int
+	webhookTimeout      time.Duration
+	webhookMaxRetry     int
+	cloudURL            string
+	cloudProvider       string
+	cloudBucket         string
+	cloudPrefix         string
+	cloudRegion         string
+	cloudRecords        int
+	cloudBytes          int
+	cloudTimeout        time.Duration
+	cloudCompress       bool
+	metricsAddr         string
+	syslogAddress       string
+	syslogFormat        string
+	syslogFacility      string
+	syslogAppName       string
+	esURL               string
+	esIndex             string
+	esUsername          string
+	esPassword          string
+	esAPIKey            string
+	esBatchSize         int
+	esFlushInterval     time.Duration
+	natsURL             string
+	natsSubject         string
+	natsJetStream       bool
+	zmqEndpoint         string
+	zmqTopic            string
+	auditFile           string
+	auditKeyFile        string
+	auditCheckpoint     int
+	parquetDir          string
+	parquetCodec        string
+	parquetRowGroupSize int64
+	parquetMaxSizeMB    int64
+	amqpURL             string
+	amqpQueue           string
+	amqpExchange        string
+	fanoutAsync         bool
+	fanoutBuffer        int
+	fanoutOverflow      string
+	fanoutDLQPath       string
+	clickhouseAddr      string
+	clickhouseDB        string
+	clickhouseUser      string
+	clickhousePassword  string
+	clickhouseBatchSize int
+	sqsQueue            string
+	snsTopic            string
+	awsRegion           string
+	pubsubTopic         string
+	metrics             *sink.Prometheus
+	constructedSinks    []io.Closer
 }
 
 func (s *sinkFlags) register(cmd *cobra.Command) {
@@ -114,6 +129,8 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 
 	flags.StringVar(&s.syslogAddress, "syslog-address", "",
 		"send records to a syslog socket, e.g. unixgram:///dev/log or udp://host:514")
+	flags.StringVar(&s.syslogAddress, "sink-syslog", "",
+		"alias for --syslog-address")
 	flags.StringVar(&s.syslogFormat, "syslog-format", string(sink.SyslogRFC5424),
 		`syslog message format: "rfc5424" or "journald"`)
 	flags.StringVar(&s.syslogFacility, "syslog-facility", "local0",
@@ -128,7 +145,8 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.IntVar(&s.esBatchSize, "sink-es-batch-size", 100, "records per Elasticsearch bulk request")
 	flags.DurationVar(&s.esFlushInterval, "sink-es-flush-interval", time.Second, "flush a partial Elasticsearch bulk request after this interval")
 	flags.StringVar(&s.natsURL, "sink-nats", "", "NATS server URL")
-	flags.StringVar(&s.natsSubject, "nats-subject", "stellar.events.{{.ContractID}}", "NATS subject template using .ContractID, .Topic0, .ID or .Ledger")
+	flags.StringVar(&s.natsURL, "sink-nats-url", "", "alias for --sink-nats")
+	flags.StringVar(&s.natsSubject, "nats-subject", "stellar.events.{{.ContractID}}.{{.Topic0}}", "NATS subject template using .ContractID, .Topic0, .ID or .Ledger")
 	flags.BoolVar(&s.natsJetStream, "nats-jetstream", false, "wait for JetStream publish acknowledgements")
 	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "ZeroMQ PUB endpoint")
 	flags.StringVar(&s.zmqTopic, "zmq-topic", "stellar.events.{{.ContractID}}", "ZeroMQ topic template using .ContractID, .Topic0, .ID or .Ledger")
@@ -139,12 +157,37 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.IntVar(&s.auditCheckpoint, "sink-audit-checkpoint", sink.DefaultAuditCheckpointRecords,
 		"write a signed audit checkpoint every this many records (0 writes one after every record)")
 	flags.StringVar(&s.parquetDir, "sink-parquet-dir", "", "write partitioned Parquet files under this directory")
+	flags.StringVar(&s.parquetDir, "parquet-dir", "", "alias for --sink-parquet-dir")
+	flags.StringVar(&s.parquetCodec, "parquet-codec", "snappy", "Parquet compression codec: snappy, zstd, gzip, or uncompressed")
+	flags.Int64Var(&s.parquetRowGroupSize, "parquet-row-group-size", 128*1024*1024, "Parquet row group size in bytes (default: 128MB)")
+	flags.Int64Var(&s.parquetMaxSizeMB, "parquet-max-mb", 0,
+		"rotate a Parquet part file once its staged rows reach this many megabytes (0 bounds parts by row count only)")
+	flags.StringVar(&s.amqpURL, "sink-amqp-url", "",
+		"publish records to RabbitMQ at this AMQP 0-9-1 URL, in addition to the other outputs")
+	flags.StringVar(&s.amqpQueue, "sink-amqp-queue", "stellar.events",
+		"durable AMQP queue to declare and bind to the exchange")
+	flags.StringVar(&s.amqpExchange, "sink-amqp-exchange", "stellar.events",
+		"topic exchange to declare; routing keys are contract.<contract_id>.<event_type>")
+	flags.BoolVar(&s.fanoutAsync, "sink-fanout-async", false,
+		"give each extra sink its own buffered worker, so a slow destination cannot block the fast ones")
+	flags.IntVar(&s.fanoutBuffer, "sink-fanout-buffer", sink.DefaultAsyncFanoutBuffer,
+		"per-sink buffer for --sink-fanout-async")
+	flags.StringVar(&s.fanoutOverflow, "sink-fanout-overflow", string(sink.OverflowBlock),
+		`what --sink-fanout-async does when a sink buffer is full: "block", "drop" or "dlq"`)
+	flags.StringVar(&s.fanoutDLQPath, "sink-fanout-dlq", "",
+		"NDJSON file that receives overflowed records when --sink-fanout-overflow=dlq")
+	flags.StringVar(&s.clickhouseAddr, "clickhouse-addr", "", "ClickHouse native TCP endpoint (host:port, default port 9000)")
+	flags.StringVar(&s.clickhouseDB, "clickhouse-db", "default", "ClickHouse database name")
+	flags.StringVar(&s.clickhouseUser, "clickhouse-user", "default", "ClickHouse user")
+	flags.StringVar(&s.clickhousePassword, "clickhouse-password", "", "ClickHouse password")
+	flags.IntVar(&s.clickhouseBatchSize, "clickhouse-batch-size", 5000, "ClickHouse bulk insert batch size")
 	flags.StringVar(&s.sqsQueue, "sink-sqs-queue", "", "AWS SQS queue URL")
 	flags.StringVar(&s.snsTopic, "sink-sns-topic", "", "AWS SNS topic ARN")
 	flags.StringVar(&s.awsRegion, "sink-region", "", "AWS region (uses SDK defaults when empty)")
 	flags.StringVar(&s.pubsubTopic, "sink-pubsub-topic", "", "Google Pub/Sub topic as projects/PROJECT/topics/TOPIC")
 
 	registerFlagCompletion(cmd, "cloud-provider", "s3", "gcs")
+	registerFlagCompletion(cmd, "parquet-codec", "snappy", "zstd", "gzip", "uncompressed")
 	registerFlagCompletion(cmd, "syslog-format", string(sink.SyslogRFC5424), string(sink.SyslogJournald))
 	registerFlagCompletion(cmd, "syslog-facility",
 		"local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7",
@@ -217,6 +260,46 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.parquetDir != "" && strings.TrimSpace(s.parquetDir) == "" {
 		return fmt.Errorf("--sink-parquet-dir must not be blank")
+	}
+	if s.parquetCodec != "" {
+		c := strings.ToLower(s.parquetCodec)
+		if c != "snappy" && c != "zstd" && c != "gzip" && c != "uncompressed" {
+			return fmt.Errorf("invalid --parquet-codec %q: want snappy, zstd, gzip, or uncompressed", s.parquetCodec)
+		}
+	}
+	if s.parquetRowGroupSize < 0 {
+		return fmt.Errorf("--parquet-row-group-size must not be negative")
+	}
+	if s.parquetMaxSizeMB < 0 {
+		return fmt.Errorf("--parquet-max-mb must not be negative")
+	}
+	if s.amqpURL != "" {
+		if strings.TrimSpace(s.amqpQueue) == "" {
+			return fmt.Errorf("--sink-amqp-url requires a non-empty --sink-amqp-queue")
+		}
+		if strings.TrimSpace(s.amqpExchange) == "" {
+			return fmt.Errorf("--sink-amqp-url requires a non-empty --sink-amqp-exchange")
+		}
+	}
+	if s.fanoutAsync && s.fanoutBuffer <= 0 {
+		return fmt.Errorf("--sink-fanout-buffer must be greater than zero")
+	}
+	overflow := sink.OverflowPolicy(s.fanoutOverflow)
+	if overflow == "" {
+		// The zero value comes from programmatic construction, not the flag
+		// default, and means the same safe backpressure policy.
+		overflow = sink.OverflowBlock
+	}
+	switch overflow {
+	case sink.OverflowBlock, sink.OverflowDrop, sink.OverflowDLQ:
+	default:
+		return fmt.Errorf(`invalid --sink-fanout-overflow %q: want "block", "drop" or "dlq"`, s.fanoutOverflow)
+	}
+	if overflow == sink.OverflowDLQ && s.fanoutDLQPath == "" {
+		return fmt.Errorf("--sink-fanout-overflow=dlq requires --sink-fanout-dlq")
+	}
+	if s.clickhouseAddr != "" && s.clickhouseBatchSize <= 0 {
+		return fmt.Errorf("--clickhouse-batch-size must be greater than zero")
 	}
 	return s.validateAudit(cmd)
 }
@@ -396,12 +479,52 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 		sinks = append(sinks, zmqSink)
 	}
 	if s.parquetDir != "" {
-		parquetSink, parquetErr := sink.NewParquetSink(s.parquetDir)
+		parquetSink, parquetErr := sink.NewParquet(context.Background(), sink.ParquetConfig{
+			Dir:          s.parquetDir,
+			Compression:  s.parquetCodec,
+			RowGroupSize: s.parquetRowGroupSize,
+			MaxFileBytes: s.parquetMaxSizeMB << 20,
+		})
 		if parquetErr != nil {
 			return nil, parquetErr
 		}
 		s.constructedSinks = append(s.constructedSinks, parquetSink)
 		sinks = append(sinks, parquetSink)
+	}
+	if s.amqpURL != "" {
+		publisher, amqpErr := sink.NewAMQPPublisher(s.amqpURL, sink.AMQPOptions{
+			Queue:        s.amqpQueue,
+			Exchange:     s.amqpExchange,
+			ExchangeKind: "topic",
+		})
+		if amqpErr != nil {
+			return nil, amqpErr
+		}
+		amqpSink, amqpErr := sink.NewAMQP(sink.AMQPConfig{
+			Queue:    s.amqpQueue,
+			Exchange: s.amqpExchange,
+			Decode:   decode,
+		}, publisher)
+		if amqpErr != nil {
+			_ = publisher.Close()
+			return nil, amqpErr
+		}
+		s.constructedSinks = append(s.constructedSinks, amqpSink)
+		sinks = append(sinks, amqpSink)
+	}
+	if s.clickhouseAddr != "" {
+		chSink, chErr := sink.NewClickHouse(context.Background(), sink.ClickHouseConfig{
+			Addr:      s.clickhouseAddr,
+			Database:  s.clickhouseDB,
+			User:      s.clickhouseUser,
+			Password:  s.clickhousePassword,
+			BatchSize: s.clickhouseBatchSize,
+		})
+		if chErr != nil {
+			return nil, chErr
+		}
+		s.constructedSinks = append(s.constructedSinks, chSink)
+		sinks = append(sinks, chSink)
 	}
 	if s.sqsQueue != "" || s.snsTopic != "" {
 		loadOpts := []func(*config.LoadOptions) error{}
@@ -448,6 +571,33 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 
 	if len(sinks) == 1 {
 		return base, nil
+	}
+	if s.fanoutAsync {
+		var dlq stream.Sink
+		var dlqFile *os.File
+		if sink.OverflowPolicy(s.fanoutOverflow) == sink.OverflowDLQ {
+			file, openErr := os.OpenFile(s.fanoutDLQPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if openErr != nil {
+				return nil, fmt.Errorf("opening fanout dead letter queue: %w", openErr)
+			}
+			dlqFile = file
+			dlq = sink.NewNDJSON(file, decode)
+		}
+
+		async := sink.NewAsyncFanout(sinks, sink.AsyncFanoutOptions{
+			Buffer:  s.fanoutBuffer,
+			Policy:  sink.OverflowPolicy(s.fanoutOverflow),
+			DLQ:     dlq,
+			OnError: observeError,
+		})
+		// The async sink closes every sink it wraps, so only the dead letter
+		// file it does not own is tracked separately.
+		s.constructedSinks = nil
+		if dlqFile != nil {
+			s.constructedSinks = append(s.constructedSinks, dlqFile)
+		}
+		s.constructedSinks = append(s.constructedSinks, async)
+		return async, nil
 	}
 	return sink.NewMultiSink(sinks, sink.MultiSinkOptions{Policy: sink.MultiSinkAbortAll})
 }

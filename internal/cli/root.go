@@ -7,10 +7,10 @@
 // Flag names deliberately mirror stellar-xdr-lens where the concept is
 // shared (--json, --color), so the two tools feel like one family.
 //
-// Configuration is resolved through Viper: ~/.config/prism/config.yaml,
-// .prism.yaml in the current directory, environment variables prefixed with
-// PRISM_, and then explicit CLI flags. See config.go for the resolution
-// order and the tests for the acceptance criteria.
+// Every flag can also be supplied by a PRISM_<FLAG> environment variable or
+// a config file (<user config dir>/prism/config.yaml, then .prism.yaml in the
+// current directory). Precedence is CLI flag > environment > config file >
+// default; see config_apply.go and docs/cli/config_options.md.
 package cli
 
 import (
@@ -56,20 +56,36 @@ func newClientWithTransport(urls []string, timeout time.Duration, transport http
 }
 
 // client resolves the configured endpoints and builds the client every
-// command shares. When a wire log is requested the logger is installed as the
-// HTTP transport, so it observes the same requests the SDK sends.
+// command shares. When custom headers or a wire log are requested, the
+// corresponding HTTP transports wrap the SDK's transport so every endpoint in a
+// single client or failover pool sees them.
 func client(g *globalFlags, stderr io.Writer) (rpc.Client, func(), error) {
+	headers, err := rpc.ResolveHeaders(g.headers)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	wire, closeWire, err := g.openWireLog(stderr)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	urls := rpc.ResolveURLs(g.rpcURLs)
+	var transport http.RoundTripper
+	if wire != nil {
+		transport = wire
+	}
+	if len(headers) > 0 {
+		// Wrap the wire logger so it records (and redacts) the custom headers
+		// that actually go out on the wire.
+		transport = rpc.NewHeaderTransport(transport, headers)
+	}
+
 	var c rpc.Client
-	if wire == nil {
+	if transport == nil {
 		c, err = newClient(urls, g.timeout)
 	} else {
-		c, err = newClientWithTransport(urls, g.timeout, wire)
+		c, err = newClientWithTransport(urls, g.timeout, transport)
 	}
 	if err != nil {
 		closeWire()
@@ -175,6 +191,9 @@ type globalFlags struct {
 	serveSSE         string
 	serveWS          string
 	serveGRPC        string
+	tlsCert          string
+	tlsKey           string
+	tlsAutoReload    bool
 	network          string
 	skipNetworkCheck bool
 	// color is one of "auto", "always" or "never", matching lens.
@@ -182,6 +201,9 @@ type globalFlags struct {
 	// rpcURLs overrides the endpoints; empty falls back to the environment.
 	// Repeating the flag builds a failover pool.
 	rpcURLs []string
+	// headers specifies custom HTTP headers ("Key: Value") attached to every
+	// outgoing RPC request.
+	headers []string
 	// timeout bounds a single RPC call.
 	timeout time.Duration
 	// wireLog is the debug wire-log destination; empty disables it and "-"
@@ -192,8 +214,8 @@ type globalFlags struct {
 	wireLogMaxBody int64
 
 	// configFile is an explicit path to a prism config file. When empty,
-	// Viper searches ~/.config/prism/config.yaml and then .prism.yaml in the
-	// current directory.
+	// <user config dir>/prism/config.yaml is read and .prism.yaml in the
+	// current directory is merged over it. See applyConfigSources.
 	configFile string
 	// pprofPort enables the runtime profiling server on 127.0.0.1 when it is
 	// greater than zero.
@@ -287,7 +309,15 @@ redacted before anything is written.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Fill unset flags from PRISM_* variables and the config files
+			// first, so everything below validates the resolved values.
+			if err := applyConfigSources(cmd, defaultConfigSources(g.configFile)); err != nil {
+				return err
+			}
 			if _, err := parseColorMode(g.color); err != nil {
+				return err
+			}
+			if _, err := rpc.ParseHeaders(g.headers); err != nil {
 				return err
 			}
 			if err := g.validateWireLog(cmd); err != nil {
@@ -307,6 +337,8 @@ redacted before anything is written.`,
 		`when to colourise output: "auto", "always" or "never"`)
 	root.PersistentFlags().StringArrayVar(&g.rpcURLs, "rpc-url", nil,
 		"Soroban RPC endpoint; repeat for a failover pool (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
+	root.PersistentFlags().StringArrayVarP(&g.headers, "header", "H", nil,
+		`custom HTTP header ("Key: Value") attached to RPC requests; repeat for multiple headers (env $`+rpc.HeadersEnvVar+`)`)
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
 	root.PersistentFlags().StringVar(&g.wireLog, "wire-log", "",
@@ -326,8 +358,11 @@ redacted before anything is written.`,
 	root.PersistentFlags().StringVar(&g.serveSSE, "serve-sse", "", "broadcast SSE at this listen address (/events); retains 1024 records for replay")
 	root.PersistentFlags().StringVar(&g.serveSSE, "sse", "", "alias for --serve-sse")
 	root.PersistentFlags().StringVar(&g.serveWS, "ws", "", "broadcast WebSocket events at this listen address (/events or /ws)")
-	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load (default: ~/.config/prism/config.yaml then .prism.yaml in cwd)")
+	root.PersistentFlags().StringVar(&g.configFile, "config", "", "explicit config file to load instead of the defaults (<user config dir>/prism/config.yaml, then .prism.yaml in the current directory); see docs/cli/config_options.md")
 	root.PersistentFlags().StringVar(&g.serveGRPC, "serve-grpc", "", "serve gRPC PrismStream at this listen address")
+	root.PersistentFlags().StringVar(&g.tlsCert, "tls-cert", "", "path to TLS certificate file (PEM)")
+	root.PersistentFlags().StringVar(&g.tlsKey, "tls-key", "", "path to TLS private key file (PEM)")
+	root.PersistentFlags().BoolVar(&g.tlsAutoReload, "tls-auto-reload", false, "dynamically reload TLS certificate on file change")
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
@@ -342,13 +377,16 @@ redacted before anything is written.`,
 		newContractsCmd(g, stdout, stderr),
 		newTradesCmd(g, stdout, stderr),
 		newHealthCmd(g, stdout, stderr),
+		newDoctorCmd(g, stdout, stderr),
 		newTxCmd(g, stdout, stderr),
 		newDiffCmd(g, stdout, stderr),
 		newGenerateTypesCmd(g, stdout, stderr),
 		newAuditCmd(g, stdout, stderr),
 		newAuditVerifyCmd(stdout, stderr),
 		newAggregateCmd(g, stdout, stderr),
+		newBenchmarkCmd(g, stdout, stderr),
 		newRewindCmd(stdout),
+		newReplayCmd(g, stdout, stderr),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
 	)

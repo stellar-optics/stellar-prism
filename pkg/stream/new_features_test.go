@@ -126,3 +126,24 @@ func TestSimulationSourceEmitsResourceEstimate(t *testing.T) {
 		t.Fatalf("simulation = %+v, want decoded resources", batch.Records[0].Simulation)
 	}
 }
+
+func TestSimulationSourceRetriesLedgerAfterMalformedTransactionData(t *testing.T) {
+	srv := fakerpc.NewLedgerServer(fakerpc.MakeLedgers(901, 1))
+	srv.SetSimulations([]protocol.SimulateTransactionResponse{{TransactionDataXDR: "not-xdr"}})
+	src, err := NewSimulationSource(srv, SimulationQuery{TransactionEnvelope: "envelope"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Fetch(context.Background(), ""); err == nil {
+		t.Fatal("Fetch() error = nil, want malformed transaction data error")
+	}
+
+	srv.SetSimulations([]protocol.SimulateTransactionResponse{{MinResourceFee: 3}})
+	batch, err := src.Fetch(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Fetch() after correcting the response: %v", err)
+	}
+	if len(batch.Records) != 1 || batch.Records[0].Sequence != 901 {
+		t.Fatalf("records = %+v, want the same ledger retried", batch.Records)
+	}
+}

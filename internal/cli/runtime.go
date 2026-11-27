@@ -103,9 +103,10 @@ func leaderElection(ctx context.Context, sf *streamFlags, health *stream.HealthM
 		return nil, nil
 	}
 	election, err := stream.NewLeaderElection(stream.LeaderElectionOptions{
-		Path:      sf.haLeaseFile,
-		Heartbeat: sf.haHeartbeat,
-		TTL:       sf.haTTL,
+		Path:        sf.haLeaseFile,
+		Heartbeat:   sf.haHeartbeat,
+		TTL:         sf.haTTL,
+		StandbyPoll: sf.haStandbyPoll,
 		OnChange: func(leader bool) {
 			if health != nil {
 				health.SetActive(leader)
@@ -156,6 +157,11 @@ func stateKeySource(sf *streamFlags) (stream.KeySource, error) {
 
 	case sf.stateKMSProvider != "":
 		return kmsKeySource(sf)
+
+	default:
+		if key := os.Getenv("PRISM_STATE_KEY"); key != "" {
+			return &stream.PassphraseKeySource{Passphrase: key}, nil
+		}
 	}
 	return nil, nil
 }

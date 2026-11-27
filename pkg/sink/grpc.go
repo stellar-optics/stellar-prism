@@ -12,8 +12,13 @@ import (
 // GRPCSink is both a stream sink and the generated PrismStream service. Each
 // subscriber has a bounded queue; a slow disconnected client is never allowed
 // to stall the tailer.
+//
+// Client integration (Go and Python examples, filtering, delivery semantics)
+// is documented in docs/integration/grpc_streaming.md; the wire contract is
+// proto/prism.proto.
 type GRPCSink struct {
 	prismpb.UnimplementedPrismStreamServer
+	prismpb.UnimplementedEventStreamServiceServer
 	mu      sync.Mutex
 	next    uint64
 	events  map[uint64]chan stream.Record
@@ -96,6 +101,12 @@ func (s *GRPCSink) StreamEvents(req *prismpb.EventRequest, out prismpb.PrismStre
 		}
 	}
 }
+
+// Subscribe is the issue-named alias for StreamEvents.
+func (s *GRPCSink) Subscribe(req *prismpb.FilterRequest, out prismpb.EventStreamService_SubscribeServer) error {
+	return s.StreamEvents(req, out)
+}
+
 func (s *GRPCSink) StreamLedgers(_ *prismpb.LedgerRequest, out prismpb.PrismStream_StreamLedgersServer) error {
 	id, ch := s.subscribe(s.ledgers)
 	defer s.remove(s.ledgers, id)

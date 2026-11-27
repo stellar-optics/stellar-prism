@@ -17,6 +17,10 @@ import (
 
 // pprofServer serves the Go runtime profiles over HTTP and joins the serving
 // goroutine when it is closed.
+//
+// Operator guide: docs/performance/tuning_and_profiling.md covers capturing
+// CPU, heap and allocation profiles with go tool pprof, reading them, and
+// GOGC/GOMEMLIMIT tuning. Baseline numbers live in docs/benchmarks.md.
 type pprofServer struct {
 	server    *http.Server
 	serveErr  chan error

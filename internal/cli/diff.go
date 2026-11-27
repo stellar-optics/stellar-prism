@@ -8,6 +8,8 @@ import (
 	lens "github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // newDiffCmd implements the `prism diff` command.
@@ -21,18 +23,22 @@ import (
 // and renders a colorized structural diff showing exactly which fields, parameters,
 // or return values changed.
 func newDiffCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
-	var envelopeOnly bool
-	var metaOnly bool
+	var (
+		envelopeOnly bool
+		metaOnly     bool
+		contractID   string
+		sf           streamFlags
+	)
 
 	cmd := &cobra.Command{
-		Use:   "diff <txHash1> <txHash2>",
-		Short: "Diff two transactions",
-		Long: `Diff two transactions fetched from RPC, comparing their envelopes, results,
-and transaction metadata using stellar-xdr-lens.
+		Use:   "diff [<txHash1> <txHash2>]",
+		Short: "Diff transactions or follow contract storage changes",
+		Long: `Diff two transactions fetched from RPC, or follow path-level changes to
+one contract's storage as new ledger updates arrive.
 
-Compares envelopes, results, and transaction metadata side by side,
-rendering a colorized structural diff showing exactly which fields,
-parameters, or return values changed.
+Transaction mode compares envelopes, results, and transaction metadata using
+stellar-xdr-lens. Contract mode uses transaction ledger metadata to compare
+successive contract data entries.
 
 --envelope-only  Compare only the transaction envelopes (XDR).
 --meta-only      Compare only the transaction metadata (results).
@@ -46,11 +52,48 @@ Example:
   prism diff TXHASH1 TXHASH2 --envelope-only
 
   # Diff metadata only
-  prism diff TXHASH1 TXHASH2 --meta-only`,
-		Args: cobra.ExactArgs(2),
+  prism diff TXHASH1 TXHASH2 --meta-only
+
+  # Follow path-level changes to contract storage
+  prism diff --contract CDLZ... --follow`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if contractID != "" {
+				if len(args) != 0 {
+					return fmt.Errorf("--contract mode does not accept transaction hashes")
+				}
+				return nil
+			}
+			if sf.follow {
+				return fmt.Errorf("--follow requires --contract")
+			}
+			return cobra.ExactArgs(2)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if envelopeOnly && metaOnly {
 				return fmt.Errorf("--envelope-only and --meta-only are mutually exclusive")
+			}
+			if contractID != "" {
+				if envelopeOnly || metaOnly {
+					return fmt.Errorf("--envelope-only and --meta-only apply only to transaction diff mode")
+				}
+				if err := sf.validate(cmd); err != nil {
+					return err
+				}
+				client, closeClient, err := openClient(g, stderr)
+				if err != nil {
+					return err
+				}
+				defer closeClient()
+
+				sf.stateKey = stateKey("diff", filterPart("contract", []string{contractID}))
+				newSource := func(startLedger uint32) (stream.Source, error) {
+					return stream.NewContractStateDiffSource(client, stream.StorageChangeQuery{
+						StartLedger: startLedger,
+						PageLimit:   sf.pageSize,
+						ContractIDs: []string{contractID},
+					})
+				}
+				return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 			}
 
 			client, closeClient, err := openClient(g, stderr)
@@ -85,6 +128,8 @@ Example:
 
 	cmd.Flags().BoolVar(&envelopeOnly, "envelope-only", false, "Compare only the transaction envelopes")
 	cmd.Flags().BoolVar(&metaOnly, "meta-only", false, "Compare only the transaction metadata")
+	cmd.Flags().StringVar(&contractID, "contract", "", "follow structural storage diffs for this contract")
+	sf.register(cmd, stream.DefaultStorageChangePageLimit)
 
 	return cmd
 }

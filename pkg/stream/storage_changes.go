@@ -45,6 +45,12 @@ type StorageChangeQuery struct {
 	// EntryTypes limits results to contract_data, contract_code or ttl.
 	// Empty means all three.
 	EntryTypes []string
+	// Keys limits results to contract data entries whose storage key is one
+	// of these base64 XDR ScVals, for example a Balance(address) map key or
+	// the contract instance key (AAAAFA==). Contract code and TTL entries
+	// have no ScVal key and are therefore omitted when this filter is set.
+	// See docs/guides/storage_change_streaming.md.
+	Keys []string
 }
 
 // StorageChangeSource streams contract-related ledger entry mutations by
@@ -58,6 +64,9 @@ type StorageChangeSource struct {
 	query   StorageChangeQuery
 	changes map[string]bool
 	entries map[string]bool
+	// keys holds the canonical base64 XDR of every --key filter value.
+	keys       map[string]bool
+	entryState map[string]string
 }
 
 // NewStorageChangeSource returns a Source over the given RPC client.
@@ -83,15 +92,72 @@ func NewStorageChangeSource(client rpc.Client, q StorageChangeQuery) (*StorageCh
 		return nil, fmt.Errorf("storage change source: %w", err)
 	}
 
+	keys, err := normalizeScValKeys(q.Keys)
+	if err != nil {
+		return nil, fmt.Errorf("storage change source: %w", err)
+	}
+
 	return &StorageChangeSource{
 		tx: NewTransactionSource(client, TransactionQuery{
 			StartLedger: q.StartLedger,
 			PageLimit:   q.PageLimit,
 		}),
-		query:   q,
-		changes: changes,
-		entries: entries,
+		query:      q,
+		changes:    changes,
+		entries:    entries,
+		keys:       keys,
+		entryState: make(map[string]string),
 	}, nil
+}
+
+// normalizeScValKeys decodes every key filter as a base64 XDR ScVal and
+// re-encodes it, so two spellings of the same value (padding, whitespace)
+// compare equal and a malformed value is reported up front.
+func normalizeScValKeys(values []string) (map[string]bool, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	set := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		var key xdr.ScVal
+		if err := xdr.SafeUnmarshalBase64(value, &key); err != nil {
+			return nil, fmt.Errorf("invalid --key %q: want a base64 XDR ScVal: %w", value, err)
+		}
+		canonical, err := xdr.MarshalBase64(key)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --key %q: %w", value, err)
+		}
+		set[canonical] = true
+	}
+	if len(set) == 0 {
+		return nil, nil
+	}
+	return set, nil
+}
+
+// matchesKey reports whether a change passes the --key filter. Only contract
+// data entries carry an ScVal key, so every other entry type is rejected
+// while the filter is set.
+func (s *StorageChangeSource) matchesKey(change *xdr.LedgerEntryChange) (bool, error) {
+	if len(s.keys) == 0 {
+		return true, nil
+	}
+	key, err := change.LedgerKey()
+	if err != nil {
+		return false, fmt.Errorf("reading ledger key: %w", err)
+	}
+	if key.Type != xdr.LedgerEntryTypeContractData || key.ContractData == nil {
+		return false, nil
+	}
+	encoded, err := xdr.MarshalBase64(key.ContractData.Key)
+	if err != nil {
+		return false, fmt.Errorf("encoding storage key: %w", err)
+	}
+	return s.keys[encoded], nil
 }
 
 func normalizeSet(values []string, allowed ...string) (map[string]bool, error) {
@@ -128,6 +194,7 @@ func (s *StorageChangeSource) Name() string { return "storage_changes" }
 func (s *StorageChangeSource) Rewind(ledger uint32) {
 	s.query.StartLedger = ledger
 	s.tx.Rewind(ledger)
+	s.entryState = make(map[string]string)
 }
 
 // CursorLedger implements Source.
@@ -145,9 +212,9 @@ func (s *StorageChangeSource) Fetch(ctx context.Context, cursor string) (Batch, 
 	out := Batch{
 		Records:    make([]Record, 0, len(batch.Records)),
 		NextCursor: batch.NextCursor,
-		Latest:     batch.Latest,
-		Oldest:     batch.Oldest,
-		Full:       batch.Full,
+		Latest:     batch.Latest, LatestCloseTime: batch.LatestCloseTime,
+		Oldest: batch.Oldest,
+		Full:   batch.Full,
 	}
 	for i := range batch.Records {
 		tx := batch.Records[i].Transaction
@@ -185,12 +252,34 @@ func (s *StorageChangeSource) extract(record *Record) ([]Record, error) {
 	}
 
 	var records []Record
+	transactionState := make(map[string]string)
+	touched := make(map[string]bool)
 	for _, group := range groups {
 		for i := range group {
 			change := &group[i]
 			if change.Type == xdr.LedgerEntryChangeTypeLedgerEntryState {
-				// State changes restate an entry the transaction read; they
-				// are not mutations and would duplicate the stream.
+				entry, ok := change.GetLedgerEntry()
+				if !ok {
+					continue
+				}
+				key, err := change.LedgerKey()
+				if err != nil {
+					return nil, fmt.Errorf("reading state ledger key: %w", err)
+				}
+				keyXDR, err := key.MarshalBinaryBase64()
+				if err != nil {
+					return nil, fmt.Errorf("encoding state ledger key: %w", err)
+				}
+				entryXDR, err := xdr.MarshalBase64(entry)
+				if err != nil {
+					return nil, fmt.Errorf("encoding state ledger entry: %w", err)
+				}
+				if !touched[keyXDR] {
+					transactionState[keyXDR] = entryXDR
+				}
+				if _, exists := s.entryState[keyXDR]; !exists {
+					s.entryState[keyXDR] = entryXDR
+				}
 				continue
 			}
 
@@ -201,7 +290,27 @@ func (s *StorageChangeSource) extract(record *Record) ([]Record, error) {
 			if !ok {
 				continue
 			}
+			previous, found := transactionState[payload.KeyXDR]
+			if found {
+				delete(transactionState, payload.KeyXDR)
+			} else {
+				previous, found = s.entryState[payload.KeyXDR]
+			}
+			if found {
+				payload.PreviousEntryXDR = previous
+			}
+			touched[payload.KeyXDR] = true
+			if payload.ChangeType == StorageChangeRemoved {
+				delete(s.entryState, payload.KeyXDR)
+			} else if payload.EntryXDR != "" {
+				s.entryState[payload.KeyXDR] = payload.EntryXDR
+			}
 			if !s.matches(payload) {
+				continue
+			}
+			if ok, err := s.matchesKey(change); err != nil {
+				return nil, err
+			} else if !ok {
 				continue
 			}
 			if payload.EntryType == StorageEntryTTL && payload.EntryXDR != "" {

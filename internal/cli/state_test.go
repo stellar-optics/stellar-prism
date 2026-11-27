@@ -453,6 +453,10 @@ func TestStateKeySeparatesDifferentStreams(t *testing.T) {
 	if a != eventsStateKey([]string{"CDLZF"}, nil, nil) {
 		t.Errorf("the key for the same filters is not stable: %q", a)
 	}
+	excluded := eventsStateKey([]string{"CDLZF"}, nil, nil, filterPart("exclude-contract", []string{"CAAA"}))
+	if excluded == a {
+		t.Errorf("a blacklisted stream shares the unblacklisted cursor key %q", a)
+	}
 }
 
 // TestStateKeyIgnoresEmptyFilters checks that a filter left out does not
