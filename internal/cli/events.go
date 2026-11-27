@@ -476,13 +476,10 @@ func samePath(a, b string) bool {
 // The pruning flags only mean something when there is a file to prune, so
 // they are rejected on their own rather than being silently ignored.
 func (s *streamFlags) validateState(cmd *cobra.Command) error {
-	if s.stateRedisURL != "" {
-		// Redis-backed metadata is a state store too, so the pruning flags
-		// are meaningful with it.
-		if s.stateRedisKey == "" {
-			// default derived later from the stream key; nothing to validate
-		}
-	}
+	// Redis-backed cursor metadata is a state store too; the pruning flags
+	// are meaningful with --state-redis-url. The key defaults to
+	// prism:cursor:<stream_name> and is derived later, so nothing to
+	// validate here.
 	if s.pruneInterval < 0 {
 		return fmt.Errorf("--prune-interval must not be negative")
 	}

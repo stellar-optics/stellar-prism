@@ -1,3 +1,10 @@
+// Package state provides Redis-backed implementations of the stream.MetadataStore,
+// stream.StateStore, stream.CursorStore, and distributed lease interfaces.
+//
+// All types are safe for concurrent use.  A minimal RESP/TCP client is bundled
+// so that the package has no external Redis driver dependency; callers that
+// already use a full driver (e.g. github.com/redis/go-redis) can supply their
+// own client via the [RedisClient] interface.
 package state
 
 import (
@@ -367,10 +374,14 @@ func (b *redisStoreBase) eval(ctx context.Context, script string, keys []string,
 // RedisMetadataStore (stream.MetadataStore)
 // ---------------------------------------------------------------------------
 
+// RedisMetadataStore is a [stream.MetadataStore] backed by a single Redis key.
+// Checkpoint entries are stored as a JSON array; use Prune to bound its size.
 type RedisMetadataStore struct {
 	redisStoreBase
 }
 
+// NewRedisMetadataStore returns a [RedisMetadataStore] that stores entries
+// under key in the given Redis client.
 func NewRedisMetadataStore(client any, key any) (*RedisMetadataStore, error) {
 	k, err := parseRedisKey(key, "")
 	if err != nil {
@@ -382,7 +393,7 @@ func NewRedisMetadataStore(client any, key any) (*RedisMetadataStore, error) {
 	return &RedisMetadataStore{redisStoreBase: redisStoreBase{client: client, key: k}}, nil
 }
 
-// Aliases for common naming.
+// NewRedisStore is an alias for [NewRedisMetadataStore].
 func NewRedisStore(client any, key any) (*RedisMetadataStore, error) {
 	return NewRedisMetadataStore(client, key)
 }
@@ -410,6 +421,7 @@ func (s *RedisMetadataStore) saveEntries(ctx context.Context, entries []stream.C
 	return s.set(ctx, s.key, string(data), 0)
 }
 
+// Append adds meta to the checkpoint list stored in Redis.
 func (s *RedisMetadataStore) Append(ctx context.Context, meta stream.CursorMetadata) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -427,6 +439,7 @@ func (s *RedisMetadataStore) Append(ctx context.Context, meta stream.CursorMetad
 	return s.saveEntries(ctx, entries)
 }
 
+// Latest returns the most recent checkpoint for key, or false if none exists.
 func (s *RedisMetadataStore) Latest(ctx context.Context, key string) (stream.CursorMetadata, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -443,6 +456,7 @@ func (s *RedisMetadataStore) Latest(ctx context.Context, key string) (stream.Cur
 	return stream.CursorMetadata{}, false, nil
 }
 
+// Entries returns all stored checkpoints for key.
 func (s *RedisMetadataStore) Entries(ctx context.Context, key string) ([]stream.CursorMetadata, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -460,6 +474,7 @@ func (s *RedisMetadataStore) Entries(ctx context.Context, key string) ([]stream.
 	return out, nil
 }
 
+// Prune removes checkpoints that fall outside policy, compacting the stored list.
 func (s *RedisMetadataStore) Prune(ctx context.Context, policy stream.PrunePolicy) (stream.PruneStats, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -507,11 +522,14 @@ func (s *RedisMetadataStore) Prune(ctx context.Context, policy stream.PrunePolic
 // RedisStateStore (stream.StateStore)
 // ---------------------------------------------------------------------------
 
+// RedisStateStore is a [stream.StateStore] backed by a single Redis key.
 type RedisStateStore struct {
 	redisStoreBase
 	mu sync.Mutex
 }
 
+// NewRedisStateStore returns a [RedisStateStore] that persists state
+// under key in the given Redis client.
 func NewRedisStateStore(client any, key any) (*RedisStateStore, error) {
 	k, err := parseRedisKey(key, "")
 	if err != nil {
@@ -523,6 +541,7 @@ func NewRedisStateStore(client any, key any) (*RedisStateStore, error) {
 	return &RedisStateStore{redisStoreBase: redisStoreBase{client: client, key: k}}, nil
 }
 
+// Load reads the stream state from Redis.
 func (s *RedisStateStore) Load() (stream.State, error) {
 	ctx := context.Background()
 	raw, err := s.get(ctx, s.key)
@@ -539,6 +558,7 @@ func (s *RedisStateStore) Load() (stream.State, error) {
 	return st, nil
 }
 
+// Save writes st to Redis.
 func (s *RedisStateStore) Save(st stream.State) error {
 	ctx := context.Background()
 	s.mu.Lock()
@@ -554,6 +574,7 @@ func (s *RedisStateStore) Save(st stream.State) error {
 	return s.set(ctx, s.key, string(data), 0)
 }
 
+// LoadContext is like [RedisStateStore.Load] but accepts a context.
 func (s *RedisStateStore) LoadContext(ctx context.Context) (stream.State, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -562,6 +583,7 @@ func (s *RedisStateStore) LoadContext(ctx context.Context) (stream.State, error)
 	return s.Load()
 }
 
+// SaveContext is like [RedisStateStore.Save] but accepts a context.
 func (s *RedisStateStore) SaveContext(ctx context.Context, st stream.State) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -574,11 +596,15 @@ func (s *RedisStateStore) SaveContext(ctx context.Context, st stream.State) erro
 // RedisCursorStore (stream.CursorStore)
 // ---------------------------------------------------------------------------
 
+// RedisCursorStore is a [stream.CursorStore] backed by Redis.
+// Each cursor is stored under its own key.
 type RedisCursorStore struct {
 	redisStoreBase
 	mu sync.Mutex
 }
 
+// NewRedisCursorStore returns a [RedisCursorStore] using client, with
+// key as the default Redis key when a per-cursor key is not supplied.
 func NewRedisCursorStore(client any, key any) (*RedisCursorStore, error) {
 	k, err := parseRedisKey(key, "")
 	if err != nil {
@@ -590,7 +616,7 @@ func NewRedisCursorStore(client any, key any) (*RedisCursorStore, error) {
 	return &RedisCursorStore{redisStoreBase: redisStoreBase{client: client, key: k}}, nil
 }
 
-// Aliases.
+// NewRedisCursor is an alias for [NewRedisCursorStore].
 func NewRedisCursor(client any, key any) (*RedisCursorStore, error) {
 	return NewRedisCursorStore(client, key)
 }
@@ -602,6 +628,7 @@ func (s *RedisCursorStore) redisKeyFor(key string) string {
 	return s.key
 }
 
+// Load reads the cursor state for key from Redis.
 func (s *RedisCursorStore) Load(ctx context.Context, key string) (stream.CursorState, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -621,6 +648,7 @@ func (s *RedisCursorStore) Load(ctx context.Context, key string) (stream.CursorS
 	return st, nil
 }
 
+// Save persists state for key to Redis.
 func (s *RedisCursorStore) Save(ctx context.Context, key string, state stream.CursorState) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -642,6 +670,9 @@ func (s *RedisCursorStore) Save(ctx context.Context, key string, state stream.Cu
 // Redis lease (distributed leader)
 // ---------------------------------------------------------------------------
 
+// RedisLease implements a distributed leader election using Redis SET NX.
+// The holder acquires the lease with [RedisLease.Acquire] and must call
+// [RedisLease.Renew] at least every TTL/2 to keep it.
 type RedisLease struct {
 	redisStoreBase
 	mu     sync.Mutex
@@ -649,10 +680,12 @@ type RedisLease struct {
 	ttl    time.Duration
 }
 
+// NewRedisLease creates a [RedisLease] with the default 15-second TTL.
 func NewRedisLease(client any, key any) (*RedisLease, error) {
 	return NewRedisLeaseWithTTL(client, key, 15*time.Second, "")
 }
 
+// NewRedisLeaseWithTTL creates a [RedisLease] with a custom TTL and holder name.
 func NewRedisLeaseWithTTL(client any, key any, ttl time.Duration, holder string) (*RedisLease, error) {
 	k, err := parseRedisKey(key, "")
 	if err != nil {
@@ -674,18 +707,27 @@ func NewRedisLeaseWithTTL(client any, key any, ttl time.Duration, holder string)
 	}, nil
 }
 
-// Aliases.
+// NewRedisLeaderLease is an alias for [NewRedisLease].
 func NewRedisLeaderLease(client any, key any) (*RedisLease, error) {
 	return NewRedisLease(client, key)
 }
+
+// NewLeaderLease is an alias for [NewRedisLease].
 func NewLeaderLease(client any, key any) (*RedisLease, error) {
 	return NewRedisLease(client, key)
 }
 
-func (l *RedisLease) Key() string        { return l.key }
-func (l *RedisLease) Holder() string     { return l.holder }
+// Key returns the Redis key the lease is stored under.
+func (l *RedisLease) Key() string { return l.key }
+
+// Holder returns the value written to the lease key to identify this instance.
+func (l *RedisLease) Holder() string { return l.holder }
+
+// TTL returns the lease's time-to-live.
 func (l *RedisLease) TTL() time.Duration { return l.ttl }
 
+// Acquire attempts to take the lease using SET NX.
+// It returns true when the lease was granted.
 func (l *RedisLease) Acquire(ctx context.Context) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -693,6 +735,7 @@ func (l *RedisLease) Acquire(ctx context.Context) (bool, error) {
 	return l.setNX(ctx, l.key, l.holder, l.ttl)
 }
 
+// Renew refreshes the lease TTL.  It returns true when the renewal succeeded.
 func (l *RedisLease) Renew(ctx context.Context) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -703,6 +746,7 @@ func (l *RedisLease) Renew(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// Release deletes the lease key, yielding it to the next candidate.
 func (l *RedisLease) Release(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -710,6 +754,7 @@ func (l *RedisLease) Release(ctx context.Context) error {
 	return l.del(ctx, l.key)
 }
 
+// TryAcquire is an alias for [RedisLease.Acquire].
 func (l *RedisLease) TryAcquire(ctx context.Context) (bool, error) {
 	return l.Acquire(ctx)
 }
@@ -725,6 +770,8 @@ type redisTCPClient struct {
 	timeout  time.Duration
 }
 
+// NewRedisClient parses rawURL (redis:// or rediss://) and returns a minimal
+// TCP-based [RedisClient] that speaks the RESP protocol.
 func NewRedisClient(rawURL string) (RedisClient, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -958,50 +1005,70 @@ func (c *redisTCPClient) Close() error { return nil }
 // Compatibility aliases
 // ---------------------------------------------------------------------------
 
+// RedisJournalStore is an alias for [RedisMetadataStore].
 type RedisJournalStore = RedisMetadataStore
+
+// RedisCheckpointStore is an alias for [RedisMetadataStore].
 type RedisCheckpointStore = RedisMetadataStore
+
+// RedisState is an alias for [RedisStateStore].
 type RedisState = RedisStateStore
+
+// RedisCursor is an alias for [RedisCursorStore].
 type RedisCursor = RedisCursorStore
+
+// RedisLeaderLease is an alias for [RedisLease].
 type RedisLeaderLease = RedisLease
+
+// RedisLeader is an alias for [RedisLease].
 type RedisLeader = RedisLease
 
+// NewRedisJournalStore is an alias for [NewRedisMetadataStore].
 func NewRedisJournalStore(client any, key any) (*RedisMetadataStore, error) {
 	return NewRedisMetadataStore(client, key)
 }
 
+// NewRedisCheckpointStore is an alias for [NewRedisMetadataStore].
 func NewRedisCheckpointStore(client any, key any) (*RedisMetadataStore, error) {
 	return NewRedisMetadataStore(client, key)
 }
 
+// NewRedisMetadata is an alias for [NewRedisMetadataStore].
 func NewRedisMetadata(client any, key any) (*RedisMetadataStore, error) {
 	return NewRedisMetadataStore(client, key)
 }
 
+// NewStateRedisStore is an alias for [NewRedisStateStore].
 func NewStateRedisStore(client any, key any) (*RedisStateStore, error) {
 	return NewRedisStateStore(client, key)
 }
 
+// NewRedisState is an alias for [NewRedisStateStore].
 func NewRedisState(client any, key any) (*RedisStateStore, error) {
 	return NewRedisStateStore(client, key)
 }
 
+// NewRedisCursorCheckpointStore is an alias for [NewRedisCursorStore].
 func NewRedisCursorCheckpointStore(client any, key any) (*RedisCursorStore, error) {
 	return NewRedisCursorStore(client, key)
 }
 
+// NewRedisCursorStateStore is an alias for [NewRedisCursorStore].
 func NewRedisCursorStateStore(client any, key any) (*RedisCursorStore, error) {
 	return NewRedisCursorStore(client, key)
 }
 
+// NewRedisLeaseStore is an alias for [NewRedisLease].
 func NewRedisLeaseStore(client any, key any) (*RedisLease, error) {
 	return NewRedisLease(client, key)
 }
 
+// OpenRedisClient is an alias for [NewRedisClient].
 func OpenRedisClient(rawURL string) (RedisClient, error) {
 	return NewRedisClient(rawURL)
 }
 
-// NewRedisClientFromURL is an alias for NewRedisClient.
+// NewRedisClientFromURL is an alias for [NewRedisClient].
 func NewRedisClientFromURL(rawURL string) (RedisClient, error) {
 	return NewRedisClient(rawURL)
 }

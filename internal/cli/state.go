@@ -8,9 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stellar-optics/stellar-prism/pkg/stream"
-
 	redisstate "github.com/stellar-optics/stellar-prism/pkg/state"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
 // cursorState owns the optional cursor metadata file and the background
