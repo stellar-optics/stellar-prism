@@ -837,28 +837,24 @@ func NewMockServer(m *MockRPC) *MockServer {
 		switch req.Method {
 		case "getEvents":
 			var p protocol.GetEventsRequest
-			if len(req.Params) > 0 {
-				_ = json.Unmarshal(req.Params, &p)
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetEvents(ctx, p)
 			}
-			result, rpcErr = s.GetEvents(ctx, p)
 		case "getTransaction":
 			var p protocol.GetTransactionRequest
-			if len(req.Params) > 0 {
-				_ = json.Unmarshal(req.Params, &p)
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetTransaction(ctx, p)
 			}
-			result, rpcErr = s.GetTransaction(ctx, p)
 		case "getTransactions":
 			var p protocol.GetTransactionsRequest
-			if len(req.Params) > 0 {
-				_ = json.Unmarshal(req.Params, &p)
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetTransactions(ctx, p)
 			}
-			result, rpcErr = s.GetTransactions(ctx, p)
 		case "getLedgers":
 			var p protocol.GetLedgersRequest
-			if len(req.Params) > 0 {
-				_ = json.Unmarshal(req.Params, &p)
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetLedgers(ctx, p)
 			}
-			result, rpcErr = s.GetLedgers(ctx, p)
 		case "getHealth":
 			result, rpcErr = s.Health(ctx)
 		case "getLatestLedger":
@@ -883,7 +879,9 @@ func NewMockServer(m *MockRPC) *MockServer {
 		} else {
 			resp.Result = result
 		}
-		_ = json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 	})
 
 	s.Server = httptest.NewServer(handler)
@@ -914,4 +912,16 @@ func (s *MockServer) Close() {
 	if s.Server != nil {
 		s.Server.Close()
 	}
+}
+
+// decodeParams unmarshals JSON-RPC params into dst. Absent params leave dst at
+// its zero value.
+func decodeParams(params json.RawMessage, dst any) error {
+	if len(params) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(params, dst); err != nil {
+		return fmt.Errorf("invalid params: %w", err)
+	}
+	return nil
 }
