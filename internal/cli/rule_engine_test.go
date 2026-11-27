@@ -2,7 +2,12 @@ package cli
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
 
@@ -596,4 +601,41 @@ func encodeSymbol(t *testing.T, symbol string) string {
 		t.Fatalf("marshalling symbol: %v", err)
 	}
 	return encoded
+}
+
+func TestRulesEngineYAMLAndWebhookDispatch(t *testing.T) {
+	received := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		received <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "rules.yaml")
+	yaml := fmt.Sprintf(`rules:
+  - name: large-transfer
+    condition: value.amount > 100000
+    action:
+      type: webhook
+      url: %s
+`, server.URL)
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := LoadRulesEngine(path)
+	if err != nil {
+		t.Fatalf("LoadRulesEngine: %v", err)
+	}
+	defer engine.Close()
+
+	record := makeEventRecord(t, map[string]any{"amount": int64(150000)})
+	engine.Dispatch(record)
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook was not dispatched")
+	}
 }

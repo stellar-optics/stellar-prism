@@ -160,7 +160,9 @@ type streamFlags struct {
 	// sampleRate is the fraction of events to keep (0.0 to 1.0). Zero disables sampling.
 	sampleRate float64
 	// maxRate is the maximum number of events per second to emit. Zero disables rate limiting.
-	maxRate float64
+	maxRate     float64
+	untilLedger uint32
+	untilTime   string
 
 	// excludeTopics are topic patterns to exclude (base64 ScVal or symbol string).
 	excludeTopics []string
@@ -174,6 +176,10 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep streaming as new ledgers close, like tail -f")
 	cmd.Flags().Uint32Var(&s.from, "from", 0,
 		"start from this ledger and continue forward (default: the latest ledger)")
+	cmd.Flags().Uint32Var(&s.untilLedger, "until-ledger", 0,
+		"stop gracefully after this ledger is processed (0 means no ledger boundary)")
+	cmd.Flags().StringVar(&s.untilTime, "until-time", "",
+		"stop gracefully after this RFC3339 ledger close time")
 	cmd.Flags().DurationVar(&s.since, "since", 0,
 		"start about this long ago, e.g. --since 10m; converted to an approximate start ledger (mutually exclusive with --from)")
 	cmd.Flags().StringVar(&s.rewind, "rewind", "",
@@ -195,6 +201,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"print a line on stderr after this long waiting in silence (with --follow; 0 disables)")
 	cmd.Flags().UintVar(&s.pageSize, "page-size", defaultPage,
 		"how many records to request per RPC call")
+	cmd.Flags().Float64Var(&s.sampleRate, "sample", 0,
+		"fraction of records to emit deterministically (0.0 < ratio <= 1.0; 0 disables)")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
 	defaultBackoff := stream.DefaultBackoff()
@@ -328,6 +336,14 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 			return fmt.Errorf("--since must not be negative")
 		}
 	}
+	if cmd.Flags().Changed("until-time") && s.untilTime != "" {
+		if _, err := time.Parse(time.RFC3339, s.untilTime); err != nil {
+			return fmt.Errorf("--until-time must be RFC3339: %w", err)
+		}
+	}
+	if s.untilLedger > 0 && s.untilTime != "" {
+		return fmt.Errorf("--until-ledger and --until-time are mutually exclusive")
+	}
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
 	}
@@ -382,6 +398,9 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.sampleRate < 0 || s.sampleRate > 1 {
 		return fmt.Errorf("--sample-rate must be between 0.0 and 1.0")
+	}
+	if cmd.Flags().Changed("sample") && (s.sampleRate <= 0 || s.sampleRate > 1) {
+		return fmt.Errorf("--sample must be greater than 0.0 and at most 1.0")
 	}
 	if s.maxRate < 0 {
 		return fmt.Errorf("--max-rate must not be negative")
@@ -751,6 +770,13 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 	if err != nil {
 		return stream.Options{}, err
 	}
+	var untilTime time.Time
+	if s.untilTime != "" {
+		untilTime, err = time.Parse(time.RFC3339, s.untilTime)
+		if err != nil {
+			return stream.Options{}, fmt.Errorf("--until-time must be RFC3339: %w", err)
+		}
+	}
 
 	// Determine effective quiet mode: flag overrides the quiet parameter.
 	effectiveQuiet := s.quiet || quiet
@@ -768,6 +794,8 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		Follow:       s.follow,
 		Limit:        s.limit,
 		Filter:       s.filter,
+		UntilLedger:  s.untilLedger,
+		UntilTime:    untilTime,
 		PollInterval: s.poll,
 		MaxRetries:   s.retries,
 		Backoff:      s.backoff(),
@@ -1223,6 +1251,23 @@ func runStream(
 		from = target.Ledger
 	}
 
+	outputWriter := stdout
+	if sf.output == "" && !sf.asJSON && strings.ToLower(sf.format) != "csv" && strings.ToLower(sf.format) != "tsv" {
+		mode, parseErr := parseColorMode(g.color)
+		if parseErr != nil {
+			return parseErr
+		}
+		outputWriter, err = NewHighlightWriter(stdout, g.highlightRegex, mode)
+		if err != nil {
+			return fmt.Errorf("invalid --highlight-regex: %w", err)
+		}
+	}
+	out, err := sf.newSink(outputWriter, stderr, g.color, func(err error) {
+		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
+	}, func(entry sink.DLQEntry) {
+		record := "-"
+		if entry.Record != nil {
+			record = entry.Record.ID
 	var out stream.Sink
 	if sf.aggregate {
 		// Aggregation replaces per-event output with periodic window
@@ -1253,6 +1298,20 @@ func runStream(
 		}
 	}
 	localOut := out
+	if g.rulesFile != "" {
+		engine, rulesErr := LoadRulesEngine(g.rulesFile)
+		if rulesErr != nil {
+			if closer, ok := localOut.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			return rulesErr
+		}
+		engine.SetStderr(func(format string, args ...any) {
+			fmt.Fprintf(stderr, "prism: "+format+"\n", args...)
+		})
+		out = NewRulesSink(out, engine)
+		defer engine.Close()
+	}
 	// The output is closed exactly once, whether the run ends normally, is
 	// interrupted or fails: the drain closes it, and the deferred teardown
 	// closes it when the drain never ran. A second close would report a
