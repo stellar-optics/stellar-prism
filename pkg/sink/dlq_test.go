@@ -523,3 +523,123 @@ func TestDLQRejectsUseAfterClose(t *testing.T) {
 		t.Errorf("Flush() after Close() error = %v, want nil", err)
 	}
 }
+
+// attemptSink fails a fixed number of deliveries, counting every attempt.
+type attemptSink struct {
+	failures int
+	attempts int
+	emitted  []stream.Record
+}
+
+func (s *attemptSink) Emit(r stream.Record) error {
+	s.attempts++
+	if s.attempts <= s.failures {
+		return errBoom
+	}
+	s.emitted = append(s.emitted, r)
+	return nil
+}
+
+func (s *attemptSink) Flush() error { return nil }
+
+func TestDLQDirectoryWritesOneFilePerRecordAfterBackoff(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "dlq")
+	primary := &attemptSink{failures: 1 << 30}
+	now := time.Unix(1_700_000_000, 0).UTC()
+
+	dlq, err := sink.NewDLQ(primary, nil, sink.DLQOptions{
+		Directory:        dir,
+		MaxRecordRetries: 3,
+		RetryBackoff:     time.Millisecond,
+		MaxRetryBackoff:  2 * time.Millisecond,
+		Now:              func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewDLQ() error = %v", err)
+	}
+
+	record := eventRecord()
+	if err := dlq.Emit(record); err != nil {
+		t.Fatalf("Emit() error = %v", err)
+	}
+	if primary.attempts != 4 {
+		t.Fatalf("delivery attempts = %d, want the initial attempt plus 3 retries", primary.attempts)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading queue directory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("dead letters = %d, want 1", len(entries))
+	}
+
+	name := entries[0].Name()
+	if !strings.HasPrefix(name, "20231114T221320.000000000Z_") || !strings.HasSuffix(name, ".json") {
+		t.Errorf("dead letter file %q is not <timestamp>_<id>.json", name)
+	}
+	if !strings.Contains(name, record.ID) {
+		t.Errorf("dead letter file %q does not name record %s", name, record.ID)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("reading dead letter: %v", err)
+	}
+	var entry struct {
+		Kind   string         `json:"kind"`
+		Stage  string         `json:"stage"`
+		Error  string         `json:"error"`
+		Stack  string         `json:"stack"`
+		Record *stream.Record `json:"record"`
+	}
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("decoding dead letter: %v", err)
+	}
+	if entry.Kind != sink.DLQKind {
+		t.Errorf("kind = %q, want %q", entry.Kind, sink.DLQKind)
+	}
+	if entry.Stage != sink.DLQStageDelivery {
+		t.Errorf("stage = %q, want %q", entry.Stage, sink.DLQStageDelivery)
+	}
+	if !strings.Contains(entry.Error, errBoom.Error()) {
+		t.Errorf("error = %q, want it to contain %q", entry.Error, errBoom)
+	}
+	if !strings.Contains(entry.Stack, "goroutine") {
+		t.Errorf("stack = %q, want a goroutine trace", entry.Stack)
+	}
+	if entry.Record == nil || entry.Record.ID != record.ID {
+		t.Errorf("record = %+v, want the failed record preserved", entry.Record)
+	}
+}
+
+func TestDLQDirectoryRetriesTransientFailuresWithoutSpilling(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "dlq")
+	primary := &attemptSink{failures: 2}
+
+	dlq, err := sink.NewDLQ(primary, nil, sink.DLQOptions{
+		Directory:        dir,
+		MaxRecordRetries: 3,
+		RetryBackoff:     time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewDLQ() error = %v", err)
+	}
+
+	if err := dlq.Emit(eventRecord()); err != nil {
+		t.Fatalf("Emit() error = %v", err)
+	}
+	if primary.attempts != 3 {
+		t.Errorf("delivery attempts = %d, want 3", primary.attempts)
+	}
+	if len(primary.emitted) != 1 {
+		t.Errorf("delivered records = %d, want 1", len(primary.emitted))
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading queue directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("dead letters = %d, want none after a recovered retry", len(entries))
+	}
+}

@@ -2,6 +2,7 @@ package sink_test
 
 import (
 	"compress/gzip"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -419,5 +420,121 @@ func TestFileRotatorPathAndBuilderNil(t *testing.T) {
 
 	if _, err := sink.NewFileRotator(path, func(io.Writer) stream.Sink { return nil }, sink.RotatorOptions{}); err == nil {
 		t.Error("nil-returning builder accepted")
+	}
+}
+
+func TestRotatingWriterRotatesDailyAndCompressesInBackground(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "events.log")
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	w, err := sink.NewRotatingWriter(path, sink.RotatorOptions{
+		Daily:         true,
+		Compress:      true,
+		AsyncCompress: true,
+		Now:           func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewRotatingWriter() error = %v", err)
+	}
+
+	if _, err := w.Write([]byte("first day\n")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	now = now.Add(24 * time.Hour)
+	if _, err := w.Write([]byte("second day\n")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	// Close waits for the background compressor, so the archive is complete.
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	archives := backups(t, path)
+	if len(archives) != 1 {
+		t.Fatalf("archives = %v, want one daily archive", archives)
+	}
+	if !strings.HasSuffix(archives[0], "2026-11-28.log.gz") {
+		t.Errorf("archive = %q, want a YYYY-MM-DD.log.gz name for the day it covers", archives[0])
+	}
+
+	file, err := os.Open(archives[0])
+	if err != nil {
+		t.Fatalf("opening archive: %v", err)
+	}
+	reader, err := gzip.NewReader(file)
+	if err != nil {
+		_ = file.Close()
+		t.Fatalf("reading gzip archive: %v", err)
+	}
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("decompressing archive: %v", err)
+	}
+	if err := errors.Join(reader.Close(), file.Close()); err != nil {
+		t.Fatalf("closing archive: %v", err)
+	}
+	if string(content) != "first day\n" {
+		t.Errorf("archive content = %q, want %q", content, "first day\n")
+	}
+	if got := readFile(t, path); got != "second day\n" {
+		t.Errorf("active file = %q, want %q", got, "second day\n")
+	}
+}
+
+func TestRotatingWriterPrunesOldestArchives(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "events.log")
+	w, err := sink.NewRotatingWriter(path, sink.RotatorOptions{MaxSize: 40, MaxBackups: 1})
+	if err != nil {
+		t.Fatalf("NewRotatingWriter() error = %v", err)
+	}
+	for i := range 3 {
+		if _, err := w.Write([]byte(strings.Repeat("x", 30))); err != nil {
+			t.Fatalf("Write(%d) error = %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if got := backups(t, path); len(got) != 1 {
+		t.Errorf("archives = %v, want MaxBackups=1 to keep one", got)
+	}
+}
+
+func TestRollingFileSinkRotatesDailyAndCompresses(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "events.ndjson")
+	now := time.Date(2026, 11, 28, 8, 0, 0, 0, time.UTC)
+	rotator, err := sink.NewRollingFileSink(path, func(w io.Writer) stream.Sink {
+		return sink.NewNDJSON(w, false)
+	}, sink.RollingFileSinkOptions{MaxSizeMB: 1, MaxBackups: 2, Compress: true, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("NewRollingFileSink() error = %v", err)
+	}
+	if got := rotator.Path(); got != path {
+		t.Errorf("Path() = %q, want %q", got, path)
+	}
+
+	if err := rotator.Emit(ledgerRecord()); err != nil {
+		t.Fatalf("Emit() error = %v", err)
+	}
+	now = now.Add(24 * time.Hour)
+	if err := rotator.Emit(ledgerRecord()); err != nil {
+		t.Fatalf("Emit() error = %v", err)
+	}
+	if err := rotator.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	archives := backups(t, path)
+	if len(archives) != 1 {
+		t.Fatalf("archives = %v, want one daily archive", archives)
+	}
+	if !strings.HasSuffix(archives[0], "2026-11-28.log.gz") {
+		t.Errorf("archive = %q, want a compressed daily archive", archives[0])
 	}
 }

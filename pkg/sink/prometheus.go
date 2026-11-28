@@ -60,7 +60,22 @@ type Prometheus struct {
 	latencySum   float64
 	latencyCount uint64
 	lastLedger   uint32
-	server       *metricsServer
+
+	// Events processed counts the records that reached this sink, which is
+	// the throughput an operator watches during ingestion.
+	eventsProcessed uint64
+	// ledgerLag is how many ledgers the stream is behind the chain head, as
+	// reported by the tailer after each poll.
+	ledgerLag int64
+	// queueDepth is how many records are buffered downstream and not yet
+	// delivered.
+	queueDepth int64
+	// rpcLatency is the histogram of upstream RPC call durations.
+	rpcLatencySum   float64
+	rpcLatencyCount uint64
+	rpcBuckets      []uint64
+
+	server *metricsServer
 }
 
 // NewPrometheus validates opts and builds the sink, starting the /metrics
@@ -98,6 +113,7 @@ func NewPrometheus(opts PrometheusOptions) (*Prometheus, error) {
 		events:       make(map[string]uint64),
 		errors:       make(map[string]uint64),
 		bucketCounts: make([]uint64, len(buckets)+1), // last bucket is +Inf
+		rpcBuckets:   make([]uint64, len(buckets)+1),
 	}
 
 	if opts.ListenAddr != "" {
@@ -116,6 +132,7 @@ func (p *Prometheus) Emit(r stream.Record) error {
 	defer p.mu.Unlock()
 
 	p.observeLocked(r)
+	p.eventsProcessed++
 	return nil
 }
 
@@ -127,7 +144,48 @@ func (p *Prometheus) EmitBatch(records []stream.Record) error {
 	for _, r := range records {
 		p.observeLocked(r)
 	}
+	p.eventsProcessed += uint64(len(records))
 	return nil
+}
+
+// SetLedgerLag records how many ledgers the stream is behind the chain head.
+// It is called from the tailer's progress hook, so a scrape always shows the
+// lag of the most recent poll even when no record was emitted.
+func (p *Prometheus) SetLedgerLag(ledgers int64) {
+	if ledgers < 0 {
+		ledgers = 0
+	}
+	p.mu.Lock()
+	p.ledgerLag = ledgers
+	p.mu.Unlock()
+}
+
+// SetQueueDepth records how many records are buffered but not yet delivered.
+func (p *Prometheus) SetQueueDepth(depth int64) {
+	if depth < 0 {
+		depth = 0
+	}
+	p.mu.Lock()
+	p.queueDepth = depth
+	p.mu.Unlock()
+}
+
+// ObserveRPCLatency records the duration of one upstream RPC call in the
+// prism_rpc_latency_seconds histogram.
+func (p *Prometheus) ObserveRPCLatency(d time.Duration) {
+	seconds := d.Seconds()
+	if seconds < 0 {
+		seconds = 0
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rpcLatencySum += seconds
+	p.rpcLatencyCount++
+	start := sort.SearchFloat64s(p.buckets, seconds)
+	for i := start; i < len(p.rpcBuckets); i++ {
+		p.rpcBuckets[i]++
+	}
 }
 
 // Flush implements stream.Sink. Metrics are kept in memory, so there is
@@ -271,6 +329,35 @@ func (p *Prometheus) gather() string {
 	fmt.Fprintf(&b, "# HELP %s Highest ledger sequence emitted.\n", sequence)
 	fmt.Fprintf(&b, "# TYPE %s gauge\n", sequence)
 	fmt.Fprintf(&b, "%s %d\n", sequence, p.lastLedger)
+
+	// The families below are the operational health surface documented for
+	// scraping: throughput, ledger lag, RPC latency and buffered work. They
+	// are always present, including at zero, so a dashboard does not have to
+	// special-case a stream that has not emitted yet.
+	processed := p.namespace + "_events_processed_total"
+	fmt.Fprintf(&b, "# HELP %s Records processed by the event pipeline.\n", processed)
+	fmt.Fprintf(&b, "# TYPE %s counter\n", processed)
+	fmt.Fprintf(&b, "%s %d\n", processed, p.eventsProcessed)
+
+	lag := p.namespace + "_ledger_lag_ledgers"
+	fmt.Fprintf(&b, "# HELP %s Ledgers between the stream position and the chain head.\n", lag)
+	fmt.Fprintf(&b, "# TYPE %s gauge\n", lag)
+	fmt.Fprintf(&b, "%s %d\n", lag, p.ledgerLag)
+
+	rpcLatency := p.namespace + "_rpc_latency_seconds"
+	fmt.Fprintf(&b, "# HELP %s Duration of upstream RPC calls.\n", rpcLatency)
+	fmt.Fprintf(&b, "# TYPE %s histogram\n", rpcLatency)
+	for i, boundary := range p.buckets {
+		fmt.Fprintf(&b, "%s_bucket{le=%q} %d\n", rpcLatency, formatFloat(boundary), p.rpcBuckets[i])
+	}
+	fmt.Fprintf(&b, "%s_bucket{le=\"+Inf\"} %d\n", rpcLatency, p.rpcBuckets[len(p.buckets)])
+	fmt.Fprintf(&b, "%s_sum %s\n", rpcLatency, formatFloat(p.rpcLatencySum))
+	fmt.Fprintf(&b, "%s_count %d\n", rpcLatency, p.rpcLatencyCount)
+
+	queue := p.namespace + "_queue_depth"
+	fmt.Fprintf(&b, "# HELP %s Records buffered but not yet delivered.\n", queue)
+	fmt.Fprintf(&b, "# TYPE %s gauge\n", queue)
+	fmt.Fprintf(&b, "%s %d\n", queue, p.queueDepth)
 
 	return b.String()
 }

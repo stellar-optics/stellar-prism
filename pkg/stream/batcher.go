@@ -90,6 +90,14 @@ func (b *Batcher) Flush() error {
 	return b.asyncErr
 }
 
+// QueueDepth reports how many records are buffered but not yet delivered, so
+// a metrics sink can publish the pipeline's buffered work.
+func (b *Batcher) QueueDepth() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.buf)
+}
+
 // Close flushes any buffered records and stops the timer. It is safe to call
 // more than once.
 func (b *Batcher) Close() error {

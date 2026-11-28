@@ -77,6 +77,9 @@ type streamFlags struct {
 	stats     bool
 	dryRun    bool
 	statsBar  bool
+	// statusBar shows the ANSI footer while following on a terminal. It is on
+	// by default and turns itself off when stdout is redirected.
+	statusBar bool
 	process   func([]stream.Record) ([]stream.Record, error)
 	filter    stream.RecordFilter
 
@@ -138,7 +141,10 @@ type streamFlags struct {
 
 	// dlqFile is the optional dead letter queue. When set, records that fail
 	// validation or delivery are written there instead of stopping the run.
-	dlqFile          string
+	dlqFile string
+	// dlqDir writes one JSON file per failed record instead of appending to a
+	// shared queue file, so each failure can be inspected and replayed alone.
+	dlqDir           string
 	maxRecordRetries int
 
 	// stateKey identifies this stream inside the cursor metadata file. Two
@@ -233,8 +239,10 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"print a run summary on exit: records processed, duplicates dropped, retries and elapsed time")
 	cmd.Flags().BoolVar(&s.dryRun, "dry-run", false,
 		"validate filters and report matches without writing to configured sinks")
+	cmd.Flags().BoolVar(&s.statusBar, "status-bar", true,
+		"show a live ANSI status bar with ledger, event and lag counters (default on a terminal; disabled when stdout is not a terminal)")
 	cmd.Flags().BoolVar(&s.statsBar, "stats-bar", false,
-		"show live ledger timing and ingest statistics on stderr (with --follow and a terminal stdout)")
+		"deprecated alias for --status-bar (with --follow and a terminal stdout)")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
 		"append records to this file instead of stdout")
 	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
@@ -285,6 +293,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how long a shutdown may take to flush records and commit the final cursor")
 	cmd.Flags().StringVar(&s.dlqFile, "dlq-file", "",
 		"append malformed or undeliverable records to this file as NDJSON instead of stopping the stream")
+	cmd.Flags().StringVar(&s.dlqDir, "dlq-dir", "",
+		"write each malformed or undeliverable record to its own <timestamp>_<id>.json file in this directory, retrying transient failures with exponential backoff")
 	cmd.Flags().IntVar(&s.maxRecordRetries, "max-record-retries", 0,
 		"retry a failed record this many times before writing it to the dead-letter queue")
 	cmd.Flags().StringSliceVar(&s.kafkaBrokers, "kafka-brokers", nil,
@@ -370,6 +380,20 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
 		return fmt.Errorf("--dlq-file must differ from --output-file")
 	}
+	if s.sinks.fileRotatePath != "" {
+		if s.output != "" && samePath(s.sinks.fileRotatePath, s.output) {
+			return fmt.Errorf("--sink-file-rotate must differ from --output-file")
+		}
+		if s.dlqFile != "" && samePath(s.sinks.fileRotatePath, s.dlqFile) {
+			return fmt.Errorf("--sink-file-rotate must differ from --dlq-file")
+		}
+	}
+	if s.dlqFile != "" && s.dlqDir != "" {
+		return fmt.Errorf("--dlq-file and --dlq-dir are mutually exclusive")
+	}
+	if s.dlqDir != "" && s.output != "" && samePath(s.dlqDir, s.output) {
+		return fmt.Errorf("--dlq-dir must differ from --output-file")
+	}
 	if s.sinks.auditFile != "" {
 		if s.output != "" && samePath(s.sinks.auditFile, s.output) {
 			return fmt.Errorf("--sink-audit must differ from --output-file")
@@ -381,8 +405,8 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	if s.maxRecordRetries < 0 {
 		return fmt.Errorf("--max-record-retries must not be negative")
 	}
-	if s.maxRecordRetries > 0 && s.dlqFile == "" {
-		return fmt.Errorf("--max-record-retries requires --dlq-file")
+	if s.maxRecordRetries > 0 && s.dlqFile == "" && s.dlqDir == "" {
+		return fmt.Errorf("--max-record-retries requires --dlq-file or --dlq-dir")
 	}
 	if s.dedupWindow < 0 {
 		return fmt.Errorf("--dedup-window must not be negative")
@@ -639,20 +663,39 @@ func (s *streamFlags) newSink(
 	}
 
 	var dlq *sink.DLQ
-	if s.dlqFile != "" {
-		file, err := os.OpenFile(s.dlqFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			closeSink(out)
-			return nil, fmt.Errorf("opening dead letter queue: %w", err)
+	if s.dlqFile != "" || s.dlqDir != "" {
+		var writer io.Writer
+		var closeWriter bool
+		if s.dlqFile != "" {
+			file, err := os.OpenFile(s.dlqFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if err != nil {
+				closeSink(out)
+				return nil, fmt.Errorf("opening dead letter queue: %w", err)
+			}
+			writer, closeWriter = file, true
 		}
 
-		dlq, err = sink.NewDLQ(out, file, sink.DLQOptions{
+		opts := sink.DLQOptions{
 			MaxRecordRetries: s.maxRecordRetries,
-			CloseWriter:      true,
+			CloseWriter:      closeWriter,
 			OnDeadLetter:     onDeadLetter,
-		})
+			Directory:        s.dlqDir,
+		}
+		if s.dlqDir != "" {
+			// A per-record queue is meant to survive transient outages, so it
+			// retries by default even when --max-record-retries was not given.
+			if opts.MaxRecordRetries == 0 {
+				opts.MaxRecordRetries = sink.DefaultDLQRetries
+			}
+			opts.RetryBackoff = 100 * time.Millisecond
+			opts.MaxRetryBackoff = 5 * time.Second
+		}
+
+		dlq, err = sink.NewDLQ(out, writer, opts)
 		if err != nil {
-			_ = file.Close()
+			if closer, ok := writer.(io.Closer); ok {
+				_ = closer.Close()
+			}
 			closeSink(out)
 			return nil, err
 		}
@@ -731,6 +774,15 @@ type closingSink struct {
 
 // Close runs the teardown registered by the code that built the chain.
 func (c *closingSink) Close() error { return c.closeFn() }
+
+// QueueDepth forwards the buffered-record count of the wrapped sink, so a
+// metrics collector outside the chain can still report the batch backlog.
+func (c *closingSink) QueueDepth() int {
+	if reporter, ok := c.Sink.(interface{ QueueDepth() int }); ok {
+		return reporter.QueueDepth()
+	}
+	return 0
+}
 
 // closeSink releases a sink that was built before a later construction step
 // failed, so a validation error cannot leak an open file.
@@ -1241,6 +1293,15 @@ func runStream(
 		from = target.Ledger
 	}
 
+	if g.metricsPort < 0 || g.metricsPort > 65535 {
+		return fmt.Errorf("--metrics-port must be between 0 and 65535")
+	}
+	if g.metricsPort > 0 && sf.sinks.metricsAddr == "" {
+		// --metrics-addr is the more specific flag, so it wins if both are
+		// given; --metrics-port exists for the common case.
+		sf.sinks.metricsAddr = fmt.Sprintf(":%d", g.metricsPort)
+	}
+
 	var out stream.Sink
 	if sf.aggregate {
 		// Aggregation replaces per-event output with periodic window
@@ -1270,8 +1331,19 @@ func runStream(
 		}
 		out = specOut
 	}
-	if sf.statsBar {
-		out = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: isTerminalWriter(stdout)})
+	var queueReporter interface{ QueueDepth() int }
+	if reporter, ok := out.(interface{ QueueDepth() int }); ok {
+		queueReporter = reporter
+	}
+	var statusBar *sink.StatusBar
+	statusBarEnabled := sf.statusBar
+	if cmd.Flags().Changed("stats-bar") {
+		// --stats-bar predates --status-bar; an explicit value still wins.
+		statusBarEnabled = sf.statsBar
+	}
+	if statusBarEnabled && sf.follow && !sf.quiet && isTerminalWriter(stdout) {
+		statusBar = sink.NewStatusBar(out, stderr, sink.StatusBarOptions{Enabled: true})
+		out = statusBar
 	}
 	if sf.sinks.metrics != nil {
 		if addr := sf.sinks.metrics.Addr(); addr != "" {
@@ -1403,6 +1475,29 @@ func runStream(
 		opts.OnProgress = func(progress stream.Progress) {
 			health.RecordProgress(progress)
 		}
+	}
+
+	// The metrics sink and the status bar both live on the poll cycle: a scrape
+	// or a footer refresh must show the lag of the newest poll even when that
+	// poll emitted nothing.
+	metrics := sf.sinks.metrics
+	onProgress := opts.OnProgress
+	opts.OnProgress = func(progress stream.Progress) {
+		if onProgress != nil {
+			onProgress(progress)
+		}
+		if statusBar != nil {
+			statusBar.Update(progress)
+		}
+		if metrics != nil {
+			metrics.SetLedgerLag(int64(progress.Lag()))
+			if queueReporter != nil {
+				metrics.SetQueueDepth(int64(queueReporter.QueueDepth()))
+			}
+		}
+	}
+	if metrics != nil {
+		opts.OnFetchLatency = metrics.ObserveRPCLatency
 	}
 
 	// The lease makes this instance the leader or a standby. Only the leader

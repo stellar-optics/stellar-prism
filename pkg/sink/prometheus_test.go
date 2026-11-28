@@ -257,3 +257,49 @@ func TestPrometheusValidation(t *testing.T) {
 		t.Errorf("Close() error = %v", err)
 	}
 }
+
+func TestPrometheusOperationalMetricFamilies(t *testing.T) {
+	t.Parallel()
+
+	p, err := sink.NewPrometheus(sink.PrometheusOptions{})
+	if err != nil {
+		t.Fatalf("NewPrometheus() error = %v", err)
+	}
+
+	if err := p.Emit(eventRecord()); err != nil {
+		t.Fatalf("Emit() error = %v", err)
+	}
+	if err := p.EmitBatch([]stream.Record{ledgerRecord()}); err != nil {
+		t.Fatalf("EmitBatch() error = %v", err)
+	}
+	p.SetLedgerLag(7)
+	p.ObserveRPCLatency(150 * time.Millisecond)
+	p.SetQueueDepth(3)
+
+	body := gatherMetrics(t, p)
+	for _, want := range []string{
+		"prism_events_processed_total 2",
+		"prism_ledger_lag_ledgers 7",
+		`prism_rpc_latency_seconds_bucket{le="0.1"} 0`,
+		`prism_rpc_latency_seconds_bucket{le="0.25"} 1`,
+		`prism_rpc_latency_seconds_bucket{le="+Inf"} 1`,
+		"prism_rpc_latency_seconds_sum 0.15",
+		"prism_rpc_latency_seconds_count 1",
+		"prism_queue_depth 3",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body does not contain %q:\n%s", want, body)
+		}
+	}
+
+	// Gauges clamp at zero rather than exporting an impossible negative lag
+	// or queue depth.
+	p.SetLedgerLag(-4)
+	p.SetQueueDepth(-1)
+	body = gatherMetrics(t, p)
+	for _, want := range []string{"prism_ledger_lag_ledgers 0", "prism_queue_depth 0"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body does not contain %q:\n%s", want, body)
+		}
+	}
+}
