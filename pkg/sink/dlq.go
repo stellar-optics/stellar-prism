@@ -7,11 +7,19 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
+
+// DefaultDLQRetries is how many times a failed delivery is retried before the
+// record is quarantined when --dlq-dir is used without an explicit retry
+// count.
+const DefaultDLQRetries = 3
 
 // Stage names recorded on a dead letter, saying where the record failed.
 const (
@@ -35,11 +43,14 @@ const DLQKind = "dlq"
 // replayed by decoding Record and handing it back to a sink. Record is nil
 // only for a flush failure, which is not about one record.
 type DLQEntry struct {
-	Kind     string         `json:"kind"`
-	FailedAt string         `json:"failedAt,omitempty"`
-	Stage    string         `json:"stage"`
-	Error    string         `json:"error"`
-	Record   *stream.Record `json:"record,omitempty"`
+	Kind     string `json:"kind"`
+	FailedAt string `json:"failedAt,omitempty"`
+	Stage    string `json:"stage"`
+	Error    string `json:"error"`
+	// Stack is the goroutine stack at the moment the record failed, kept so a
+	// quarantined record explains where in prism it was abandoned.
+	Stack  string         `json:"stack,omitempty"`
+	Record *stream.Record `json:"record,omitempty"`
 }
 
 // DLQOptions configures a DLQ.
@@ -47,6 +58,17 @@ type DLQOptions struct {
 	// MaxRecordRetries retries a failed delivery before quarantining it. Zero
 	// preserves the immediate-quarantine behaviour.
 	MaxRecordRetries int
+	// RetryBackoff is the wait before the first retry. Each further retry
+	// doubles it, up to MaxRetryBackoff. Zero retries immediately.
+	RetryBackoff time.Duration
+	// MaxRetryBackoff caps the exponential backoff. Zero leaves it
+	// uncapped.
+	MaxRetryBackoff time.Duration
+	// Directory, when set, writes each dead letter to its own file in this
+	// directory, named <timestamp>_<record id>.json, instead of appending to
+	// the shared writer. A directory makes a single poison record easy to
+	// inspect, replay or hand off; out may then be nil.
+	Directory string
 	// Now supplies the FailedAt timestamp. Tests inject a fixed clock; nil
 	// means time.Now.
 	Now func() time.Time
@@ -92,8 +114,10 @@ type DLQ struct {
 	writer  *bufio.Writer
 	enc     *json.Encoder
 	closer  io.Closer
+	dir     string
 	opts    DLQOptions
 	now     func() time.Time
+	sleep   func(time.Duration)
 
 	mu     sync.Mutex
 	stats  DLQStats
@@ -109,8 +133,8 @@ func NewDLQ(primary stream.Sink, out io.Writer, opts DLQOptions) (*DLQ, error) {
 	if primary == nil {
 		return nil, fmt.Errorf("dlq: primary sink is required")
 	}
-	if out == nil {
-		return nil, fmt.Errorf("dlq: output writer is required")
+	if out == nil && opts.Directory == "" {
+		return nil, fmt.Errorf("dlq: output writer or directory is required")
 	}
 
 	now := opts.Now
@@ -118,20 +142,29 @@ func NewDLQ(primary stream.Sink, out io.Writer, opts DLQOptions) (*DLQ, error) {
 		now = time.Now
 	}
 
-	bw := bufio.NewWriter(out)
-	enc := json.NewEncoder(bw)
-	enc.SetEscapeHTML(false)
-
 	d := &DLQ{
 		primary: primary,
-		writer:  bw,
-		enc:     enc,
+		dir:     opts.Directory,
 		opts:    opts,
 		now:     now,
+		sleep:   time.Sleep,
 	}
-	if opts.CloseWriter {
-		if closer, ok := out.(io.Closer); ok {
-			d.closer = closer
+
+	if out != nil {
+		bw := bufio.NewWriter(out)
+		enc := json.NewEncoder(bw)
+		enc.SetEscapeHTML(false)
+		d.writer = bw
+		d.enc = enc
+		if opts.CloseWriter {
+			if closer, ok := out.(io.Closer); ok {
+				d.closer = closer
+			}
+		}
+	}
+	if opts.Directory != "" {
+		if err := os.MkdirAll(opts.Directory, 0o755); err != nil {
+			return nil, fmt.Errorf("dlq: creating directory %s: %w", opts.Directory, err)
 		}
 	}
 	return d, nil
@@ -216,18 +249,42 @@ func (d *DLQ) emitLocked(r stream.Record) error {
 	}
 
 	var err error
-	for attempt := 0; attempt <= d.opts.MaxRecordRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		err = d.primary.Emit(r)
 		if err == nil {
 			d.stats.Delivered++
 			return nil
 		}
+		if attempt >= d.opts.MaxRecordRetries {
+			break
+		}
+		// The retry loop holds the lock: an in-flight record must not be
+		// reordered against the records behind it in the queue.
+		if delay := d.retryDelay(attempt); delay > 0 {
+			d.sleep(delay)
+		}
 	}
-	if err != nil {
-		d.stats.Failed++
-		return d.recordLocked(r, DLQStageDelivery, err)
+	d.stats.Failed++
+	return d.recordLocked(r, DLQStageDelivery, err)
+}
+
+// retryDelay is the exponential backoff before retry attempt number attempt
+// (zero-based): RetryBackoff, then double it, capped by MaxRetryBackoff.
+func (d *DLQ) retryDelay(attempt int) time.Duration {
+	delay := d.opts.RetryBackoff
+	if delay <= 0 {
+		return 0
 	}
-	return nil
+	for i := 0; i < attempt; i++ {
+		if d.opts.MaxRetryBackoff > 0 && delay >= d.opts.MaxRetryBackoff/2 {
+			return d.opts.MaxRetryBackoff
+		}
+		delay *= 2
+	}
+	if d.opts.MaxRetryBackoff > 0 && delay > d.opts.MaxRetryBackoff {
+		return d.opts.MaxRetryBackoff
+	}
+	return delay
 }
 
 // recordLocked writes one dead letter and reports only a failure to write it.
@@ -237,7 +294,11 @@ func (d *DLQ) recordLocked(r stream.Record, stage string, cause error) error {
 		FailedAt: d.now().UTC().Format(time.RFC3339Nano),
 		Stage:    stage,
 		Error:    cause.Error(),
+		Stack:    string(debug.Stack()),
 		Record:   &r,
+	}
+	if d.dir != "" {
+		return d.writeDirLocked(entry)
 	}
 	if err := d.enc.Encode(entry); err != nil {
 		return fmt.Errorf("dlq: writing %s entry for record %s: %w", stage, r.ID, err)
@@ -250,6 +311,56 @@ func (d *DLQ) recordLocked(r stream.Record, stage string, cause error) error {
 	}
 	d.notifyLocked(entry)
 	return nil
+}
+
+// writeDirLocked stores one dead letter as <timestamp>_<id>.json so an
+// operator can list, inspect and replay failures file by file.
+func (d *DLQ) writeDirLocked(entry DLQEntry) error {
+	data, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return fmt.Errorf("dlq: encoding %s entry: %w", entry.Stage, err)
+	}
+	data = append(data, '\n')
+
+	id := "flush"
+	if entry.Record != nil && entry.Record.ID != "" {
+		id = entry.Record.ID
+	}
+	stamp := d.now().UTC().Format("20060102T150405.000000000Z")
+	base := fmt.Sprintf("%s_%s", stamp, safeDLQName(id))
+
+	path := filepath.Join(d.dir, base+".json")
+	for i := 1; ; i++ {
+		if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+			break
+		}
+		path = filepath.Join(d.dir, fmt.Sprintf("%s.%d.json", base, i))
+	}
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("dlq: writing %s entry for record %s: %w", entry.Stage, id, err)
+	}
+	d.notifyLocked(entry)
+	return nil
+}
+
+// safeDLQName keeps a record ID usable as one path component: record IDs are
+// opaque source strings and must not be able to escape the queue directory.
+func safeDLQName(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	name := strings.Trim(b.String(), ".")
+	if name == "" {
+		return "record"
+	}
+	return name
 }
 
 func (d *DLQ) notifyLocked(entry DLQEntry) {
@@ -280,8 +391,10 @@ func (d *DLQ) flushLocked() error {
 
 	// Flush failures captured by earlier emits first, so the queue order
 	// matches the order in which the failures happened.
-	if err := d.writer.Flush(); err != nil {
-		errs = append(errs, fmt.Errorf("dlq: flushing dead letters: %w", err))
+	if d.writer != nil {
+		if err := d.writer.Flush(); err != nil {
+			errs = append(errs, fmt.Errorf("dlq: flushing dead letters: %w", err))
+		}
 	}
 
 	if err := d.primary.Flush(); err != nil {
@@ -292,8 +405,10 @@ func (d *DLQ) flushLocked() error {
 	}
 
 	// Flush the flush entry, if one was just written.
-	if err := d.writer.Flush(); err != nil {
-		errs = append(errs, fmt.Errorf("dlq: flushing dead letters: %w", err))
+	if d.writer != nil {
+		if err := d.writer.Flush(); err != nil {
+			errs = append(errs, fmt.Errorf("dlq: flushing dead letters: %w", err))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -304,6 +419,10 @@ func (d *DLQ) writeFlushEntryLocked(cause error) error {
 		FailedAt: d.now().UTC().Format(time.RFC3339Nano),
 		Stage:    DLQStageFlush,
 		Error:    cause.Error(),
+		Stack:    string(debug.Stack()),
+	}
+	if d.dir != "" {
+		return d.writeDirLocked(entry)
 	}
 	if err := d.enc.Encode(entry); err != nil {
 		return fmt.Errorf("dlq: writing flush entry: %w", err)
