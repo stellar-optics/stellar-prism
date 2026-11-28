@@ -2,8 +2,11 @@ package prismtest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sort"
 	"strconv"
 	"sync"
@@ -522,6 +525,21 @@ func (m *MockRPC) GetTransactions(ctx context.Context, req protocol.GetTransacti
 	return respond(out), nil
 }
 
+// SetLedgers installs the full ordered universe of ledgers.
+func (m *MockRPC) SetLedgers(ledgers []protocol.LedgerInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ledgers = append([]protocol.LedgerInfo(nil), ledgers...)
+	if len(ledgers) > 0 {
+		if m.oldest == 0 {
+			m.oldest = ledgers[0].Sequence
+		}
+		if m.latest == 0 {
+			m.latest = ledgers[len(ledgers)-1].Sequence
+		}
+	}
+}
+
 // SetTransaction installs a canned response for GetTransaction.
 func (m *MockRPC) SetTransaction(hash string, resp protocol.GetTransactionResponse) {
 	m.mu.Lock()
@@ -748,4 +766,162 @@ func WithLatestLedger(latest uint32) func(*Behaviour) {
 	return func(b *Behaviour) {
 		b.LatestLedger = latest
 	}
+}
+
+// MockServer is a lightweight HTTP mock Soroban RPC server testkit.
+type MockServer struct {
+	*MockRPC
+	Server *httptest.Server
+	URL    string
+
+	simMu     sync.Mutex
+	simStatus int
+	simCount  int
+}
+
+type jsonrpcRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type jsonrpcResponse struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      any    `json:"id"`
+	Result  any    `json:"result,omitempty"`
+	Error   any    `json:"error,omitempty"`
+}
+
+// NewServer starts an HTTP mock server backed by m.
+func (m *MockRPC) NewServer() *MockServer {
+	return NewMockServer(m)
+}
+
+// NewMockServer starts an HTTP mock server backed by m.
+func NewMockServer(m *MockRPC) *MockServer {
+	s := &MockServer{
+		MockRPC: m,
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.simMu.Lock()
+		if s.simCount > 0 && s.simStatus > 0 {
+			s.simCount--
+			status := s.simStatus
+			s.simMu.Unlock()
+			http.Error(w, fmt.Sprintf("simulated HTTP error %d", status), status)
+			return
+		}
+		s.simMu.Unlock()
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req jsonrpcRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		ctx := r.Context()
+
+		var (
+			result any
+			rpcErr error
+		)
+
+		switch req.Method {
+		case "getEvents":
+			var p protocol.GetEventsRequest
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetEvents(ctx, p)
+			}
+		case "getTransaction":
+			var p protocol.GetTransactionRequest
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetTransaction(ctx, p)
+			}
+		case "getTransactions":
+			var p protocol.GetTransactionsRequest
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetTransactions(ctx, p)
+			}
+		case "getLedgers":
+			var p protocol.GetLedgersRequest
+			if rpcErr = decodeParams(req.Params, &p); rpcErr == nil {
+				result, rpcErr = s.GetLedgers(ctx, p)
+			}
+		case "getHealth":
+			result, rpcErr = s.Health(ctx)
+		case "getLatestLedger":
+			result, rpcErr = s.GetLatestLedger(ctx)
+		case "getNetwork":
+			result = protocol.GetNetworkResponse{
+				Passphrase: "Test SDF Network ; September 2015",
+			}
+		default:
+			rpcErr = fmt.Errorf("method %q not implemented", req.Method)
+		}
+
+		resp := jsonrpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+		}
+		if rpcErr != nil {
+			resp.Error = map[string]any{
+				"code":    -32603,
+				"message": rpcErr.Error(),
+			}
+		} else {
+			resp.Result = result
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
+
+	s.Server = httptest.NewServer(handler)
+	s.URL = s.Server.URL
+	return s
+}
+
+// Simulate500 simulates an HTTP 500 error for the next n calls.
+func (s *MockServer) Simulate500(count int) {
+	s.SimulateStatus(http.StatusInternalServerError, count)
+}
+
+// SimulateRateLimit simulates an HTTP 429 rate limit for the next n calls.
+func (s *MockServer) SimulateRateLimit(count int) {
+	s.SimulateStatus(http.StatusTooManyRequests, count)
+}
+
+// SimulateStatus sets the HTTP status code for the next n calls.
+func (s *MockServer) SimulateStatus(statusCode, count int) {
+	s.simMu.Lock()
+	defer s.simMu.Unlock()
+	s.simStatus = statusCode
+	s.simCount = count
+}
+
+// Close closes the test HTTP server.
+func (s *MockServer) Close() {
+	if s.Server != nil {
+		s.Server.Close()
+	}
+}
+
+// decodeParams unmarshals JSON-RPC params into dst. Absent params leave dst at
+// its zero value.
+func decodeParams(params json.RawMessage, dst any) error {
+	if len(params) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(params, dst); err != nil {
+		return fmt.Errorf("invalid params: %w", err)
+	}
+	return nil
 }

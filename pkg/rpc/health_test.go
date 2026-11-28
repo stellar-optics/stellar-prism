@@ -559,3 +559,36 @@ func TestHealthCheckerFutureCloseTimeClampsLatency(t *testing.T) {
 		t.Errorf("LedgerLatency = %s, want 0 for a future close time", report.LedgerLatency)
 	}
 }
+
+func TestCheckHealth(t *testing.T) {
+	t.Parallel()
+
+	healthyClient := healthFunc(func(context.Context) (protocol.GetHealthResponse, error) {
+		return healthyResponse(time.Now(), 2*time.Second), nil
+	})
+
+	status, err := rpc.CheckHealth(context.Background(), healthyClient)
+	if err != nil {
+		t.Fatalf("CheckHealth() unexpected error = %v", err)
+	}
+	if !status.Healthy {
+		t.Error("status.Healthy = false, want true")
+	}
+	if status.Status != rpc.HealthStatusHealthy {
+		t.Errorf("status.Status = %q, want %q", status.Status, rpc.HealthStatusHealthy)
+	}
+
+	unhealthyClient := healthFunc(func(context.Context) (protocol.GetHealthResponse, error) {
+		return protocol.GetHealthResponse{
+			Status: rpc.HealthStatusUnhealthy,
+		}, nil
+	})
+
+	status, err = rpc.CheckHealth(context.Background(), unhealthyClient)
+	if err == nil {
+		t.Fatal("CheckHealth() on unhealthy expected error, got nil")
+	}
+	if status == nil || status.Healthy {
+		t.Errorf("CheckHealth() status = %v, want unhealthy status", status)
+	}
+}
