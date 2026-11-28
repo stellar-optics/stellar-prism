@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
 )
@@ -43,15 +44,45 @@ func TestOperationsCommandNDJSON(t *testing.T) {
 
 func TestSimulateCommandNDJSON(t *testing.T) {
 	srv := fakerpc.NewLedgerServer(fakerpc.MakeLedgers(9950, 1))
-	srv.SetSimulations([]protocol.SimulateTransactionResponse{{MinResourceFee: 17}})
+	account := xdr.MustAddress("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+	key, err := xdr.NewLedgerKey(xdr.LedgerEntryTypeAccount, xdr.LedgerKeyAccount{AccountId: account})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataXDR, err := xdr.MarshalBase64(xdr.SorobanTransactionData{
+		Resources: xdr.SorobanResources{
+			Instructions: 42, DiskReadBytes: 10, WriteBytes: 3,
+			Footprint: xdr.LedgerFootprint{ReadOnly: []xdr.LedgerKey{key}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetSimulations([]protocol.SimulateTransactionResponse{{
+		TransactionDataXDR: dataXDR,
+		MinResourceFee:     17,
+		Error:              "HostError: contract error 42",
+		Results: []protocol.SimulateHostFunctionResult{{
+			ReturnValueJSON: json.RawMessage(`{"value":4}`),
+			AuthJSON:        []json.RawMessage{json.RawMessage(`{"credential":"required"}`)},
+		}},
+		EventsJSON: []json.RawMessage{json.RawMessage(`{"type":"contract"}`)},
+	}})
 	withFake(t, srv)
 
-	stdout, _, err := run(t, "simulate", "--tx-envelope", "AAA=", "--json")
+	stdout, _, err := run(t, "simulate", "--envelope", "AAA=", "--json")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !strings.Contains(stdout, `"kind":"simulation"`) || !strings.Contains(stdout, `"minResourceFee":17`) {
-		t.Errorf("simulation output = %s", stdout)
+	for _, expected := range []string{
+		`"kind":"simulation"`, `"minResourceFee":17`, `"instructions":42`,
+		`"error":"HostError: contract error 42"`, `"returnValue":{"value":4}`,
+		`"auth":[{"credential":"required"}]`, `"events":[{"type":"contract"}]`,
+		`"readOnlyFootprint":[`,
+	} {
+		if !strings.Contains(stdout, expected) {
+			t.Errorf("simulation output missing %s:\n%s", expected, stdout)
+		}
 	}
 }
 

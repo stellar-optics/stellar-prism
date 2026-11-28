@@ -52,11 +52,14 @@ func filterPart(name string, values []string) string {
 }
 
 // eventsStateKey identifies an event stream by its filters.
-func eventsStateKey(contractIDs, topics, eventTypes []string) string {
-	return stateKey("events",
+func eventsStateKey(contractIDs, topics, eventTypes []string, extraFilters ...string) string {
+	parts := []string{
 		filterPart("contract", contractIDs),
 		filterPart("topic", topics),
-		filterPart("type", eventTypes))
+		filterPart("type", eventTypes),
+	}
+	parts = append(parts, extraFilters...)
+	return stateKey(append([]string{"events"}, parts...)...)
 }
 
 // openCursorState prepares the cursor metadata file, if one was requested,
@@ -83,6 +86,11 @@ func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io
 	if sf.stateFile == "" || !isJournalState(sf) {
 		return nil, nil
 	}
+	if sf.state.streamID != "" {
+		// An explicit --stream-id names the stream in the journal too, so
+		// processes sharing one journal keep their checkpoints apart.
+		key = sf.state.streamID
+	}
 
 	source, err := stateKeySource(sf)
 	if err != nil {
@@ -97,7 +105,7 @@ func openCursorState(ctx context.Context, sf *streamFlags, key string, stderr io
 		}
 		store = encrypted
 	} else {
-		plain, err := stream.NewFileMetadataStore(sf.stateFile)
+		plain, err := stream.NewSharedFileMetadataStore(sf.stateFile)
 		if err != nil {
 			return nil, err
 		}

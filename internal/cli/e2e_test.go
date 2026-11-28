@@ -33,8 +33,77 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 
+	"github.com/stellar-optics/stellar-prism/pkg/prismtest"
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 )
+
+var (
+	e2eMockOnce   sync.Once
+	e2eMockServer *prismtest.MockServer
+	e2eMockHash   string
+	e2eMockLedger uint32
+)
+
+func getE2EMock() (*prismtest.MockServer, string, uint32) {
+	e2eMockOnce.Do(func() {
+		mock := prismtest.NewMockRPC()
+		e2eMockLedger = 100
+		e2eMockHash = "3389e9f05928d1578328221b3394a1d6365b938096f300184e930f3a61c3b171"
+
+		envXDR := ""
+		resXDR := ""
+		if b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "tx_failed.env.txt")); err == nil {
+			envXDR = strings.TrimSpace(string(b))
+		}
+		if b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "tx_failed.res.txt")); err == nil {
+			resXDR = strings.TrimSpace(string(b))
+		}
+
+		// Universe of ledgers
+		mock.SetLedgers(prismtest.MakeLedgers(90, 30))
+
+		// Universe of events
+		for _, ev := range prismtest.MakeEvents(90, 30) {
+			mock.AddEvent(ev)
+		}
+
+		// Transaction info
+		mock.SetTransactions(protocol.GetTransactionsResponse{
+			Transactions: []protocol.TransactionInfo{
+				{
+					TransactionDetails: protocol.TransactionDetails{
+						TransactionHash:  e2eMockHash,
+						Status:           protocol.TransactionStatusSuccess,
+						Ledger:           e2eMockLedger,
+						CreatedAt:        1700000100,
+						ApplicationOrder: 1,
+						EnvelopeXDR:      envXDR,
+						ResultXDR:        resXDR,
+					},
+				},
+			},
+			LatestLedger: 120,
+			OldestLedger: 90,
+		})
+
+		mock.SetTransaction(e2eMockHash, protocol.GetTransactionResponse{
+			TransactionDetails: protocol.TransactionDetails{
+				TransactionHash:  e2eMockHash,
+				Status:           protocol.TransactionStatusSuccess,
+				Ledger:           e2eMockLedger,
+				CreatedAt:        1700000100,
+				ApplicationOrder: 1,
+				EnvelopeXDR:      envXDR,
+				ResultXDR:        resXDR,
+			},
+			LatestLedger: 120,
+			OldestLedger: 90,
+		})
+
+		e2eMockServer = prismtest.NewMockServer(mock)
+	})
+	return e2eMockServer, e2eMockHash, e2eMockLedger
+}
 
 const (
 	// e2eEnableEnv gates the whole suite. Without it nothing touches the
@@ -110,12 +179,13 @@ func e2eFriendbotURL() string {
 	return defaultE2EFriendbotURL
 }
 
-// requireNetwork skips a test unless the suite is enabled, and returns the
-// endpoint to use.
+// requireNetwork returns the endpoint to use for tests.
+// When PRISM_E2E is unset, it returns a 100% offline deterministic mock RPC server.
 func requireNetwork(t *testing.T) string {
 	t.Helper()
 	if os.Getenv(e2eEnableEnv) == "" {
-		t.Skipf("set %s=1 to run the end-to-end suite; it needs Docker or a local network", e2eEnableEnv)
+		srv, _, _ := getE2EMock()
+		return srv.URL
 	}
 	return e2eRPCURL()
 }
@@ -180,6 +250,10 @@ func waitForNetwork(rpcURL string, timeout time.Duration) error {
 // real traffic every test builds on.
 func fundAccount(t *testing.T, rpcURL string) (hash string, ledger uint32) {
 	t.Helper()
+	if os.Getenv(e2eEnableEnv) == "" {
+		_, hash, ledger := getE2EMock()
+		return hash, ledger
+	}
 
 	kp, err := keypair.Random()
 	if err != nil {
@@ -490,6 +564,9 @@ func TestE2EFollowStopsCleanlyOnCancel(t *testing.T) {
 // getTransaction only reports a success or failure once its ledger closed.
 func waitForTransaction(t *testing.T, rpcURL, hash string) {
 	t.Helper()
+	if os.Getenv(e2eEnableEnv) == "" {
+		return
+	}
 
 	client := rpc.New(rpcURL, 30*time.Second)
 	defer closeClient(client, io.Discard)
@@ -526,4 +603,50 @@ func waitForGoroutines(t *testing.T, want int) {
 	n := runtime.Stack(buf, true)
 	t.Errorf("goroutines still running after the stream stopped: %d, want <= %d\n%s",
 		got, want, buf[:n])
+}
+
+// TestE2EMockEdgeCases verifies edge-case RPC network failures cleanly:
+// HTTP 500 error, HTTP 429 rate limit, and retention gaps.
+func TestE2EMockEdgeCases(t *testing.T) {
+	mock := prismtest.NewMockRPC()
+	mock.SetLedgers(prismtest.MakeLedgers(90, 20))
+	server := prismtest.NewMockServer(mock)
+	defer server.Close()
+
+	client := rpc.New(server.URL, 5*time.Second)
+
+	// 1. Simulate 500 error
+	server.Simulate500(1)
+	_, err := client.GetLatestLedger(context.Background())
+	if err == nil {
+		t.Error("expected error on simulated 500 error")
+	}
+
+	// 2. Normal call succeeds
+	resp, err := client.GetLatestLedger(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error after 500 recovery: %v", err)
+	}
+	if resp.Sequence == 0 {
+		t.Error("expected non-zero sequence")
+	}
+
+	// 3. Simulate rate limit (429)
+	server.SimulateRateLimit(1)
+	_, err = client.GetLatestLedger(context.Background())
+	if err == nil {
+		t.Error("expected error on simulated rate limit 429")
+	}
+
+	// 4. Simulate gap
+	mock.SimulateGap(10, 50)
+	eventsResp, err := client.GetEvents(context.Background(), protocol.GetEventsRequest{
+		StartLedger: 10,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on getEvents: %v", err)
+	}
+	if eventsResp.OldestLedger != 50 {
+		t.Errorf("expected oldest ledger 50 after gap simulation, got %d", eventsResp.OldestLedger)
+	}
 }

@@ -74,6 +74,10 @@ type AMQP struct {
 	routingKey string
 	decode     bool
 	timeout    time.Duration
+	// dynamicKey routes each record by its own contract and event type
+	// instead of a fixed key. It is used whenever an exchange is configured
+	// without an explicit routing key.
+	dynamicKey bool
 }
 
 // AMQP never buffers, so it satisfies both sink interfaces.
@@ -91,8 +95,15 @@ func NewAMQP(cfg AMQPConfig, publisher AMQPPublisher) (*AMQP, error) {
 		return nil, fmt.Errorf("amqp: a queue is required")
 	}
 	routingKey := cfg.RoutingKey
+	dynamicKey := false
 	if routingKey == "" {
-		routingKey = cfg.Queue
+		if strings.TrimSpace(cfg.Exchange) != "" {
+			// An exchange routes by key, so each record gets its own
+			// contract.<id>.<type> key rather than the queue name.
+			dynamicKey = true
+		} else {
+			routingKey = cfg.Queue
+		}
 	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
@@ -104,7 +115,29 @@ func NewAMQP(cfg AMQPConfig, publisher AMQPPublisher) (*AMQP, error) {
 		routingKey: routingKey,
 		decode:     cfg.Decode,
 		timeout:    timeout,
+		dynamicKey: dynamicKey,
 	}, nil
+}
+
+// AMQPEventRoutingKey renders the topic routing key for one record:
+// contract.<contract_id>.<event_type>, e.g.
+// contract.CA…ABC.contract. Records without event metadata fall back to the
+// record kind so the key is never malformed.
+func AMQPEventRoutingKey(r stream.Record) string {
+	contractID := "unknown"
+	eventType := string(r.Kind)
+	if r.Event != nil {
+		if r.Event.ContractID != "" {
+			contractID = r.Event.ContractID
+		}
+		if r.Event.Type != "" {
+			eventType = r.Event.Type
+		}
+	}
+	if eventType == "" {
+		eventType = "unknown"
+	}
+	return "contract." + contractID + "." + eventType
 }
 
 // Emit implements stream.Sink.
@@ -133,16 +166,21 @@ func (a *AMQP) publish(r stream.Record) error {
 	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
 	defer cancel()
 
+	routingKey := a.routingKey
+	if a.dynamicKey {
+		routingKey = AMQPEventRoutingKey(r)
+	}
+
 	msg := AMQPMessage{
 		Exchange:   a.exchange,
-		RoutingKey: a.routingKey,
+		RoutingKey: routingKey,
 		MessageID:  r.ID,
 		Kind:       string(r.Kind),
 		Timestamp:  r.Time,
 		Body:       body,
 	}
 	if err := a.publisher.Publish(ctx, msg); err != nil {
-		return fmt.Errorf("amqp: publishing record %s to %q: %w", r.ID, a.routingKey, err)
+		return fmt.Errorf("amqp: publishing record %s to %q: %w", r.ID, routingKey, err)
 	}
 	return nil
 }
@@ -165,6 +203,12 @@ func (a *AMQP) Close() error {
 type AMQPOptions struct {
 	// Queue is declared durable, so it survives a broker restart. Required.
 	Queue string
+	// Exchange, when set, is declared durable and bound to the queue with
+	// the "#" topic pattern, so every event routing key reaches it.
+	Exchange string
+	// ExchangeKind is the exchange type declared for Exchange. Empty means
+	// "topic".
+	ExchangeKind string
 }
 
 // amqpChannel is the subset of *amqp.Channel the publisher uses. Keeping it
@@ -172,6 +216,8 @@ type AMQPOptions struct {
 // broker, which is where the delivery guarantee actually lives.
 type amqpChannel interface {
 	QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
+	ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) error
+	QueueBind(name, key, exchange string, noWait bool, args amqp.Table) error
 	Confirm(noWait bool) error
 	NotifyPublish(confirm chan amqp.Confirmation) chan amqp.Confirmation
 	PublishWithContext(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) error
@@ -224,51 +270,87 @@ func newAMQPPublisher(url string, opts AMQPOptions, dial func(string) (amqpConne
 		return nil, fmt.Errorf("amqp: a queue is required")
 	}
 
-	conn, err := dial(url)
+	p := &amqpPublisher{url: url, opts: opts, dial: dial}
+	if err := p.connectLocked(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// connectLocked dials the broker, declares the queue and topic exchange, and
+// enables publisher confirms. It is also the reconnect path, so a broker
+// restart is recovered by calling it again. The caller must hold p.mu.
+func (p *amqpPublisher) connectLocked() error {
+	conn, err := p.dial(p.url)
 	if err != nil {
-		return nil, fmt.Errorf("amqp: dialling broker: %w", err)
+		return fmt.Errorf("amqp: dialling broker: %w", err)
 	}
 
 	ch, err := conn.Channel()
 	if err != nil {
 		if closeErr := conn.Close(); closeErr != nil {
-			return nil, errors.Join(fmt.Errorf("amqp: opening channel: %w", err), closeErr)
+			return errors.Join(fmt.Errorf("amqp: opening channel: %w", err), closeErr)
 		}
-		return nil, fmt.Errorf("amqp: opening channel: %w", err)
+		return fmt.Errorf("amqp: opening channel: %w", err)
 	}
 
 	if _, err := ch.QueueDeclare(
-		opts.Queue,
+		p.opts.Queue,
 		true,  // durable
 		false, // autoDelete
 		false, // exclusive
 		false, // noWait
 		nil,
 	); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("amqp: declaring durable queue %q: %w", opts.Queue, err),
+		return errors.Join(
+			fmt.Errorf("amqp: declaring durable queue %q: %w", p.opts.Queue, err),
 			ch.Close(),
 			conn.Close(),
 		)
 	}
 
+	if p.opts.Exchange != "" {
+		kind := p.opts.ExchangeKind
+		if kind == "" {
+			kind = "topic"
+		}
+		if err := ch.ExchangeDeclare(p.opts.Exchange, kind, true, false, false, false, nil); err != nil {
+			return errors.Join(
+				fmt.Errorf("amqp: declaring %s exchange %q: %w", kind, p.opts.Exchange, err),
+				ch.Close(),
+				conn.Close(),
+			)
+		}
+		// "#" matches every event routing key, so the queue receives the
+		// whole stream published to the exchange.
+		if err := ch.QueueBind(p.opts.Queue, "#", p.opts.Exchange, false, nil); err != nil {
+			return errors.Join(
+				fmt.Errorf("amqp: binding queue %q to exchange %q: %w", p.opts.Queue, p.opts.Exchange, err),
+				ch.Close(),
+				conn.Close(),
+			)
+		}
+	}
+
 	if err := ch.Confirm(false); err != nil {
-		return nil, errors.Join(
+		return errors.Join(
 			fmt.Errorf("amqp: enabling publisher confirms: %w", err),
 			ch.Close(),
 			conn.Close(),
 		)
 	}
 
-	return &amqpPublisher{
-		conn:     conn,
-		ch:       ch,
-		confirms: ch.NotifyPublish(make(chan amqp.Confirmation, 1)),
-	}, nil
+	p.conn = conn
+	p.ch = ch
+	p.confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+	return nil
 }
 
 type amqpPublisher struct {
 	mu       sync.Mutex
+	url      string
+	opts     AMQPOptions
+	dial     func(string) (amqpConnection, error)
 	conn     amqpConnection
 	ch       amqpChannel
 	confirms <-chan amqp.Confirmation
@@ -288,6 +370,23 @@ func (p *amqpPublisher) Publish(ctx context.Context, msg AMQPMessage) error {
 		return fmt.Errorf("amqp: publish after close")
 	}
 
+	err := p.publishLocked(ctx, msg)
+	if !errors.Is(err, amqp.ErrClosed) || ctx.Err() != nil {
+		return err
+	}
+
+	// The connection or channel was closed under us, which is what a broker
+	// restart looks like. Reconnect and retry once: the message ID lets a
+	// consumer de-duplicate the redelivery if the first attempt landed.
+	if rerr := p.reconnectLocked(); rerr != nil {
+		return errors.Join(err, rerr)
+	}
+	return p.publishLocked(ctx, msg)
+}
+
+// publishLocked writes one message and waits for its confirmation. The caller
+// must hold p.mu.
+func (p *amqpPublisher) publishLocked(ctx context.Context, msg AMQPMessage) error {
 	publishing := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
@@ -319,6 +418,23 @@ func (p *amqpPublisher) Publish(ctx context.Context, msg AMQPMessage) error {
 	case <-ctx.Done():
 		return fmt.Errorf("amqp: waiting for acknowledgement of message %s: %w", msg.MessageID, ctx.Err())
 	}
+}
+
+// reconnectLocked replaces a dead connection with a fresh one. The caller must
+// hold p.mu.
+func (p *amqpPublisher) reconnectLocked() error {
+	var errs []error
+	if p.ch != nil {
+		errs = append(errs, p.ch.Close())
+	}
+	if p.conn != nil {
+		errs = append(errs, p.conn.Close())
+	}
+	if err := p.connectLocked(); err != nil {
+		errs = append(errs, err)
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 // Close implements AMQPPublisher. It is safe to call more than once.

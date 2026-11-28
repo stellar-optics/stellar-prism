@@ -40,15 +40,34 @@ func (filters FilterSet) Match(record Record) (bool, error) {
 	return true, nil
 }
 
+type blacklistFilter struct {
+	matcher *excludeMatcher
+}
+
+// NewBlacklistFilter compiles contract and topic exclusions as a record filter.
+// Add it after inclusion filters to make blacklists take precedence.
+func NewBlacklistFilter(excludeTopics, excludeContracts []string) (RecordFilter, error) {
+	matcher, err := newExcludeMatcher(excludeTopics, excludeContracts)
+	if err != nil {
+		return nil, err
+	}
+	return blacklistFilter{matcher: matcher}, nil
+}
+
+func (f blacklistFilter) Match(record Record) (bool, error) {
+	return !f.matcher.shouldExclude(record), nil
+}
+
 type expressionFilter struct {
 	source string
 	root   ast.Expr
 }
 
 // CompileExpression parses an expression once, before a stream starts.
-// Supported values are value fields, topics, contract, type, tx, ledger,
-// txIndex, and opIndex. Operators follow Go syntax for arithmetic, comparison,
-// boolean logic, indexing, and parentheses.
+// Supported values are value fields, topics (or topic), contract, type, tx,
+// ledger, txIndex, and opIndex. Operators follow Go syntax for arithmetic,
+// comparison, boolean logic, indexing, and parentheses. contains(container,
+// value) checks strings, lists, and map keys.
 func CompileExpression(source string) (ExpressionFilter, error) {
 	root, err := parser.ParseExpr(source)
 	if err != nil {
@@ -89,7 +108,7 @@ func validateFilterAST(expr ast.Expr) error {
 		}
 	case *ast.Ident:
 		switch n.Name {
-		case "true", "false", "value", "topics", "contract", "type", "tx", "ledger", "txIndex", "opIndex":
+		case "true", "false", "value", "topics", "topic", "contract", "type", "tx", "ledger", "txIndex", "opIndex":
 		default:
 			return fmt.Errorf("unknown filter expression name %q", n.Name)
 		}
@@ -118,6 +137,16 @@ func validateFilterAST(expr ast.Expr) error {
 			return err
 		}
 		return validateFilterAST(n.Y)
+	case *ast.CallExpr:
+		name, ok := n.Fun.(*ast.Ident)
+		if !ok || name.Name != "contains" || len(n.Args) != 2 || n.Ellipsis.IsValid() {
+			return fmt.Errorf("only contains(container, value) is supported")
+		}
+		for _, arg := range n.Args {
+			if err := validateFilterAST(arg); err != nil {
+				return err
+			}
+		}
 	default:
 		return fmt.Errorf("unsupported expression construct %T", expr)
 	}
@@ -127,12 +156,14 @@ func validateFilterAST(expr ast.Expr) error {
 func eventExpressionContext(record Record) (map[string]any, error) {
 	e := record.Event
 	topics := make([]any, len(e.TopicXDR))
+	topic := make([]any, len(e.TopicXDR))
 	for i, encoded := range e.TopicXDR {
 		decoded, err := lens.Decode(encoded)
 		if err != nil {
 			return nil, fmt.Errorf("decoding topic[%d] for filter: %w", i, err)
 		}
 		topics[i] = filterTopicValue(decoded.Node)
+		topic[i] = filterTopicScalar(decoded.Node)
 	}
 	var value any
 	if e.ValueXDR != "" {
@@ -143,10 +174,21 @@ func eventExpressionContext(record Record) (map[string]any, error) {
 		value = filterNodeValue(decoded.Node)
 	}
 	return map[string]any{
-		"value": value, "topics": topics, "contract": e.ContractID,
+		"value": value, "topics": topics, "topic": topic, "contract": e.ContractID,
 		"type": e.Type, "tx": e.TxHash, "ledger": int64(record.Sequence),
 		"txIndex": int64(e.TxIndex), "opIndex": int64(e.OpIndex),
 	}, nil
+}
+
+func filterTopicScalar(node *lens.Node) any {
+	if node != nil {
+		for _, child := range node.Children {
+			if child.Name == "Sym" || child.Name == "Str" {
+				return filterNodeValue(child)
+			}
+		}
+	}
+	return filterNodeValue(node)
 }
 
 func filterTopicValue(node *lens.Node) any {
@@ -334,8 +376,49 @@ func evalFilterExpr(expr ast.Expr, context map[string]any) (any, error) {
 			return nil, err
 		}
 		return applyFilterOperator(n.Op, left, right)
+	case *ast.CallExpr:
+		args := make([]any, len(n.Args))
+		for i, arg := range n.Args {
+			value, err := evalFilterExpr(arg, context)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = value
+		}
+		return filterContains(args[0], args[1])
 	}
 	return nil, fmt.Errorf("unsupported expression %T", expr)
+}
+
+func filterContains(container, value any) (bool, error) {
+	switch items := container.(type) {
+	case string:
+		needle, ok := value.(string)
+		if !ok {
+			return false, fmt.Errorf("contains on a string requires a string value")
+		}
+		return strings.Contains(items, needle), nil
+	case []any:
+		for _, item := range items {
+			if filterValuesEqual(item, value) {
+				return true, nil
+			}
+		}
+		return false, nil
+	case map[string]any:
+		key, ok := value.(string)
+		if !ok {
+			return false, fmt.Errorf("contains on an object requires a string key")
+		}
+		_, found := items[key]
+		return found, nil
+	default:
+		return false, fmt.Errorf("contains requires a string, list, or object; got %T", container)
+	}
+}
+
+func filterValuesEqual(left, right any) bool {
+	return fmt.Sprint(left) == fmt.Sprint(right) && fmt.Sprintf("%T", left) == fmt.Sprintf("%T", right)
 }
 
 func lookupFilterField(value any, name string) (any, error) {
@@ -390,7 +473,7 @@ func applyFilterOperator(op token.Token, left, right any) (any, error) {
 		return l || r, nil
 	}
 	if op == token.EQL || op == token.NEQ {
-		equal := fmt.Sprint(left) == fmt.Sprint(right) && fmt.Sprintf("%T", left) == fmt.Sprintf("%T", right)
+		equal := filterValuesEqual(left, right)
 		if op == token.NEQ {
 			return !equal, nil
 		}

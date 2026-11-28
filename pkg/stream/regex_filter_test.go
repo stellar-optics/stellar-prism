@@ -49,3 +49,30 @@ func TestTopicRegexFilterValidatesRules(t *testing.T) {
 		}
 	}
 }
+
+func FuzzTopicPattern(f *testing.F) {
+	for _, seed := range [][2]string{
+		{"*", "AAAAAQ=="},
+		{"**", ""},
+		{"transfer,**", "AAAABw=="},
+		{"re:(a+)+$", "aaaaaaaaaaaaaaaa!"},
+		{"re:(a|aa)+$", "aaaaaaaaaaaaaaaa!"},
+		{"re:(?=a)a", "a"},
+		{"prefix:", "topic"},
+		{",**", "topic"},
+		{"re:[", "topic"},
+	} {
+		f.Add(seed[0], seed[1])
+	}
+
+	f.Fuzz(func(t *testing.T, spec, topic string) {
+		if len(spec) > 4096 || len(topic) > 4096 {
+			t.Skip()
+		}
+		pattern, err := CompileTopicPattern(spec)
+		if err != nil {
+			return
+		}
+		_ = pattern.Matches([]string{topic})
+	})
+}

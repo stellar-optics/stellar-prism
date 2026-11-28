@@ -1,12 +1,22 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -14,6 +24,114 @@ import (
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
+
+func TestSuperviseServeRestartsAfterPanic(t *testing.T) {
+	var calls int
+	var delays []time.Duration
+	var stderr bytes.Buffer
+	err := superviseServe(context.Background(), 1, &stderr, func() error {
+		calls++
+		if calls == 1 {
+			panic("injected crash")
+		}
+		return nil
+	}, func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("run called %d times, want 2", calls)
+	}
+	if len(delays) != 1 || delays[0] != 5*time.Second {
+		t.Fatalf("restart delays = %v, want [5s]", delays)
+	}
+	if !strings.Contains(stderr.String(), "recovered panic") || !strings.Contains(stderr.String(), "injected crash") {
+		t.Fatalf("restart was not logged: %s", stderr.String())
+	}
+}
+
+func TestSuperviseServeStopsAtMaxRestarts(t *testing.T) {
+	var calls int
+	err := superviseServe(context.Background(), 1, io.Discard, func() error {
+		calls++
+		panic("injected crash")
+	}, func(context.Context, time.Duration) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "restart limit 1 reached") {
+		t.Fatalf("supervisor error = %v, want restart limit error", err)
+	}
+	if calls != 2 {
+		t.Fatalf("run called %d times, want 2", calls)
+	}
+}
+
+func TestSuperviseServeRejectsNegativeMaxRestarts(t *testing.T) {
+	called := false
+	err := superviseServe(context.Background(), -1, io.Discard, func() error {
+		called = true
+		return nil
+	}, func(context.Context, time.Duration) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "--max-restarts must not be negative") {
+		t.Fatalf("supervisor error = %v, want invalid restart limit", err)
+	}
+	if called {
+		t.Fatal("run called with invalid restart limit")
+	}
+}
+
+func TestServeRestartDelayGrowsAndCaps(t *testing.T) {
+	for _, test := range []struct {
+		restarts int
+		want     time.Duration
+	}{
+		{restarts: 1, want: 5 * time.Second},
+		{restarts: 2, want: 10 * time.Second},
+		{restarts: 3, want: 20 * time.Second},
+		{restarts: 10, want: 5 * time.Minute},
+	} {
+		if got := serveRestartDelay(test.restarts); got != test.want {
+			t.Errorf("serveRestartDelay(%d) = %s, want %s", test.restarts, got, test.want)
+		}
+	}
+}
+
+func generateTestCert(t *testing.T, commonName string) ([]byte, []byte) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey error: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject: pkix.Name{
+			CommonName: commonName,
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("CreateCertificate error: %v", err)
+	}
+
+	certPem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+
+	privBytes, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("MarshalECPrivateKey error: %v", err)
+	}
+	keyPem := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
+
+	return certPem, keyPem
+}
 
 func TestBroadcastCLIFlagsAndServe(t *testing.T) {
 	for _, args := range [][]string{
@@ -42,6 +160,7 @@ func TestBroadcastCLIFlagsAndServe(t *testing.T) {
 		}
 	}
 }
+
 func TestBroadcastOccupiedPortAndCleanup(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -69,6 +188,49 @@ func TestBroadcastOccupiedPortAndCleanup(t *testing.T) {
 		t.Fatalf("listener leaked: %v", err)
 	}
 	_ = rebound.Close()
+}
+
+func TestServeTLSFlags(t *testing.T) {
+	tempDir := t.TempDir()
+	certPath := filepath.Join(tempDir, "cert.pem")
+	keyPath := filepath.Join(tempDir, "key.pem")
+
+	certPem, keyPem := generateTestCert(t, "127.0.0.1")
+	if err := os.WriteFile(certPath, certPem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Partial TLS flags must be rejected
+	if _, _, err := run(t, "serve", "--sse", "127.0.0.1:0", "--tls-cert", certPath); err == nil {
+		t.Fatal("expected error when only --tls-cert is provided without --tls-key")
+	}
+
+	// 2. Both flags valid with dynamic reload enabled
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(100, 1))
+	withFake(t, srv)
+
+	stdout, stderr, err := run(t, "serve",
+		"--sse", "127.0.0.1:0",
+		"--tls-cert", certPath,
+		"--tls-key", keyPath,
+		"--tls-auto-reload",
+		"--from", "100",
+		"--limit", "1",
+		"--json",
+		"--raw",
+	)
+	if err != nil {
+		t.Fatalf("serve with TLS failed: %v, stderr: %s", err, stderr)
+	}
+	if !strings.Contains(stderr, "https://") {
+		t.Errorf("expected https listener in stderr: %s", stderr)
+	}
+	if !strings.Contains(stdout, `"kind":"event"`) {
+		t.Errorf("expected event record in stdout: %s", stdout)
+	}
 }
 
 func TestTransactionMemoCLI(t *testing.T) {

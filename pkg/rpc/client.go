@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -29,6 +30,11 @@ const DefaultURL = "https://soroban-testnet.stellar.org"
 
 // URLEnvVar is the environment variable consulted when --rpc-url is not given.
 const URLEnvVar = "SOROBAN_RPC_URL"
+
+// HeadersEnvVar is the environment variable consulted for custom HTTP headers
+// attached to outgoing RPC requests. Entries may be separated by newlines or
+// commas and use the same "Key: Value" format as --header.
+const HeadersEnvVar = "PRISM_HEADERS"
 
 // Client is the subset of Soroban RPC that prism uses.
 //
@@ -140,6 +146,11 @@ func New(url string, timeout time.Duration) *SDKClient {
 	return NewWithTransport(url, timeout, nil)
 }
 
+// NewMulti initializes a FailoverRpcClient managing a pool across multiple endpoints.
+func NewMulti(urls []string, timeout time.Duration, opts ...FailoverOption) (*FailoverRpcClient, error) {
+	return NewFailoverRpcClient(urls, timeout, opts...)
+}
+
 // NewWithTransport returns a Client backed by the Stellar SDK that sends every
 // HTTP request through transport.
 //
@@ -158,6 +169,19 @@ func NewWithTransport(url string, timeout time.Duration, transport http.RoundTri
 	return &SDKClient{
 		inner: rpcclient.NewClient(url, httpClient),
 	}
+}
+
+// NewWithHeaders returns a Client backed by the Stellar SDK that attaches
+// headers to every outgoing HTTP request.
+func NewWithHeaders(url string, timeout time.Duration, headers http.Header) *SDKClient {
+	return NewWithOptions(url, timeout, NewClientOption{Headers: headers})
+}
+
+// NewWithOptions returns a Client backed by the Stellar SDK configured with opts.
+func NewWithOptions(url string, timeout time.Duration, opts ...NewClientOption) *SDKClient {
+	applied := applyNewClientOptions(opts...)
+	transport := NewHeaderTransport(applied.transport, applied.headers)
+	return NewWithTransport(url, timeout, transport)
 }
 
 // GetEvents implements Client.
@@ -286,11 +310,18 @@ type NewClientOption struct {
 	// ProxyURL, when set, routes RPC traffic through an HTTP, HTTPS or SOCKS5
 	// proxy instead of dialling the endpoint directly.
 	ProxyURL string
+
+	// Headers, when non-empty, are attached to every outgoing RPC HTTP request.
+	Headers http.Header
+
+	// Transport, when set, overrides the base HTTP round tripper.
+	Transport http.RoundTripper
 }
 
 // newClientOptions collects options for SDK client creation.
 type newClientOptions struct {
 	transport http.RoundTripper
+	headers   http.Header
 }
 
 // applyNewClientOptions resolves opts into the concrete transport settings
@@ -300,17 +331,230 @@ type newClientOptions struct {
 func applyNewClientOptions(opts ...NewClientOption) newClientOptions {
 	applied := newClientOptions{}
 	for _, opt := range opts {
-		if opt.ProxyURL == "" {
-			continue
+		if opt.Transport != nil {
+			applied.transport = opt.Transport
 		}
-		transport, err := proxyURLToTransport(opt.ProxyURL)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "rpc: ignoring proxy URL %q: %v\n", opt.ProxyURL, err)
-			continue
+		if opt.ProxyURL != "" {
+			transport, err := proxyURLToTransport(opt.ProxyURL)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "rpc: ignoring proxy URL %q: %v\n", opt.ProxyURL, err)
+			}
+			if err == nil {
+				applied.transport = transport
+			}
 		}
-		applied.transport = transport
+		if len(opt.Headers) > 0 {
+			if applied.headers == nil {
+				applied.headers = make(http.Header, len(opt.Headers))
+			}
+			mergeHeaders(applied.headers, opt.Headers)
+		}
 	}
 	return applied
+}
+
+// ParseHeaders parses "Key: Value" header strings into an http.Header.
+// Blank entries are ignored. Header names and values are validated to reject
+// malformed syntax and control characters.
+func ParseHeaders(raw []string) (http.Header, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	parsed := make(http.Header, len(raw))
+	for _, entry := range raw {
+		if strings.TrimSpace(entry) == "" {
+			continue
+		}
+		key, val, err := parseHeader(entry)
+		if err != nil {
+			return nil, err
+		}
+		parsed.Add(key, val)
+	}
+	if len(parsed) == 0 {
+		return nil, nil
+	}
+	return parsed, nil
+}
+
+// ResolveHeaders resolves custom HTTP headers from explicit CLI flag values
+// and the PRISM_HEADERS environment variable. When both define the same header
+// name, the explicit flag value overrides the environment value.
+func ResolveHeaders(flagValues []string) (http.Header, error) {
+	var envHeaders http.Header
+	if env := strings.TrimSpace(os.Getenv(HeadersEnvVar)); env != "" {
+		var err error
+		envHeaders, err = ParseHeaders(splitEnvHeaders(env))
+		if err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", HeadersEnvVar, err)
+		}
+	}
+
+	flagHeaders, err := ParseHeaders(flagValues)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(envHeaders) == 0 {
+		return flagHeaders, nil
+	}
+	if len(flagHeaders) == 0 {
+		return envHeaders, nil
+	}
+
+	merged := envHeaders.Clone()
+	mergeHeaders(merged, flagHeaders)
+	return merged, nil
+}
+
+// NewHeaderTransport wraps base so every outgoing HTTP request carries headers.
+// When headers is empty, base is returned unchanged.
+func NewHeaderTransport(base http.RoundTripper, headers http.Header) http.RoundTripper {
+	cloned := cloneCleanHeaders(headers)
+	if len(cloned) == 0 {
+		return base
+	}
+	return &headerTransport{
+		base:    base,
+		headers: cloned,
+	}
+}
+
+type headerTransport struct {
+	base    http.RoundTripper
+	headers http.Header
+}
+
+// RoundTrip implements http.RoundTripper, cloning req before attaching custom
+// headers so the caller's request is never mutated.
+func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, errors.New("rpc: nil request")
+	}
+	cloned := req.Clone(req.Context())
+	if cloned.Header == nil {
+		cloned.Header = make(http.Header, len(t.headers))
+	}
+	mergeHeaders(cloned.Header, t.headers)
+
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(cloned)
+}
+
+func mergeHeaders(dst, src http.Header) {
+	for key, values := range src {
+		if len(values) == 0 {
+			continue
+		}
+		dst[http.CanonicalHeaderKey(key)] = slices.Clone(values)
+	}
+}
+
+func cloneCleanHeaders(src http.Header) http.Header {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(http.Header, len(src))
+	mergeHeaders(dst, src)
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+func parseHeader(raw string) (string, string, error) {
+	key, val, ok := strings.Cut(raw, ":")
+	if !ok {
+		return "", "", fmt.Errorf("invalid header %q: expected Key: Value", raw)
+	}
+	key = strings.TrimSpace(key)
+	if !isValidHeaderName(key) {
+		return "", "", fmt.Errorf("invalid header name %q", key)
+	}
+	val = strings.TrimSpace(val)
+	if !isValidHeaderValue(val) {
+		return "", "", fmt.Errorf("invalid header value for %q", key)
+	}
+	return http.CanonicalHeaderKey(key), val, nil
+}
+
+// splitEnvHeaders splits PRISM_HEADERS on newlines and on commas that precede a
+// new "Key: Value" entry, preserving commas inside header values such as Accept
+// or Date.
+func splitEnvHeaders(env string) []string {
+	var out []string
+	for _, line := range strings.Split(env, "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if line == "" {
+			continue
+		}
+		out = append(out, splitCommaHeaders(line)...)
+	}
+	return out
+}
+
+func splitCommaHeaders(line string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(line); i++ {
+		if line[i] != ',' {
+			continue
+		}
+		rest := strings.TrimSpace(line[i+1:])
+		if rest == "" {
+			if seg := strings.TrimSpace(line[start:i]); seg != "" {
+				out = append(out, seg)
+			}
+			return out
+		}
+		if name, _, hasColon := strings.Cut(rest, ":"); hasColon && isValidHeaderName(strings.TrimSpace(name)) {
+			if seg := strings.TrimSpace(line[start:i]); seg != "" {
+				out = append(out, seg)
+			}
+			start = i + 1
+		}
+	}
+	if seg := strings.TrimSpace(line[start:]); seg != "" {
+		out = append(out, seg)
+	}
+	return out
+}
+
+func isValidHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !isTokenChar(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isTokenChar(c byte) bool {
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidHeaderValue(val string) bool {
+	for i := 0; i < len(val); i++ {
+		b := val[i]
+		if b != '\t' && (b < 0x20 || b == 0x7f) {
+			return false
+		}
+	}
+	return true
 }
 
 // proxyURLToTransport converts a proxy URL into the transport that uses it.

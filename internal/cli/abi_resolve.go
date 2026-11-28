@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"io"
 	"math"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -20,7 +23,11 @@ import (
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 
 	prismrpc "github.com/stellar-optics/stellar-prism/pkg/rpc"
+	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
+
+// DefaultSpecCacheDir is the default directory where parsed contract specs are persisted.
+const DefaultSpecCacheDir = "~/.cache/prism/specs"
 
 // contractSpecSection is the WASM custom section that Soroban contracts embed
 // their ScSpecEntry stream in.
@@ -45,8 +52,10 @@ type contractSpec struct {
 // newABICmd builds `prism abi <contract-id>`.
 func newABICmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
-		function  string
-		arguments []string
+		function     string
+		arguments    []string
+		specCacheDir string
+		specCacheTTL time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -56,9 +65,8 @@ func newABICmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 Soroban spec embedded in its contractspecv0 custom section, and render
 functions, types and events with human-readable argument names.
 
-The lookup is two RPC calls: the contract instance names the WASM hash, and
-the code entry carries the bytecode. No other network access is made, and
-nothing is cached between runs.
+Specs are cached in memory and on disk under --spec-cache-dir with configurable TTL
+to avoid redundant RPC requests when watching or re-resolving contracts.
 
 With --function, only that function is shown. Repeating --arg decodes actual
 base64 ScVal arguments against the function's parameter names and types, so
@@ -85,7 +93,25 @@ hand.`,
 			}
 			defer closeClient()
 
-			spec, err := resolveContractSpec(cmd.Context(), client, args[0])
+			var cache *stream.ABICache
+			if specCacheDir != "" {
+				var err error
+				cache, err = stream.NewABICache(stream.ABICacheOptions{
+					Dir: specCacheDir,
+					TTL: specCacheTTL,
+				})
+				if err != nil {
+					// Fallback to in-memory cache if disk directory cannot be created
+					cache, err = stream.NewABICache(stream.ABICacheOptions{
+						TTL: specCacheTTL,
+					})
+					if err != nil {
+						return fmt.Errorf("creating in-memory spec cache: %w", err)
+					}
+				}
+			}
+
+			spec, err := resolveContractSpecWithCache(cmd.Context(), client, args[0], cache)
 			if err != nil {
 				return err
 			}
@@ -102,6 +128,10 @@ hand.`,
 		"show only this function and decode any --arg values against it")
 	cmd.Flags().StringArrayVar(&arguments, "arg", nil,
 		"base64 ScVal argument to decode; repeatable and requires --function")
+	cmd.Flags().StringVar(&specCacheDir, "spec-cache-dir", DefaultSpecCacheDir,
+		"directory to cache parsed contract specs on disk (empty disables disk cache)")
+	cmd.Flags().DurationVar(&specCacheTTL, "spec-cache-ttl", stream.DefaultABICacheTTL,
+		"TTL for cached contract specs (default: 24h)")
 	return cmd
 }
 
@@ -243,8 +273,15 @@ type abiEventParamJSON struct {
 }
 
 // resolveContractSpec performs the two ledger-entry lookups and parses the
-// embedded spec. It is the only networked path in this file.
+// embedded spec.
 func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID string) (*contractSpec, error) {
+	return resolveContractSpecWithCache(ctx, client, contractID, nil)
+}
+
+// resolveContractSpecWithCache resolves the contract spec, checking and updating
+// cache if non-nil. When the contract wasm hash is cached, the second RPC call
+// for contract bytecode is skipped.
+func resolveContractSpecWithCache(ctx context.Context, client prismrpc.Client, contractID string, cache *stream.ABICache) (*contractSpec, error) {
 	entries, ok := client.(prismrpc.LedgerEntriesClient)
 	if !ok {
 		return nil, fmt.Errorf("RPC client does not support getLedgerEntries, which is required to resolve a contract ABI")
@@ -267,6 +304,22 @@ func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID
 		return nil, err
 	}
 
+	if cache != nil {
+		if cached, ok := cache.Get(contractID); ok {
+			expectedHash := hex.EncodeToString(hash[:])
+			if cached.WasmHash == expectedHash {
+				// Cache hit! Skip the second RPC call for WASM code.
+				spec := &contractSpec{ContractID: contractID, WasmHash: hash}
+				if err := spec.add(cached.Entries()); err == nil {
+					return spec, nil
+				}
+			} else {
+				// Code hash changed on-chain, invalidate stale entry.
+				cache.Invalidate(contractID)
+			}
+		}
+	}
+
 	codeKey := xdr.LedgerKey{
 		Type:         xdr.LedgerEntryTypeContractCode,
 		ContractCode: &xdr.LedgerKeyContractCode{Hash: hash},
@@ -278,10 +331,15 @@ func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID
 	if codeEntry.Data.Type != xdr.LedgerEntryTypeContractCode || codeEntry.Data.ContractCode == nil {
 		return nil, fmt.Errorf("contract %s: WASM code entry has unexpected type %s", contractID, codeEntry.Data.Type)
 	}
+	code := codeEntry.Data.ContractCode.Code
 
-	specEntries, err := parseContractSpec(codeEntry.Data.ContractCode.Code)
+	specEntries, err := parseContractSpec(code)
 	if err != nil {
 		return nil, fmt.Errorf("contract %s: %w", contractID, err)
+	}
+
+	if cache != nil {
+		cache.Put(contractID, hash, specEntries)
 	}
 
 	spec := &contractSpec{ContractID: contractID, WasmHash: hash}
@@ -1254,4 +1312,231 @@ func writeIndentedValue(w io.Writer, value *lens.Value, palette lensformat.Palet
 		}
 	}
 	return nil
+}
+
+// specDecodeSink decorates event records with their emitting contract's ABI
+// before handing them to the next sink.
+//
+// Resolution is attempted once per contract and cached in memory; a contract
+// whose spec cannot be fetched or has none is remembered as unresolved and its
+// events pass through with the wire shape intact, so a missing spec never
+// fails the stream.
+type specDecodeSink struct {
+	next   stream.Sink
+	client prismrpc.Client
+	cache  *stream.ABICache
+
+	mu       sync.Mutex
+	resolved map[string]*contractSpec
+	failed   map[string]struct{}
+}
+
+// specResolveTimeout bounds the RPC round trip for one contract, so an
+// unreachable endpoint degrades to the wire shape instead of stalling output.
+const specResolveTimeout = 10 * time.Second
+
+func newSpecDecodeSink(next stream.Sink, client prismrpc.Client) (*specDecodeSink, error) {
+	cache, err := stream.NewABICache(stream.ABICacheOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("initialising contract spec cache: %w", err)
+	}
+	return &specDecodeSink{
+		next:     next,
+		client:   client,
+		cache:    cache,
+		resolved: make(map[string]*contractSpec),
+		failed:   make(map[string]struct{}),
+	}, nil
+}
+
+// Emit implements stream.Sink.
+func (s *specDecodeSink) Emit(r stream.Record) error {
+	if r.Event != nil {
+		if typed := s.decode(r.Event); typed != nil {
+			r.Event.Typed = typed
+		}
+	}
+	return s.next.Emit(r)
+}
+
+// Flush implements stream.Sink.
+func (s *specDecodeSink) Flush() error { return s.next.Flush() }
+
+// Close closes the wrapped sink when it owns a resource.
+func (s *specDecodeSink) Close() error {
+	if closer, ok := s.next.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+func (s *specDecodeSink) decode(e *stream.Event) *stream.TypedEvent {
+	return s.specFor(e.ContractID).decodeEvent(e)
+}
+
+// specFor returns the resolved spec for a contract, or nil. Nil receivers make
+// the call site a no-op when resolution failed.
+func (s *specDecodeSink) specFor(contractID string) *contractSpec {
+	if contractID == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if spec, ok := s.resolved[contractID]; ok {
+		return spec
+	}
+	if _, ok := s.failed[contractID]; ok {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), specResolveTimeout)
+	defer cancel()
+	spec, err := resolveContractSpecWithCache(ctx, s.client, contractID, s.cache)
+	if err != nil {
+		s.failed[contractID] = struct{}{}
+		return nil
+	}
+	s.resolved[contractID] = spec
+	return spec
+}
+
+// decodeEvent applies the contract spec to one event. It returns nil when the
+// event is not declared in the spec, which leaves the wire shape in place.
+func (s *contractSpec) decodeEvent(e *stream.Event) *stream.TypedEvent {
+	if s == nil || e == nil || len(s.Events) == 0 || len(e.TopicXDR) == 0 {
+		return nil
+	}
+
+	topicVals := make([]xdr.ScVal, 0, len(e.TopicXDR))
+	for _, raw := range e.TopicXDR {
+		value, err := decodeScValBase64(raw)
+		if err != nil {
+			return nil
+		}
+		topicVals = append(topicVals, value)
+	}
+	// Contract events lead with the event name as a symbol topic.
+	if topicVals[0].Type != xdr.ScValTypeScvSymbol || topicVals[0].Sym == nil {
+		return nil
+	}
+	name := string(*topicVals[0].Sym)
+
+	var spec *xdr.ScSpecEventV0
+	for i := range s.Events {
+		if string(s.Events[i].Name) == name {
+			spec = &s.Events[i]
+			break
+		}
+	}
+	if spec == nil {
+		return nil
+	}
+
+	var data *xdr.ScVal
+	if e.ValueXDR != "" {
+		if value, err := decodeScValBase64(e.ValueXDR); err == nil {
+			data = &value
+		}
+	}
+
+	dataParams := 0
+	for _, param := range spec.Params {
+		if param.Location != xdr.ScSpecEventParamLocationV0ScSpecEventParamLocationTopicList {
+			dataParams++
+		}
+	}
+
+	typed := &stream.TypedEvent{Name: name}
+	topicIndex := 1
+	for _, param := range spec.Params {
+		if param.Location == xdr.ScSpecEventParamLocationV0ScSpecEventParamLocationTopicList {
+			if topicIndex >= len(topicVals) {
+				continue
+			}
+			typed.Fields = append(typed.Fields, stream.TypedField{
+				Name:  param.Name,
+				Value: formatScValRaw(e.TopicXDR[topicIndex]),
+			})
+			topicIndex++
+			continue
+		}
+		if data == nil {
+			continue
+		}
+		// A single data parameter is the payload itself; several are packed
+		// into a map keyed by parameter name.
+		if dataParams <= 1 {
+			typed.Fields = append(typed.Fields, stream.TypedField{
+				Name:  param.Name,
+				Value: formatScValValue(*data),
+			})
+			continue
+		}
+		if data.Type == xdr.ScValTypeScvMap && data.Map != nil {
+			if value := scMapEntryValue(**data.Map, param.Name); value != nil {
+				typed.Fields = append(typed.Fields, stream.TypedField{
+					Name:  param.Name,
+					Value: formatScValValue(*value),
+				})
+			}
+		}
+	}
+	if len(typed.Fields) == 0 {
+		return nil
+	}
+	return typed
+}
+
+func decodeScValBase64(raw string) (xdr.ScVal, error) {
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return xdr.ScVal{}, fmt.Errorf("decoding ScVal base64: %w", err)
+	}
+	var value xdr.ScVal
+	if err := xdr.SafeUnmarshal(decoded, &value); err != nil {
+		return xdr.ScVal{}, fmt.Errorf("unmarshalling ScVal: %w", err)
+	}
+	return value, nil
+}
+
+func scMapEntryValue(m xdr.ScMap, name string) *xdr.ScVal {
+	for i := range m {
+		key := m[i].Key
+		if key.Type == xdr.ScValTypeScvSymbol && key.Sym != nil && string(*key.Sym) == name {
+			return &m[i].Val
+		}
+	}
+	return nil
+}
+
+func formatScValValue(value xdr.ScVal) string {
+	encoded, err := scValBase64(value)
+	if err != nil {
+		return value.Type.String()
+	}
+	return formatScValRaw(encoded)
+}
+
+func scValBase64(value xdr.ScVal) (string, error) {
+	var buf bytes.Buffer
+	if _, err := xdr.Marshal(&buf, value); err != nil {
+		return "", fmt.Errorf("marshalling ScVal: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+// formatScValRaw renders one ScVal as a single line, so a typed field fits on
+// its own output line.
+func formatScValRaw(raw string) string {
+	value, err := lens.DecodeAs(raw, "ScVal")
+	if err != nil {
+		return raw
+	}
+	var buf bytes.Buffer
+	if err := lensformat.NewTreeFormatter().Format(&buf, value); err != nil {
+		return raw
+	}
+	return strings.Join(strings.Fields(buf.String()), " ")
 }
