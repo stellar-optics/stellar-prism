@@ -219,7 +219,8 @@ type globalFlags struct {
 	configFile string
 	// pprofPort enables the runtime profiling server on 127.0.0.1 when it is
 	// greater than zero.
-	pprofPort int
+	pprofPort   int
+	metricsPort int
 	// profilerFactory builds the profiler cmd/prism supplies. It is nil in
 	// library tests that do not exercise profiling.
 	profilerFactory ProfilerFactory
@@ -345,6 +346,8 @@ redacted before anything is written.`,
 		`write a debug NDJSON log of RPC requests and responses to this file, with Authorization and other credential headers redacted ("-" writes to stderr)`)
 	root.PersistentFlags().Int64Var(&g.wireLogMaxBody, "wire-log-max-body", 0,
 		"maximum bytes of each body recorded by --wire-log (0 uses 1 MiB, -1 disables body capture)")
+	root.PersistentFlags().IntVar(&g.metricsPort, "metrics-port", 0,
+		"serve Prometheus metrics at /metrics on this port, e.g. 9090 (0 disables; --metrics-addr takes precedence)")
 	root.PersistentFlags().IntVar(&g.pprofPort, "pprof-port", 0,
 		"serve Go runtime profiles on http://127.0.0.1:PORT/debug/pprof/ (0 disables)")
 	root.PersistentFlags().StringVar(&g.network, "network", "testnet",

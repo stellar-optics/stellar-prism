@@ -48,6 +48,10 @@ type sinkFlags struct {
 	cloudTimeout        time.Duration
 	cloudCompress       bool
 	metricsAddr         string
+	fileRotatePath      string
+	fileRotateMaxMB     int64
+	fileRotateBackups   int
+	fileRotateCompress  bool
 	syslogAddress       string
 	syslogFormat        string
 	syslogFacility      string
@@ -126,6 +130,15 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 
 	flags.StringVar(&s.metricsAddr, "metrics-addr", "",
 		"serve Prometheus metrics at /metrics on this address, e.g. 127.0.0.1:9090")
+
+	flags.StringVar(&s.fileRotatePath, "sink-file-rotate", "",
+		"also write records to this file, rotating on size or date boundaries")
+	flags.Int64Var(&s.fileRotateMaxMB, "max-size-mb", 100,
+		"rotate --sink-file-rotate before the active file exceeds this many megabytes (0 disables size rotation)")
+	flags.IntVar(&s.fileRotateBackups, "max-backups", 5,
+		"keep at most this many rotated --sink-file-rotate archives, oldest deleted first (0 keeps all)")
+	flags.BoolVar(&s.fileRotateCompress, "sink-file-rotate-compress", true,
+		"gzip rotated --sink-file-rotate archives in the background")
 
 	flags.StringVar(&s.syslogAddress, "syslog-address", "",
 		"send records to a syslog socket, e.g. unixgram:///dev/log or udp://host:514")
@@ -301,6 +314,21 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	if s.clickhouseAddr != "" && s.clickhouseBatchSize <= 0 {
 		return fmt.Errorf("--clickhouse-batch-size must be greater than zero")
 	}
+	if s.fileRotatePath == "" {
+		if s.fileRotateMaxMB < 0 || s.fileRotateBackups < 0 {
+			return fmt.Errorf("--max-size-mb and --max-backups must not be negative")
+		}
+		if cmd != nil && (cmd.Flags().Changed("max-size-mb") || cmd.Flags().Changed("max-backups")) {
+			return fmt.Errorf("--max-size-mb and --max-backups require --sink-file-rotate")
+		}
+	} else {
+		if s.fileRotateMaxMB < 0 {
+			return fmt.Errorf("--max-size-mb must not be negative")
+		}
+		if s.fileRotateBackups < 0 {
+			return fmt.Errorf("--max-backups must not be negative")
+		}
+	}
 	return s.validateAudit(cmd)
 }
 
@@ -383,6 +411,21 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 		// network, so a record that was delivered is always a record the
 		// audit trail saw.
 		sinks = append(sinks, audit)
+	}
+
+	if s.fileRotatePath != "" {
+		rotate, rotateErr := sink.NewRollingFileSink(s.fileRotatePath, func(w io.Writer) stream.Sink {
+			return sink.NewNDJSON(w, decode)
+		}, sink.RollingFileSinkOptions{
+			MaxSizeMB:  s.fileRotateMaxMB,
+			MaxBackups: s.fileRotateBackups,
+			Compress:   s.fileRotateCompress,
+		})
+		if rotateErr != nil {
+			return nil, rotateErr
+		}
+		s.constructedSinks = append(s.constructedSinks, rotate)
+		sinks = append(sinks, rotate)
 	}
 
 	if s.webhookURL != "" {
