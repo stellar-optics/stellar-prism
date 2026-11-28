@@ -131,6 +131,10 @@ type Options struct {
 	// how far the stream has got and how far the server has got. It is
 	// what the health endpoints report stream lag from.
 	OnProgress func(Progress)
+	// OnFetchLatency, when set, observes how long every fetch attempt took,
+	// including failures. It lets the CLI publish an RPC latency histogram
+	// without wrapping the client.
+	OnFetchLatency func(time.Duration)
 	// Leader, when set, gates the stream on a distributed lease: the
 	// tailer only fetches while this instance holds the lease, so a
 	// standby never emits records the leader is already emitting.
@@ -756,11 +760,15 @@ func (t *Tailer) fetchWithRetry(ctx context.Context) (Batch, error) {
 	for {
 		started := t.opts.Clock.Now()
 		batch, err := t.src.Fetch(ctx, t.cursor)
+		elapsed := t.opts.Clock.Now().Sub(started)
+		if t.opts.OnFetchLatency != nil {
+			t.opts.OnFetchLatency(elapsed)
+		}
 		if err == nil {
 			t.stats.Fetches++
 			if t.closeEst != nil {
 				t.lastFetchAt = t.opts.Clock.Now()
-				t.closeEst.ObserveLatency(t.lastFetchAt.Sub(started))
+				t.closeEst.ObserveLatency(elapsed)
 			}
 			return batch, nil
 		}
