@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -301,6 +302,7 @@ func eventRecord(e protocol.EventInfo) Record {
 			EventIndex: eventIndex(e.ID),
 			TopicXDR:   e.TopicXDR,
 			ValueXDR:   e.ValueXDR,
+			SAC:        DecodeSAC(e.TopicXDR, e.ValueXDR),
 		},
 	}
 }
@@ -318,6 +320,310 @@ func eventIndex(id string) uint32 {
 		return 0
 	}
 	return uint32(index)
+}
+
+// SACDecimals is the fixed number of fractional digits in a Stellar Asset
+// Contract amount: one stroop is 1/10^7 of a token.
+const SACDecimals = 7
+
+// SACAction identifies one of the built-in Stellar Asset Contract token events.
+type SACAction string
+
+// SACTransfer moves an amount from one address to another.
+const SACTransfer SACAction = "transfer"
+
+// SACMint increases the supply by crediting an address.
+const SACMint SACAction = "mint"
+
+// SACClawback removes an amount from an address at the issuer's request.
+const SACClawback SACAction = "clawback"
+
+// SACBurn destroys an amount held by an address.
+const SACBurn SACAction = "burn"
+
+// SACSetAuthorized changes whether an address may use its balance.
+const SACSetAuthorized SACAction = "set_authorized"
+
+// SACEvent is a decoded built-in Stellar Asset Contract token event. Amount is
+// the raw integer in stroops; use AmountString to render it as a token amount.
+// Asset is the SEP-11 label from the trailing topic ("native" becomes "XLM")
+// and is empty when the event uses the older shape without an asset topic.
+type SACEvent struct {
+	// Action is the token operation the event reports.
+	Action SACAction
+	// Asset is the normalized SEP-11 asset label, if the event carried one.
+	Asset string
+	// From is the source address for transfer, burn and clawback events.
+	From string
+	// To is the destination address for transfer and mint events, and the
+	// affected address for set_authorized events.
+	To string
+	// Account is the single address acted on by mint, burn, clawback and
+	// set_authorized events; it duplicates To or From for those actions.
+	Account string
+	// Admin is the administrator address in legacy admin-topic events.
+	Admin string
+	// Amount is the raw stroop amount; it is nil for set_authorized events.
+	Amount *big.Int
+	// Authorized is the new authorization flag for set_authorized events.
+	Authorized *bool
+	// MuxedID is the to_muxed_id carried in newer map-shaped payloads.
+	MuxedID *uint64
+}
+
+// DecodeSAC decodes base64 ScVal topics and value into a SACEvent. It returns
+// nil when the XDR is malformed or the event does not match a built-in SAC
+// token shape, so callers can keep their normal rendering for those events.
+func DecodeSAC(topics []string, valueXDR string) *SACEvent {
+	if len(topics) == 0 || len(topics) > 4 {
+		return nil
+	}
+	vals := make([]xdr.ScVal, 0, len(topics))
+	for _, topic := range topics {
+		var val xdr.ScVal
+		if err := xdr.SafeUnmarshalBase64(topic, &val); err != nil {
+			return nil
+		}
+		vals = append(vals, val)
+	}
+	if vals[0].Type != xdr.ScValTypeScvSymbol {
+		return nil
+	}
+	name, ok := scValName(vals[0])
+	if !ok {
+		return nil
+	}
+	action := SACAction(name)
+	switch action {
+	case SACTransfer, SACMint, SACClawback, SACBurn, SACSetAuthorized:
+	default:
+		return nil
+	}
+
+	var value xdr.ScVal
+	if err := xdr.SafeUnmarshalBase64(valueXDR, &value); err != nil {
+		return nil
+	}
+
+	asset := ""
+	addressVals := vals[1:]
+	if len(addressVals) > 0 {
+		if label, ok := sacAssetLabel(addressVals[len(addressVals)-1]); ok {
+			asset = label
+			addressVals = addressVals[:len(addressVals)-1]
+		} else if _, isString := addressVals[len(addressVals)-1].GetStr(); isString {
+			return nil
+		}
+	}
+
+	addresses := make([]string, 0, len(addressVals))
+	var topicAuthorized *bool
+	for _, val := range addressVals {
+		if action == SACSetAuthorized {
+			if authorized, ok := val.GetB(); ok {
+				if topicAuthorized != nil {
+					return nil
+				}
+				topicAuthorized = &authorized
+				continue
+			}
+		}
+		address, ok := scValAddress(val)
+		if !ok {
+			return nil
+		}
+		addresses = append(addresses, address)
+	}
+
+	sac := &SACEvent{Action: action, Asset: asset}
+	switch action {
+	case SACTransfer:
+		if len(addresses) != 2 {
+			return nil
+		}
+		sac.From, sac.To = addresses[0], addresses[1]
+	case SACMint:
+		if len(addresses) < 1 || len(addresses) > 2 {
+			return nil
+		}
+		if len(addresses) == 2 {
+			sac.Admin = addresses[0]
+		}
+		sac.To = addresses[len(addresses)-1]
+		sac.Account = sac.To
+	case SACClawback:
+		if len(addresses) < 1 || len(addresses) > 2 {
+			return nil
+		}
+		if len(addresses) == 2 {
+			sac.Admin = addresses[0]
+		}
+		sac.From = addresses[len(addresses)-1]
+		sac.Account = sac.From
+	case SACBurn:
+		if len(addresses) != 1 {
+			return nil
+		}
+		sac.From = addresses[0]
+		sac.Account = sac.From
+	case SACSetAuthorized:
+		if len(addresses) < 1 || len(addresses) > 2 {
+			return nil
+		}
+		if len(addresses) == 2 {
+			sac.Admin = addresses[0]
+		}
+		sac.To = addresses[len(addresses)-1]
+		sac.Account = sac.To
+		if topicAuthorized != nil {
+			if value.Type != xdr.ScValTypeScvVoid {
+				return nil
+			}
+			sac.Authorized = topicAuthorized
+		} else {
+			authorized, ok := value.GetB()
+			if !ok {
+				return nil
+			}
+			sac.Authorized = &authorized
+		}
+		return sac
+	}
+
+	amount, muxedID, ok := sacAmount(value)
+	if !ok {
+		return nil
+	}
+	sac.Amount = amount
+	sac.MuxedID = muxedID
+	return sac
+}
+
+func sacAssetLabel(value xdr.ScVal) (string, bool) {
+	label, ok := value.GetStr()
+	if !ok {
+		return "", false
+	}
+	s := string(label)
+	if s == "native" {
+		return "XLM", true
+	}
+	separator := strings.LastIndex(s, ":")
+	if separator <= 0 || separator == len(s)-1 || s[separator+1] != 'G' {
+		return "", false
+	}
+	return s[:separator], true
+}
+
+func sacAmount(value xdr.ScVal) (*big.Int, *uint64, bool) {
+	if entries, ok := value.GetMap(); ok {
+		if entries == nil {
+			return nil, nil, false
+		}
+		var amount *big.Int
+		var muxedID *uint64
+		for _, entry := range *entries {
+			key, ok := scValName(entry.Key)
+			if !ok {
+				continue
+			}
+			switch key {
+			case "amount":
+				parsed, ok := scValInteger(entry.Val)
+				if !ok {
+					return nil, nil, false
+				}
+				amount = parsed
+			case "to_muxed_id":
+				id, ok := entry.Val.GetU64()
+				if !ok {
+					return nil, nil, false
+				}
+				value := uint64(id)
+				muxedID = &value
+			}
+		}
+		return amount, muxedID, amount != nil
+	}
+	amount, ok := scValInteger(value)
+	if !ok {
+		return nil, nil, false
+	}
+	return amount, nil, true
+}
+
+// FormatSACAmount renders a raw stroop amount as fixed-point decimal text with
+// the requested number of fraction digits, using integer arithmetic only.
+func FormatSACAmount(amount *big.Int, decimals int) string {
+	if amount == nil || decimals < 0 {
+		return ""
+	}
+	ten := big.NewInt(10)
+	absolute := new(big.Int).Abs(amount)
+	scaled := new(big.Int).Set(absolute)
+	if decimals < SACDecimals {
+		scaled.Quo(scaled, new(big.Int).Exp(ten, big.NewInt(int64(SACDecimals-decimals)), nil))
+	} else if decimals > SACDecimals {
+		scaled.Mul(scaled, new(big.Int).Exp(ten, big.NewInt(int64(decimals-SACDecimals)), nil))
+	}
+	whole, fraction := new(big.Int).QuoRem(scaled, new(big.Int).Exp(ten, big.NewInt(int64(decimals)), nil), new(big.Int))
+	result := whole.String()
+	if decimals > 0 {
+		digits := fraction.String()
+		result += "." + strings.Repeat("0", decimals-len(digits)) + digits
+	}
+	if amount.Sign() < 0 && absolute.Sign() != 0 {
+		result = "-" + result
+	}
+	return result
+}
+
+// AmountString renders the full seven-decimal token amount.
+func (s *SACEvent) AmountString() string {
+	if s == nil {
+		return ""
+	}
+	return FormatSACAmount(s.Amount, SACDecimals)
+}
+
+// Summary renders a short token summary such as
+// "transfer: G... -> G... (100.00 USDC)". Amounts are shown with two decimal
+// places; AmountString keeps the full seven-decimal precision.
+func (s *SACEvent) Summary() string {
+	if s == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(string(s.Action))
+	b.WriteString(": ")
+	switch s.Action {
+	case SACTransfer:
+		b.WriteString(s.From)
+		if s.To != "" {
+			b.WriteString(" -> " + s.To)
+		}
+	case SACSetAuthorized:
+		b.WriteString(s.Account)
+	case SACMint:
+		b.WriteString(s.Account)
+	case SACBurn, SACClawback:
+		b.WriteString(s.Account)
+	}
+	if s.Amount != nil {
+		b.WriteString(" (")
+		b.WriteString(FormatSACAmount(s.Amount, 2))
+		if s.Asset != "" {
+			b.WriteString(" " + s.Asset)
+		}
+		b.WriteString(")")
+	} else if s.Authorized != nil {
+		state := "deauthorized"
+		if *s.Authorized {
+			state = "authorized"
+		}
+		b.WriteString(" (" + state + ")")
+	}
+	return b.String()
 }
 
 // filters builds the single server-side filter prism uses.

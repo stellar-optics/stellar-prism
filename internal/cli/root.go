@@ -362,6 +362,10 @@ redacted before anything is written.`,
 	root.PersistentFlags().StringVar(&g.tlsCert, "tls-cert", "", "path to TLS certificate file (PEM)")
 	root.PersistentFlags().StringVar(&g.tlsKey, "tls-key", "", "path to TLS private key file (PEM)")
 	root.PersistentFlags().BoolVar(&g.tlsAutoReload, "tls-auto-reload", false, "dynamically reload TLS certificate on file change")
+
+	abiCmd := newABICmd(g, stdout, stderr)
+	abiCmd.AddCommand(newABIInspectCmd(g, stdout, stderr))
+
 	root.AddCommand(
 		newServeCmd(g, stdout, stderr),
 		newEventsCmd(g, stdout, stderr),
@@ -369,7 +373,7 @@ redacted before anything is written.`,
 		newTransactionsCmd(g, stdout, stderr),
 		newOperationsCmd(g, stdout, stderr),
 		newSimulateCmd(g, stdout, stderr),
-		newABICmd(g, stdout, stderr),
+		abiCmd,
 		newStorageCmd(g, stdout, stderr),
 		newWASMCmd(g, stdout, stderr),
 		newFeeStatsCmd(g, stdout, stderr),

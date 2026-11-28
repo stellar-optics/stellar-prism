@@ -62,6 +62,7 @@ type sinkFlags struct {
 	natsURL             string
 	natsSubject         string
 	natsJetStream       bool
+	zmqPubEndpoint      string
 	zmqEndpoint         string
 	zmqTopic            string
 	auditFile           string
@@ -86,6 +87,8 @@ type sinkFlags struct {
 	sqsQueue            string
 	snsTopic            string
 	awsRegion           string
+	awsBatchSize        int
+	awsFlushInterval    time.Duration
 	pubsubTopic         string
 	metrics             *sink.Prometheus
 	constructedSinks    []io.Closer
@@ -148,8 +151,9 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.StringVar(&s.natsURL, "sink-nats-url", "", "alias for --sink-nats")
 	flags.StringVar(&s.natsSubject, "nats-subject", "stellar.events.{{.ContractID}}.{{.Topic0}}", "NATS subject template using .ContractID, .Topic0, .ID or .Ledger")
 	flags.BoolVar(&s.natsJetStream, "nats-jetstream", false, "wait for JetStream publish acknowledgements")
-	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "ZeroMQ PUB endpoint")
-	flags.StringVar(&s.zmqTopic, "zmq-topic", "stellar.events.{{.ContractID}}", "ZeroMQ topic template using .ContractID, .Topic0, .ID or .Ledger")
+	flags.StringVar(&s.zmqPubEndpoint, "sink-zmq-pub", "", "bind a ZeroMQ PUB socket here (tcp://127.0.0.1:5556 or ipc:///tmp/prism.ipc)")
+	flags.StringVar(&s.zmqEndpoint, "sink-zmq", "", "deprecated alias for --sink-zmq-pub")
+	flags.StringVar(&s.zmqTopic, "zmq-topic", "{{if .ContractID}}{{.ContractID}}{{else}}{{.ID}}{{end}}", "ZeroMQ multipart topic template using .ContractID, .Topic0, .ID or .Ledger")
 	flags.StringVar(&s.auditFile, "sink-audit", "",
 		"write a tamper-evident audit trail, chained with SHA-256 and signed at checkpoints, to this file")
 	flags.StringVar(&s.auditKeyFile, "sink-audit-key", "",
@@ -184,6 +188,8 @@ func (s *sinkFlags) register(cmd *cobra.Command) {
 	flags.StringVar(&s.sqsQueue, "sink-sqs-queue", "", "AWS SQS queue URL")
 	flags.StringVar(&s.snsTopic, "sink-sns-topic", "", "AWS SNS topic ARN")
 	flags.StringVar(&s.awsRegion, "sink-region", "", "AWS region (uses SDK defaults when empty)")
+	flags.IntVar(&s.awsBatchSize, "sink-aws-batch-size", sink.AWSBatchLimit, "records per SNS/SQS batch API call (1-10)")
+	flags.DurationVar(&s.awsFlushInterval, "sink-aws-flush-interval", 250*time.Millisecond, "flush a partial SNS/SQS batch after this interval (0 disables the timer)")
 	flags.StringVar(&s.pubsubTopic, "sink-pubsub-topic", "", "Google Pub/Sub topic as projects/PROJECT/topics/TOPIC")
 
 	registerFlagCompletion(cmd, "cloud-provider", "s3", "gcs")
@@ -257,6 +263,22 @@ func (s *sinkFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.natsURL == "" && s.natsJetStream {
 		return fmt.Errorf("--nats-jetstream requires --sink-nats")
+	}
+	zmqEndpoint := s.zmqPubEndpoint
+	if zmqEndpoint == "" {
+		zmqEndpoint = s.zmqEndpoint
+	}
+	if zmqEndpoint != "" {
+		if !strings.HasPrefix(zmqEndpoint, "tcp://") && !strings.HasPrefix(zmqEndpoint, "ipc://") && !strings.HasPrefix(zmqEndpoint, "inproc://") {
+			return fmt.Errorf("invalid ZeroMQ endpoint %q: want tcp://, ipc:// or inproc://", zmqEndpoint)
+		}
+	}
+	if (s.awsBatchSize != 0 && (s.awsBatchSize < 1 || s.awsBatchSize > sink.AWSBatchLimit)) ||
+		(cmd != nil && cmd.Flags().Changed("sink-aws-batch-size") && (s.awsBatchSize < 1 || s.awsBatchSize > sink.AWSBatchLimit)) {
+		return fmt.Errorf("--sink-aws-batch-size must be between 1 and %d", sink.AWSBatchLimit)
+	}
+	if s.awsFlushInterval < 0 {
+		return fmt.Errorf("--sink-aws-flush-interval must not be negative")
 	}
 	if s.parquetDir != "" && strings.TrimSpace(s.parquetDir) == "" {
 		return fmt.Errorf("--sink-parquet-dir must not be blank")
@@ -470,8 +492,12 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 		s.constructedSinks = append(s.constructedSinks, natsSink)
 		sinks = append(sinks, natsSink)
 	}
-	if s.zmqEndpoint != "" {
-		zmqSink, zmqErr := sink.NewZeroMQSink(sink.ZeroMQOptions{Endpoint: s.zmqEndpoint, Topic: s.zmqTopic, Decode: decode})
+	zmqEndpoint := s.zmqPubEndpoint
+	if zmqEndpoint == "" {
+		zmqEndpoint = s.zmqEndpoint
+	}
+	if zmqEndpoint != "" {
+		zmqSink, zmqErr := sink.NewZeroMQSink(sink.ZeroMQOptions{Endpoint: zmqEndpoint, Topic: s.zmqTopic, Decode: decode})
 		if zmqErr != nil {
 			return nil, zmqErr
 		}
@@ -535,19 +561,33 @@ func (s *sinkFlags) addTo(base stream.Sink, decode bool, onAsyncError func(error
 		if awsErr != nil {
 			return nil, fmt.Errorf("aws config: %w", awsErr)
 		}
+		batchSize := s.awsBatchSize
+		if batchSize < 1 || batchSize > sink.AWSBatchLimit {
+			batchSize = sink.AWSBatchLimit
+		}
 		if s.sqsQueue != "" {
-			q, e := sink.NewSQSSink(sqs.NewFromConfig(cfg), s.sqsQueue, strings.HasSuffix(s.sqsQueue, ".fifo"), decode)
+			q, e := sink.NewAwsSqsSink(sqs.NewFromConfig(cfg), s.sqsQueue, strings.HasSuffix(s.sqsQueue, ".fifo"), decode)
 			if e != nil {
 				return nil, e
 			}
-			sinks = append(sinks, q)
+			s.constructedSinks = append(s.constructedSinks, q)
+			sinks = append(sinks, stream.NewBatcher(q, stream.BatcherOptions{
+				MaxRecords: batchSize,
+				MaxDelay:   s.awsFlushInterval,
+				OnError:    observeError,
+			}))
 		}
 		if s.snsTopic != "" {
-			n, e := sink.NewSNSSink(sns.NewFromConfig(cfg), s.snsTopic, decode)
+			n, e := sink.NewAwsSnsSink(sns.NewFromConfig(cfg), s.snsTopic, strings.HasSuffix(s.snsTopic, ".fifo"), decode)
 			if e != nil {
 				return nil, e
 			}
-			sinks = append(sinks, n)
+			s.constructedSinks = append(s.constructedSinks, n)
+			sinks = append(sinks, stream.NewBatcher(n, stream.BatcherOptions{
+				MaxRecords: batchSize,
+				MaxDelay:   s.awsFlushInterval,
+				OnError:    observeError,
+			}))
 		}
 	}
 	if s.pubsubTopic != "" {

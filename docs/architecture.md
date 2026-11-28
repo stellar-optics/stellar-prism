@@ -1465,11 +1465,24 @@ unions, enums, error enums and events. Function parameters and return types are
 rendered in Soroban type syntax, and `--function` plus repeated `--arg` decodes
 actual base64 `ScVal` values through lens against the named parameters.
 
+`prism abi inspect <contract-id>` uses the same resolver and prints the full
+interface as plain Markdown tables (including argument docstrings) or, with
+`--json`, as a structured object for editors and other tooling. Both views are
+ANSI-free and keep the on-chain declaration order.
+
 `getLedgerEntries` is an optional capability (`rpc.LedgerEntriesClient`), not
 part of the streaming `rpc.Client` interface. That keeps the core interface
 small and avoids forcing stream-only fakes to implement a method they never
 use. Only the `abi` command takes this path; every streaming command remains
 independent of it.
+
+Stellar Asset Contract events are the exception to spec lookup: their five
+built-in token actions (`transfer`, `mint`, `clawback`, `burn`, and
+`set_authorized`) have fixed topic shapes, so `pkg/stream.DecodeSAC` recognises
+them from the event XDR alone. Addresses, stroop amounts (with seven-decimal
+fixed-point formatting), optional SEP-11 asset labels and `to_muxed_id` are
+decoded without fetching WASM; the human sink adds a `[token]` badge and a
+short summary while raw XDR and the NDJSON schema stay unchanged.
 
 ## Completions and generated documentation
 
@@ -1653,14 +1666,30 @@ from `--nats-subject`; the template may use `.ContractID`, `.Topic0`, `.ID` and
 must contain nonempty publish tokens. Core NATS flushes after each publish;
 `--nats-jetstream` waits for a JetStream publish acknowledgement.
 
-#### ZeroMQ PUB (`--sink-zmq`, `pkg/sink/zeromq.go`)
+#### ZeroMQ PUB (`--sink-zmq-pub`, `pkg/sink/zeromq.go`)
 
-The ZeroMQ sink connects a PUB socket to `--sink-zmq` and sends each record as
-a multipart `[topic, JSON]` message. `--zmq-topic` uses the same template data
-as `--nats-subject`, which gives subscribers an efficient prefix-filterable
-first frame. PUB delivery is intentionally best-effort: a slow or disconnected
-subscriber can miss messages under ZeroMQ's high-water-mark semantics. Use
-NATS JetStream when publisher acknowledgements are required.
+The ZeroMQ sink **binds** a PUB socket at `--sink-zmq-pub` and sends each record
+as a multipart `[topic, JSON]` message. Both `tcp://127.0.0.1:5556` and
+`ipc:///tmp/prism.ipc` are supported; binding lets any number of local
+subscribers connect. The first frame defaults to the emitting contract ID (or
+the record ID for non-event records) so subscribers can filter by prefix, and
+`--zmq-topic` can render a different template from the same fields as
+`--nats-subject`. `--sink-zmq` remains as a deprecated alias. PUB delivery is
+intentionally best-effort: a slow or disconnected subscriber can miss messages
+under ZeroMQ's high-water-mark semantics. Use NATS JetStream when publisher
+acknowledgements are required.
+
+#### AWS SNS and SQS (`--sink-sqs-queue`, `--sink-sns-topic`, `pkg/sink/aws.go`)
+
+`AwsSqsSink` and `AwsSnsSink` push the same `--json` record to SQS or SNS.
+`--sink-region` overrides the SDK's default region resolution; credentials come
+from the SDK's normal environment/profile chain, never from command-line flags.
+A `Batcher` in front of each sink packs at most 10 messages into one API call,
+controlled by `--sink-aws-batch-size` and `--sink-aws-flush-interval`. Queue URLs
+and topic ARNs ending in `.fifo` get `MessageGroupId` (the contract ID, falling
+back to the record kind) and `MessageDeduplicationId` (the stable record ID) on
+every message. SQS is the choice for point-to-point work queues; SNS fans a
+message out to all subscribed endpoints.
 
 #### Audit trail (`--sink-audit`, `pkg/sink/audit_log.go`)
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
 
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
+	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 
@@ -711,6 +713,306 @@ func TestWriteUnionCaseRejectsMalformedCases(t *testing.T) {
 				t.Fatal("writeUnionCase() error = nil, want a failure")
 			}
 		})
+	}
+}
+
+func TestABIInspectMarkdown(t *testing.T) {
+	contractID, srv := fakeABIContract(t)
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "abi", "inspect", contractID, "--color", "always")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if strings.Contains(stdout, "\x1b[") {
+		t.Errorf("markdown contains ANSI escapes despite --color always\n%s", stdout)
+	}
+
+	for _, want := range []string{
+		"# Contract ABI",
+		"## Contract",
+		"| Contract ID | `" + contractID + "` |",
+		"| WASM hash | `",
+		"## Functions",
+		"| Name | Signature | Returns | Doc |",
+		"| `hello` | `hello(to: Address) -> u32` | `u32` | Says hello to a contract. |",
+		"| `set_count` | `set_count(count: u32) -> ()` | `()` |",
+		"| `transfer` | `transfer(from: Address, to: Address, amount: i128) -> ()` | `()` |",
+		"## Arguments",
+		"| Function | Name | Type | Doc |",
+		"| `hello` | `to` | `Address` | recipient |",
+		"| `set_count` | `count` | `u32` |",
+		"| `transfer` | `amount` | `i128` |",
+		"## Structs",
+		"| `Profile` |",
+		"| `name` | `String` |",
+		"## Unions",
+		"| `Some` | `(u32)` |",
+		"## Enums",
+		"| `Blue` | 1 |",
+		"## Errors",
+		"| `NotFound` | 7 |",
+		"## Events",
+		"| `Greeted` |",
+		"| `who` | `Address` | topic |",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("markdown output does not contain %q\n%s", want, stdout)
+		}
+	}
+
+	// Spec entries must stay in their on-chain order in every table.
+	positions := make([]int, 0, 3)
+	for _, signature := range []string{
+		"`hello(to: Address) -> u32`",
+		"`set_count(count: u32) -> ()`",
+		"`transfer(from: Address, to: Address, amount: i128) -> ()`",
+	} {
+		pos := strings.Index(stdout, signature)
+		if pos < 0 {
+			t.Fatalf("markdown output is missing signature %s\n%s", signature, stdout)
+		}
+		positions = append(positions, pos)
+	}
+	for i := 1; i < len(positions); i++ {
+		if positions[i-1] >= positions[i] {
+			t.Fatalf("function signatures are out of order\n%s", stdout)
+		}
+	}
+}
+
+func TestABIInspectJSON(t *testing.T) {
+	contractID, srv := fakeABIContract(t)
+	withFake(t, srv)
+
+	stdout, _, err := run(t, "abi", "inspect", contractID, "--json", "--color", "always")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if strings.Contains(stdout, "\x1b[") {
+		t.Errorf("JSON contains ANSI escapes despite --color always\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "\n  \"contractId\":") {
+		t.Errorf("JSON is not pretty printed with two-space indentation\n%s", stdout)
+	}
+	if !strings.HasSuffix(stdout, "}\n") {
+		t.Errorf("JSON encoder did not end with a newline\n%s", stdout)
+	}
+
+	for i, key := range []string{"\"contractId\"", "\"wasmHash\"", "\"functions\""} {
+		pos := strings.Index(stdout, key)
+		if pos < 0 {
+			t.Fatalf("JSON is missing top-level key %s\n%s", key, stdout)
+		}
+		if i > 0 && strings.Index(stdout, []string{"\"contractId\"", "\"wasmHash\"", "\"functions\""}[i-1]) >= pos {
+			t.Fatalf("top-level JSON keys are out of order\n%s", stdout)
+		}
+	}
+
+	var got struct {
+		ContractID string `json:"contractId"`
+		WasmHash   string `json:"wasmHash"`
+		Functions  []struct {
+			Name      string `json:"name"`
+			Doc       string `json:"doc"`
+			Arguments []struct {
+				Name string `json:"name"`
+				Type string `json:"type"`
+				Doc  string `json:"doc"`
+			} `json:"arguments"`
+			Returns []string `json:"returns"`
+		} `json:"functions"`
+		Structs []struct {
+			Name   string `json:"name"`
+			Doc    string `json:"doc"`
+			Fields []struct {
+				Name string `json:"name"`
+				Type string `json:"type"`
+				Doc  string `json:"doc"`
+			} `json:"fields"`
+		} `json:"structs"`
+		Unions []struct {
+			Name  string `json:"name"`
+			Doc   string `json:"doc"`
+			Cases []struct {
+				Name  string   `json:"name"`
+				Types []string `json:"types"`
+				Doc   string   `json:"doc"`
+			} `json:"cases"`
+		} `json:"unions"`
+		Enums []struct {
+			Name  string `json:"name"`
+			Doc   string `json:"doc"`
+			Cases []struct {
+				Name  string `json:"name"`
+				Value uint32 `json:"value"`
+				Doc   string `json:"doc"`
+			} `json:"cases"`
+		} `json:"enums"`
+		Errors []struct {
+			Name  string `json:"name"`
+			Doc   string `json:"doc"`
+			Cases []struct {
+				Name  string `json:"name"`
+				Value uint32 `json:"value"`
+				Doc   string `json:"doc"`
+			} `json:"cases"`
+		} `json:"errors"`
+		Events []struct {
+			Name   string `json:"name"`
+			Doc    string `json:"doc"`
+			Params []struct {
+				Name     string `json:"name"`
+				Type     string `json:"type"`
+				Location string `json:"location"`
+				Doc      string `json:"doc"`
+			} `json:"params"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("decoding ABI inspection JSON: %v\n%s", err, stdout)
+	}
+
+	if got.ContractID != contractID {
+		t.Errorf("contractId = %q, want %q", got.ContractID, contractID)
+	}
+	if len(got.WasmHash) != 64 {
+		t.Errorf("wasmHash = %q, want a 64-character hex hash", got.WasmHash)
+	}
+	if len(got.Functions) != 3 {
+		t.Fatalf("got %d functions, want 3\n%s", len(got.Functions), stdout)
+	}
+
+	wantNames := []string{"hello", "set_count", "transfer"}
+	for i, want := range wantNames {
+		if got.Functions[i].Name != want {
+			t.Errorf("functions[%d].name = %q, want %q", i, got.Functions[i].Name, want)
+		}
+	}
+
+	hello := got.Functions[0]
+	if hello.Doc != "Says hello to a contract." {
+		t.Errorf("hello.doc = %q", hello.Doc)
+	}
+	if len(hello.Arguments) != 1 {
+		t.Fatalf("hello has %d arguments, want 1", len(hello.Arguments))
+	}
+	if hello.Arguments[0].Name != "to" || hello.Arguments[0].Type != "Address" || hello.Arguments[0].Doc != "recipient" {
+		t.Errorf("hello argument = %+v, want to/Address/recipient", hello.Arguments[0])
+	}
+	if strings.Join(hello.Returns, ",") != "u32" {
+		t.Errorf("hello.returns = %v, want [u32]", hello.Returns)
+	}
+	if got.Functions[1].Doc != "" || len(got.Functions[1].Returns) != 0 {
+		t.Errorf("set_count = %+v, want an empty doc and returns", got.Functions[1])
+	}
+	if strings.Join(got.Functions[2].Returns, ",") != "()" {
+		t.Errorf("transfer.returns = %v, want [()]", got.Functions[2].Returns)
+	}
+
+	if len(got.Structs) != 1 || got.Structs[0].Name != "Profile" {
+		t.Fatalf("structs = %+v, want Profile", got.Structs)
+	}
+	if len(got.Structs[0].Fields) != 2 ||
+		got.Structs[0].Fields[0].Name != "name" || got.Structs[0].Fields[0].Type != "String" ||
+		got.Structs[0].Fields[1].Name != "age" || got.Structs[0].Fields[1].Type != "u32" {
+		t.Errorf("Profile fields = %+v", got.Structs[0].Fields)
+	}
+	if len(got.Unions) != 1 || got.Unions[0].Name != "Choice" || len(got.Unions[0].Cases) != 2 {
+		t.Fatalf("unions = %+v, want Choice with two cases", got.Unions)
+	}
+	if got.Unions[0].Cases[0].Name != "None" || len(got.Unions[0].Cases[0].Types) != 0 ||
+		got.Unions[0].Cases[1].Name != "Some" || strings.Join(got.Unions[0].Cases[1].Types, ",") != "u32" {
+		t.Errorf("Choice cases = %+v", got.Unions[0].Cases)
+	}
+	if len(got.Enums) != 1 || len(got.Enums[0].Cases) != 2 ||
+		got.Enums[0].Cases[1].Name != "Blue" || got.Enums[0].Cases[1].Value != 1 {
+		t.Errorf("enums = %+v, want Color/Blue=1", got.Enums)
+	}
+	if len(got.Errors) != 1 || len(got.Errors[0].Cases) != 1 ||
+		got.Errors[0].Cases[0].Name != "NotFound" || got.Errors[0].Cases[0].Value != 7 {
+		t.Errorf("errors = %+v, want Failure/NotFound=7", got.Errors)
+	}
+	if len(got.Events) != 1 || got.Events[0].Name != "Greeted" || len(got.Events[0].Params) != 2 {
+		t.Fatalf("events = %+v, want Greeted with two params", got.Events)
+	}
+	if got.Events[0].Params[0].Name != "who" || got.Events[0].Params[0].Location != "topic" ||
+		got.Events[0].Params[1].Location != "data" {
+		t.Errorf("Greeted params = %+v", got.Events[0].Params)
+	}
+}
+
+func TestABIInspectRequiresContractID(t *testing.T) {
+	if _, _, err := run(t, "abi", "inspect"); err == nil {
+		t.Fatal("Execute() error = nil, want a missing contract ID failure")
+	}
+}
+
+func TestABIInspectValidatesContractIDBeforeClient(t *testing.T) {
+	original := newClient
+	clientCalled := false
+	newClient = func([]string, time.Duration) (rpc.Client, error) {
+		clientCalled = true
+		return nil, errors.New("unexpected client construction")
+	}
+	t.Cleanup(func() { newClient = original })
+
+	_, _, err := run(t, "abi", "inspect", "not-a-contract")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want an invalid contract ID failure")
+	}
+	if !strings.Contains(err.Error(), "invalid contract ID") {
+		t.Errorf("error = %q, want it to name the invalid contract ID", err)
+	}
+	if clientCalled {
+		t.Error("invalid contract ID opened an RPC client before validation")
+	}
+}
+
+func TestABIInspectContractNotFound(t *testing.T) {
+	withFake(t, fakerpc.NewServer(nil))
+
+	_, _, err := run(t, "abi", "inspect", testContractID(t))
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a not-found failure")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %q, want it to say the contract was not found", err)
+	}
+}
+
+func TestABIInspectWASMWithoutSpec(t *testing.T) {
+	contractID := testContractID(t)
+	srv := fakerpc.NewServer(nil)
+	if err := srv.SetContractWasm(contractID, []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}); err != nil {
+		t.Fatalf("installing contract WASM: %v", err)
+	}
+	withFake(t, srv)
+
+	_, _, err := run(t, "abi", "inspect", contractID)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want a missing-spec failure")
+	}
+	if !strings.Contains(err.Error(), contractSpecSection) {
+		t.Errorf("error = %q, want it to mention %s", err, contractSpecSection)
+	}
+}
+
+var errABIWrite = errors.New("write failed")
+
+type abiFailWriter struct{}
+
+func (abiFailWriter) Write([]byte) (int, error) { return 0, errABIWrite }
+
+func TestABIInspectionWriterErrorsAreWrapped(t *testing.T) {
+	t.Parallel()
+	spec := &contractSpec{ContractID: "C...", WasmHash: xdr.Hash{1}}
+
+	if err := spec.writeInspectionMarkdown(abiFailWriter{}); !errors.Is(err, errABIWrite) {
+		t.Errorf("writeInspectionMarkdown() error = %v, want it to wrap the writer error", err)
+	}
+	if err := spec.writeInspectionJSON(abiFailWriter{}); !errors.Is(err, errABIWrite) {
+		t.Errorf("writeInspectionJSON() error = %v, want it to wrap the writer error", err)
 	}
 }
 
