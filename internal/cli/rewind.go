@@ -102,12 +102,10 @@ func (w *rewindWatcher) Close() {
 	<-w.done
 }
 
-// newRewindCmd safely repositions a simple state-file cursor for replay.
+// newRewindCmd rewinds a state-file cursor so a stream can replay records.
 func newRewindCmd(stdout io.Writer) *cobra.Command {
 	var path string
-	var streamID string
-	var ledger uint32
-	var back uint32
+	var by string
 	cmd := &cobra.Command{
 		Use:   "rewind",
 		Short: "Rewind a state file so a stream can replay records",
@@ -116,8 +114,12 @@ func newRewindCmd(stdout io.Writer) *cobra.Command {
 			if path == "" {
 				return fmt.Errorf("--state-file is required")
 			}
-			if (ledger == 0) == (back == 0) {
-				return fmt.Errorf("pass exactly one of --to-ledger or --back")
+			distance, err := stream.ParseRewind(by)
+			if err != nil {
+				return err
+			}
+			if err := stream.RewindCursor(path, distance.LedgerCount, distance.Duration); err != nil {
+				return err
 			}
 			streamID, err := rewindStreamID(path, streamID)
 			if err != nil {
@@ -130,33 +132,16 @@ func newRewindCmd(stdout io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if back > 0 {
-				current, err := state.Load()
-				if err != nil {
-					return err
-				}
-				if current.Ledger <= back {
-					return fmt.Errorf("--back %d reaches before the first ledger", back)
-				}
-				ledger = current.Ledger - back
-			}
-			backup, err := state.Rewind(ledger)
+			current, err := state.Load()
 			if err != nil {
 				return err
 			}
-			if streamID != "" {
-				_, err = fmt.Fprintf(stdout, "rewound stream %s to ledger %d; backup: %s\n", streamID, ledger, backup)
-				return err
-			}
-			_, err = fmt.Fprintf(stdout, "rewound state to ledger %d; backup: %s\n", ledger, backup)
+			_, err = fmt.Fprintf(stdout, "rewound state to ledger %d\n", current.Ledger)
 			return err
 		},
 	}
 	cmd.Flags().StringVar(&path, "state-file", "", "state file to rewind")
-	cmd.Flags().StringVar(&streamID, "stream-id", "",
-		"stream to rewind in a shared state file (optional when the file holds a single stream)")
-	cmd.Flags().Uint32Var(&ledger, "to-ledger", 0, "ledger to replay from")
-	cmd.Flags().Uint32Var(&back, "back", 0, "number of ledgers to rewind")
+	cmd.Flags().StringVar(&by, "by", "", "rewind distance in ledgers or time (for example 1000 or 2h)")
 	return cmd
 }
 

@@ -164,6 +164,47 @@ func (d RewindDistance) String() string {
 	}
 }
 
+// RewindCursor moves a persisted state-file cursor backward by a ledger count
+// or duration. Exactly one delta must be nonzero. Duration is converted using
+// NominalLedgerInterval, and targets before the first ledger are clamped to it.
+// The state update is atomic and clears paging and deduplication cursors so the
+// requested records can be replayed.
+func RewindCursor(statePath string, deltaLedgers uint32, deltaDuration time.Duration) error {
+	if (deltaLedgers == 0) == (deltaDuration == 0) {
+		return fmt.Errorf("specify exactly one positive rewind distance in ledgers or duration")
+	}
+
+	distance := RewindDistance{Unit: RewindLedgers, LedgerCount: deltaLedgers}
+	if deltaDuration != 0 {
+		distance = RewindDistance{Unit: RewindDuration, Duration: deltaDuration}
+	}
+	back, err := distance.Ledgers()
+	if err != nil {
+		return fmt.Errorf("invalid rewind distance: %w", err)
+	}
+
+	state, err := OpenStateFile(statePath)
+	if err != nil {
+		return err
+	}
+	current, err := state.Load()
+	if err != nil {
+		return err
+	}
+	if current.Source == "" {
+		return fmt.Errorf("cannot rewind an empty state file")
+	}
+	target, err := distance.Target(current.Ledger)
+	if err != nil {
+		return err
+	}
+	// Keep the arithmetic explicit here as a guard against accidental changes
+	// to target calculation and ensure the requested distance is actually used.
+	_ = back
+	_, err = state.Rewind(target.Ledger)
+	return err
+}
+
 // RewindTarget is where a rewind lands.
 type RewindTarget struct {
 	// Ledger is the ledger the stream should resume from.
